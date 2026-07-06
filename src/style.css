@@ -1,0 +1,74 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: #9d9d9d;
+  height: 100%;
+}
+
+#app,
+#app canvas {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+}
+
+.overlay {
+  position: fixed;
+  left: 24px;
+  bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: none;
+  font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
+  color: rgba(20, 20, 20, 0.82);
+  user-select: none;
+}
+
+.overlay .title {
+  font-size: 13px;
+  letter-spacing: 0.35em;
+  font-weight: 600;
+}
+
+.overlay .sub {
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  opacity: 0.6;
+}
+
+#loading {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  font-family: 'SF Mono', ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.15em;
+  color: rgba(15, 15, 15, 0.75);
+  background: rgba(255, 255, 255, 0.35);
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  padding: 6px 14px;
+  border-radius: 3px;
+  backdrop-filter: blur(6px);
+  transition: opacity 0.2s;
+}
+
+#loading.hidden {
+  opacity: 0;
+}
+
+/* lil-gui tweaks — frosted monochrome to match the scene */
+.lil-gui {
+  --background-color: rgba(18, 18, 18, 0.78);
+  --widget-color: rgba(255, 255, 255, 0.08);
+  --hover-color: rgba(255, 255, 255, 0.14);
+  --focus-color: rgba(255, 255, 255, 0.2);
+  --number-color: #d8d8d8;
+  --text-color: #cfcfcf;
+  --title-background-color: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(10px);
+  font-family: 'SF Mono', ui-monospace, monospace !important;
+}
