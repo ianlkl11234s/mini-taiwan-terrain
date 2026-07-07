@@ -18,9 +18,10 @@ import {
   BlendFunction,
 } from 'postprocessing'
 import { Terrain } from './terrain.js'
-import { createCity } from './city.js'
 import { createCone } from './cone.js'
 import { createLabels, disposeLabels } from './labels.js'
+import { createHud3D, findPois } from './hud3d.js'
+import { createHud2D } from './hud2d.js'
 
 // ------------------------------------------------------------------ params
 
@@ -40,17 +41,17 @@ const params = {
   // surface material
   color: '#c2c2c2',
   roughness: 1.0,
-  roughnessVariation: 0.6,
-  roughnessScale: 16,
-  bumpScale: 2.0,
+  roughnessVariation: 0.5,
+  roughnessScale: 1,
+  bumpScale: 0.2,
   envMapIntensity: 1.5,
 
   // camera & depth of field
-  fov: 46,
+  fov: 43,
   autoFocus: true,
-  focusDistance: 24.7,
+  focusDistance: 24.74,
   focusRange: 25,
-  bokehScale: 0.7,
+  bokehScale: 0,
 
   // map overlay
   mapTint: 1.0,
@@ -70,23 +71,40 @@ const params = {
   gridOpacity: 1,
   labels: true,
 
+  // HUD
+  hud: true,
+  hudOpacity: 1,
+  uiBlur: 9,
+  uiBgOpacity: 0.4,
+  hudAccent: '#ff4d00',
+  hudInk: '#17191b',
+  sweepSpeed: 2.5,
+  scanColor: '#ccd6ff',
+  scanDuration: 4.6,
+  scanWidth: 0.8,
+  scanBlur: 0.86,
+  scanDispHeight: 1.16,
+  scanDispFalloff: 1.2,
+
   // look
-  exposure: 0.4,
-  contrast: -0.01,
+  exposure: 0.96,
+  contrast: 0.07,
   saturation: -0.35,
   vignette: 0.6,
   grain: 0.35,
   fogNear: 35.5,
   fogFar: 50,
-  fogColor: '#b5b5b5',
+  fogColor: '#ffffff',
   surveyLines: true,
 
   // motion
-  coneSpin: 0.5,
-  coneTilt: 0.14,
-  coneDrift: 0.55,
-  bob: 0.07,
+  coneSpin: 0,
+  coneTilt: 0,
+  coneDrift: 0,
+  bob: 0,
   ringSpeed: 1.0,
+  flyDuration: 1.8,
+  flyEasing: 'smooth',
   paused: false,
 
   // light
@@ -94,8 +112,8 @@ const params = {
   sunAzimuth: 64,
   sunElevation: 19,
   hemiIntensity: 0.0,
-  envLight: 0.9,
-  shadowSoftness: 6,
+  envLight: 0.3,
+  shadowSoftness: 15,
 }
 
 // ------------------------------------------------------------------ renderer / scene
@@ -178,9 +196,6 @@ placeSun()
 const terrain = new Terrain(params)
 scene.add(terrain.mesh)
 
-const city = createCity(params.seed)
-scene.add(city.group)
-
 const cone = createCone()
 scene.add(cone.group)
 
@@ -194,6 +209,83 @@ function regenerateLabels() {
   labels = createLabels(terrain.sample, params.seed)
   labels.visible = params.labels
   scene.add(labels)
+}
+
+// ------------------------------------------------------------------ HUD + interactivity
+
+const HOME = { pos: new THREE.Vector3(0, 18, 19), target: new THREE.Vector3(0, -0.3, 0) }
+const EASINGS = {
+  smooth: (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2), // cubic in-out
+  glide: (t) => 1 - Math.pow(1 - t, 5), // quintic out
+  linear: (t) => t,
+}
+const tween = {
+  active: false,
+  t: 0,
+  p0: new THREE.Vector3(),
+  p1: new THREE.Vector3(),
+  t0: new THREE.Vector3(),
+  t1: new THREE.Vector3(),
+}
+let selectedPoi = -1
+let fps = 60
+let scanStart = -1
+
+let pois = findPois(terrain.sample, params.seed)
+let hud3 = createHud3D(params.seed, pois, { ink: params.hudInk, accent: params.hudAccent })
+hud3.lines.visible = params.surveyLines
+scene.add(hud3.group)
+
+function flyTo(pos, target) {
+  tween.p0.copy(camera.position)
+  tween.t0.copy(controls.target)
+  tween.p1.copy(pos)
+  tween.t1.copy(target)
+  tween.t = 0
+  tween.active = true
+}
+
+const hud2 = createHud2D({
+  onSelectPoi(i) {
+    selectedPoi = i
+    const p = pois[i]
+    hud2.setSelected(i, p)
+    const dir = new THREE.Vector3(p.x, 0, p.z).normalize()
+    flyTo(new THREE.Vector3(p.x + dir.x * 6.5, p.h + 4.2, p.z + dir.z * 6.5), new THREE.Vector3(p.x, p.h + 0.6, p.z))
+  },
+  onDeselect() {
+    selectedPoi = -1
+    hud2.setSelected(-1, null)
+    flyTo(HOME.pos, HOME.target)
+  },
+  onScan() {
+    scanStart = performance.now() / 1000
+    cone.kick(3)
+  },
+})
+hud2.setPois(pois)
+hud2.setStatic(params)
+hud2.setVisible(params.hud)
+hud2.setOpacity(params.hudOpacity)
+document.documentElement.style.setProperty('--hud-accent', params.hudAccent)
+document.documentElement.style.setProperty('--hud-ink', params.hudInk)
+document.documentElement.style.setProperty('--hud-blur', `${params.uiBlur}px`)
+document.documentElement.style.setProperty('--hud-bg-alpha', params.uiBgOpacity)
+
+// user grabbing the camera cancels any fly-to
+controls.addEventListener('start', () => (tween.active = false))
+
+function regenerateHud() {
+  scene.remove(hud3.group)
+  hud3.dispose()
+  pois = findPois(terrain.sample, params.seed)
+  hud3 = createHud3D(params.seed, pois, { ink: params.hudInk, accent: params.hudAccent })
+  hud3.lines.visible = params.surveyLines
+  scene.add(hud3.group)
+  hud2.setPois(pois)
+  hud2.setStatic(params)
+  selectedPoi = -1
+  hud2.setSelected(-1, null)
 }
 
 // ------------------------------------------------------------------ post: real depth-based DOF
@@ -262,20 +354,11 @@ function regenerateTerrain() {
       terrain.rebuild(params)
       terrain.rebuildRoughness(params)
       regenerateLabels()
+      regenerateHud()
       rebuildPending = false
       loadingEl.classList.add('hidden')
     }, 30)
   )
-}
-
-function regenerateCity() {
-  scene.remove(city.group)
-  const fresh = createCity(params.seed)
-  city.group = fresh.group
-  city.lines = fresh.lines
-  city.update = fresh.update
-  city.lines.visible = params.surveyLines
-  scene.add(city.group)
 }
 
 // ------------------------------------------------------------------ GUI
@@ -306,10 +389,7 @@ const copyCtrl = gui
   .name('copy parameters')
 
 const fTerrain = gui.addFolder('Terrain')
-fTerrain.add(params, 'seed', 1, 9999, 1).onFinishChange(() => {
-  regenerateTerrain()
-  regenerateCity()
-})
+fTerrain.add(params, 'seed', 1, 9999, 1).onFinishChange(regenerateTerrain)
 fTerrain
   .add(
     {
@@ -317,7 +397,6 @@ fTerrain
         params.seed = Math.floor(Math.random() * 9999) + 1
         gui.controllersRecursive().forEach((c) => c.updateDisplay())
         regenerateTerrain()
-        regenerateCity()
       },
     },
     'randomize'
@@ -410,7 +489,56 @@ fLook.addColor(params, 'fogColor').onChange((v) => {
   scene.fog.color.set(v)
   scene.background.set(v)
 })
-fLook.add(params, 'surveyLines').name('survey circles').onChange((v) => (city.lines.visible = v))
+fLook.add(params, 'surveyLines').name('survey circles').onChange((v) => (hud3.lines.visible = v))
+
+const fHud = gui.addFolder('HUD')
+fHud.add(params, 'hud').name('show HUD').onChange((v) => hud2.setVisible(v))
+fHud.add(params, 'hudOpacity', 0, 1, 0.02).name('HUD opacity').onChange((v) => hud2.setOpacity(v))
+fHud
+  .add(params, 'uiBlur', 0, 30, 1)
+  .name('panel blur')
+  .onChange((v) => document.documentElement.style.setProperty('--hud-blur', `${v}px`))
+fHud
+  .add(params, 'uiBgOpacity', 0, 1, 0.02)
+  .name('panel bg opacity')
+  .onChange((v) => document.documentElement.style.setProperty('--hud-bg-alpha', v))
+fHud
+  .addColor(params, 'hudAccent')
+  .name('accent color')
+  .onChange((v) => {
+    document.documentElement.style.setProperty('--hud-accent', v)
+    regenerateHud()
+  })
+fHud
+  .addColor(params, 'hudInk')
+  .name('ink color')
+  .onChange((v) => {
+    document.documentElement.style.setProperty('--hud-ink', v)
+    regenerateHud()
+  })
+fHud.add(params, 'sweepSpeed', 0, 3, 0.05).name('sweep speed')
+fHud
+  .addColor(params, 'scanColor')
+  .name('scan color')
+  .onChange((v) => terrain.mapUniforms.uScanColor.value.set(v))
+fHud.add(params, 'scanDuration', 1, 8, 0.1).name('scan duration')
+fHud
+  .add(params, 'scanWidth', 0.05, 4, 0.05)
+  .name('scan width')
+  .onChange((v) => (terrain.mapUniforms.uScanWidth.value = v))
+fHud
+  .add(params, 'scanBlur', 0, 3, 0.02)
+  .name('scan blur')
+  .onChange((v) => (terrain.mapUniforms.uScanBlur.value = v))
+fHud
+  .add(params, 'scanDispHeight', 0, 2, 0.02)
+  .name('wave height')
+  .onChange((v) => (terrain.mapUniforms.uScanDispH.value = v))
+fHud
+  .add(params, 'scanDispFalloff', 0.1, 6, 0.05)
+  .name('wave falloff')
+  .onChange((v) => (terrain.mapUniforms.uScanDispW.value = v))
+fHud.add({ scan: () => (scanStart = performance.now() / 1000) }, 'scan').name('trigger scan')
 
 const fMotion = gui.addFolder('Motion')
 fMotion.add(params, 'coneSpin', 0, 3, 0.05).name('cone spin')
@@ -418,6 +546,8 @@ fMotion.add(params, 'coneTilt', 0, 0.5, 0.01).name('cursor tilt')
 fMotion.add(params, 'coneDrift', 0, 2, 0.05).name('cursor drift')
 fMotion.add(params, 'bob', 0, 0.3, 0.01).name('hover bob')
 fMotion.add(params, 'ringSpeed', 0, 6, 0.1).name('ring speed')
+fMotion.add(params, 'flyDuration', 0.4, 4, 0.1).name('fly duration')
+fMotion.add(params, 'flyEasing', ['smooth', 'glide', 'linear']).name('fly easing')
 fMotion.add(params, 'paused')
 
 const fLight = gui.addFolder('Light')
@@ -440,7 +570,7 @@ fLight.close()
 // ------------------------------------------------------------------ loop
 
 // console access for debugging/scripting
-window.__exp = { scene, camera, controls, params, get labels() { return labels } }
+window.__exp = { scene, camera, controls, params, terrain, get labels() { return labels } }
 
 const clock = new THREE.Clock()
 
@@ -449,17 +579,59 @@ function tick() {
   const dt = Math.min(clock.getDelta(), 0.05)
   const t = clock.elapsedTime
 
-  controls.update()
+  // camera fly-to: timed ease with controls paused so damping can't fight the tween
+  if (tween.active) {
+    tween.t = Math.min(1, tween.t + dt / params.flyDuration)
+    const e = EASINGS[params.flyEasing](tween.t)
+    camera.position.lerpVectors(tween.p0, tween.p1, e)
+    controls.target.lerpVectors(tween.t0, tween.t1, e)
+    camera.lookAt(controls.target)
+    if (tween.t >= 1) tween.active = false
+  } else {
+    controls.update()
+  }
+
+  // refresh camera matrices NOW so DOM projections match this frame's render
+  // (otherwise labels are projected with last frame's matrices and lag behind)
+  camera.updateMatrixWorld()
 
   if (!params.paused) {
-    city.update(dt, params.ringSpeed)
+    hud3.update(dt, t, params)
     cone.update(dt, t, mouse, params)
+  }
+
+  // terrain scan ripple progress
+  if (scanStart >= 0) {
+    const p = (performance.now() / 1000 - scanStart) / params.scanDuration
+    if (p >= 1) {
+      scanStart = -1
+      terrain.mapUniforms.uScanT.value = -1
+    } else {
+      terrain.mapUniforms.uScanT.value = p
+    }
   }
 
   if (params.autoFocus) {
     params.focusDistance = camera.position.distanceTo(cone.getFocusPoint())
   }
   dof.cocMaterial.worldFocusDistance = params.focusDistance
+
+  if (params.hud) {
+    fps += (1 / Math.max(dt, 1e-4) - fps) * 0.05
+    const sph = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target))
+    const secs = Math.floor(t)
+    hud2.update(dt, camera, window.innerWidth, window.innerHeight, {
+      conePoint: cone.getFocusPoint(),
+      pois,
+      az: THREE.MathUtils.radToDeg(sph.theta),
+      el: 90 - THREE.MathUtils.radToDeg(sph.phi),
+      focus: params.focusDistance,
+      fps,
+      clock: `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`,
+      coneAlt: cone.group.position.y,
+      spin: params.coneSpin,
+    })
+  }
 
   composer.render(dt)
 }

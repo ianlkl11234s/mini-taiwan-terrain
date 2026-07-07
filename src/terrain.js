@@ -32,15 +32,36 @@ export class Terrain {
       uHeightPivot: { value: params.heightPivot },
       uSlopeTint: { value: params.slopeTint },
       uContourColor: { value: new THREE.Color(params.contourColor) },
+      uScanT: { value: -1 }, // scan progress 0..1, negative = inactive
+      uScanColor: { value: new THREE.Color(params.scanColor) },
+      uScanWidth: { value: params.scanWidth },
+      uScanBlur: { value: params.scanBlur },
+      uScanDispH: { value: params.scanDispHeight },
+      uScanDispW: { value: params.scanDispFalloff },
     }
     this.rebuildRamp(params)
     this.material.onBeforeCompile = (shader) => {
       Object.assign(shader.uniforms, this.mapUniforms)
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPos;')
+        .replace(
+          '#include <common>',
+          `#include <common>
+varying vec3 vWorldPos;
+uniform float uScanT;
+uniform float uScanDispH;
+uniform float uScanDispW;`
+        )
         .replace(
           '#include <begin_vertex>',
-          '#include <begin_vertex>\nvWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;'
+          `#include <begin_vertex>
+// scan wave physically lifts the surface as it sweeps outward
+if (uScanT >= 0.0) {
+  float dV = length(transformed.xz);
+  float RV = uScanT * 42.0;
+  float bumpV = exp(-pow((dV - RV) / max(uScanDispW, 0.05), 2.0));
+  transformed.y += uScanDispH * bumpV * (1.0 - smoothstep(0.6, 1.0, uScanT));
+}
+vWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`
         )
       shader.fragmentShader = shader.fragmentShader
         .replace(
@@ -57,7 +78,11 @@ uniform sampler2D uRampTex;
 uniform float uHeightContrast;
 uniform float uHeightPivot;
 uniform float uSlopeTint;
-uniform vec3 uContourColor;`
+uniform vec3 uContourColor;
+uniform float uScanT;
+uniform vec3 uScanColor;
+uniform float uScanWidth;
+uniform float uScanBlur;`
         )
         .replace(
           '#include <color_fragment>',
@@ -97,6 +122,30 @@ uniform vec3 uContourColor;`
   float gz = 1.0 - smoothstep(0.0, dg.y * 1.4, distGrid.y);
   float grid = max(gx, gz) * uGridOpacity;
   diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.14, 0.13, 0.12), grid);
+
+  // --- radar scan wavefront paints the surface (additive-only washes out on white terrain)
+  if (uScanT >= 0.0) {
+    float dScan = length(vWorldPos.xz);
+    float Rs = uScanT * 42.0;
+    float aaS = fwidth(dScan);
+    float edgeS = abs(dScan - Rs) - uScanWidth * 0.5;
+    float bandS = 1.0 - smoothstep(0.0, max(uScanBlur, aaS), edgeS);
+    float fadeS = 1.0 - smoothstep(0.6, 1.0, uScanT);
+    diffuseColor.rgb = mix(diffuseColor.rgb, uScanColor, clamp(bandS * fadeS, 0.0, 0.95));
+  }
+}`
+        )
+        .replace(
+          '#include <emissivemap_fragment>',
+          `#include <emissivemap_fragment>
+// radar scan ripple: an emissive wavefront expanding from the center across the relief
+if (uScanT >= 0.0) {
+  float d = length(vWorldPos.xz);
+  float R = uScanT * 42.0;
+  float edgeE = abs(d - R) - uScanWidth * 0.5;
+  float band = 1.0 - smoothstep(0.0, max(uScanBlur, fwidth(d)), edgeE);
+  float fade = 1.0 - smoothstep(0.6, 1.0, uScanT);
+  totalEmissiveRadiance += uScanColor * band * fade * 0.5;
 }`
         )
     }
