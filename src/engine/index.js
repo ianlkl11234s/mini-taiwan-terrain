@@ -202,6 +202,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
 
   const terrain = new Terrain(params)
   scene.add(terrain.group)
+  // real mode: hide the procedural placeholder until DEM tiles arrive
+  const pendingReal = params.source === 'real'
+  if (pendingReal) terrain.group.visible = false
 
   // main-island coastline ink line (real mode only) — geometry builds lazily on
   // the first real-mode update, once the projection exists
@@ -245,7 +248,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     spots: stage.lodZoom >= 12, // P2: no spot elevations in far views
   })
   let labels = createLabels(terrain.sample, params.seed, labelOpts())
-  labels.visible = params.labels
+  labels.visible = params.labels && !pendingReal
   scene.add(labels)
 
   function regenerateLabels() {
@@ -277,7 +280,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     accent: params.hudAccent,
     platform: params.source !== 'real',
   })
-  hud3.lines.visible = params.surveyLines
+  hud3.lines.visible = params.surveyLines && !pendingReal
+  if (pendingReal) hud3.group.visible = false
   scene.add(hud3.group)
 
   // ---------------------------------------------------------------- motion (fly-to + tour)
@@ -380,6 +384,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // let the indicator paint before the synchronous rebuild blocks the thread
     requestAnimationFrame(() =>
       setTimeout(() => {
+        terrain.group.visible = true
         terrain.rebuild(params)
         terrain.rebuildRoughness(params)
         if (params.source === 'real' && heightField) {
