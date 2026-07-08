@@ -40,6 +40,7 @@ export function createHud2D({ onSelectPoi, onDeselect, onScan }) {
      <div class="hud-row"><span>CAM AZ</span><b data-t="az">—</b></div>
      <div class="hud-row"><span>CAM EL</span><b data-t="el">—</b></div>
      <div class="hud-row"><span>FOCUS</span><b data-t="focus">—</b></div>
+     <div class="hud-row"><span>LOD</span><b data-t="lod">—</b></div>
      <div class="hud-row"><span>FPS</span><b data-t="fps">—</b></div>
      <div class="hud-row"><span>T+</span><b data-t="clock">—</b></div>`
   )
@@ -167,6 +168,7 @@ export function createHud2D({ onSelectPoi, onDeselect, onScan }) {
         q(telem, 'az').textContent = `${data.az.toFixed(1)}°`
         q(telem, 'el').textContent = `${data.el.toFixed(1)}°`
         q(telem, 'focus').textContent = data.focus.toFixed(2)
+        q(telem, 'lod').textContent = data.lod ? `Z${data.lod}` : '—'
         q(telem, 'fps').textContent = String(Math.round(data.fps))
         q(telem, 'clock').textContent = data.clock
         q(reticle, 'alt').textContent = `ALT ${data.coneAlt.toFixed(2)}`

@@ -36,7 +36,11 @@ export async function fetchTile(zoom, tx, ty) {
   img.close?.()
   const data = new Float32Array(TILE_PX * TILE_PX)
   for (let i = 0; i < data.length; i++) {
-    data[i] = rgba[i * 4] * 256 + rgba[i * 4 + 1] + rgba[i * 4 + 2] / 256 - 32768
+    const v = rgba[i * 4] * 256 + rgba[i * 4 + 1] + rgba[i * 4 + 2] / 256 - 32768
+    // NODATA guard: the NLSC DTM has no bathymetry, so deeply negative values
+    // are encode holes (RGB 0,0,0 = -32768 m — e.g. offshore islets without
+    // DTM coverage). They punched black pits into the P2 island view.
+    data[i] = v < -100 ? 0 : v
   }
   return data
 }

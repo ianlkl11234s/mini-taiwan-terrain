@@ -171,14 +171,21 @@ if (uScanT >= 0.0) {
     this.group.add(this.mesh)
     this.chunkGroup = new THREE.Group()
     this.group.add(this.chunkGroup)
-    this.chunkMap = new Map() // "tx,ty" → chunk mesh
-    this.heightField = null // real-world height source (geo.js), set via setHeightField()
+    this.chunkMap = new Map() // "zoom/tx/ty" → chunk mesh
+    this.heightField = null // primary real-world height source (geo.js)
+    this.heightFields = null // P2: Map zoom → HeightField, one tile pyramid level each
+    this.primaryZoom = 12
     this.rebuild(params)
     this.rebuildRoughness(params)
   }
 
-  setHeightField(heightField) {
-    this.heightField = heightField
+  // P2: one HeightField per LOD zoom, all sharing the same world coordinates
+  // and vertical datum. `primaryZoom` names the field that labels, peaks and
+  // GPS keep reading (the z12 anchor level).
+  setHeightFields(fields, primaryZoom) {
+    this.heightFields = fields
+    this.primaryZoom = primaryZoom
+    this.heightField = fields.get(primaryZoom)
   }
 
   // scene height → display elevation in feet (real when a DEM drives the terrain)
@@ -194,6 +201,14 @@ if (uScanT >= 0.0) {
     const scale = hf.projection.K * params.demExaggeration
     const datumM = hf.datumM
     this._h2ft = (h) => Math.round((h / scale + datumM) * 3.28084)
+    return this._makeDemSamplerFor(hf, params)
+  }
+
+  // Sampler bound to ONE zoom's tile cache — every LOD level shares the same
+  // K and datum, so the same world xz reads (near enough) the same height.
+  _makeDemSamplerFor(hf, params) {
+    const scale = hf.projection.K * params.demExaggeration
+    const datumM = hf.datumM
 
     const sDetail = new Simplex2(mulberry32(params.seed))
     const { detail, detailScale } = params
@@ -298,63 +313,158 @@ if (uScanT >= 0.0) {
     const minH = (hf.minM - hf.datumM) * scale
     const maxH = (hf.maxM - hf.datumM) * scale
     this.mapUniforms.uHeightRange.value.set(minH, maxH)
+    // P2: one sampler per LOD zoom — a chunk built at zoom z reads z's tile
+    // pyramid level (this.sample stays the primary-zoom sampler for labels,
+    // peaks and tours)
+    const samplers = new Map()
+    for (const [z, field] of this.heightFields) {
+      samplers.set(z, z === this.primaryZoom ? this.sample : this._makeDemSamplerFor(field, params))
+    }
     this._chunkCfg = {
-      res: params.chunkRes,
-      size: proj.tileWorldSize,
-      eps: proj.tileWorldSize / params.chunkRes, // normal probe = one grid cell
+      samplers,
       minH,
       span: Math.max(1e-5, maxH - minH),
       sTint: new Simplex2(mulberry32(params.seed + 101)),
     }
   }
 
-  // Build one chunk mesh for map tile (tx, ty). Its tile 3×3 neighbourhood
-  // must already be cached (the ChunkManager ensures it first). Vertex normals
-  // come from central differences of the global height sampler (not
-  // computeVertexNormals), so normals are identical on both sides of a chunk
-  // border — no lighting seam.
-  addChunk(tx, ty) {
-    const { res, size, eps, minH, span, sTint } = this._chunkCfg
-    const sample = this.sample
-    const center = this.heightField.projection.tileCenterWorld(tx, ty)
-    const geo = new THREE.PlaneGeometry(size, size, res, res)
-    geo.rotateX(-Math.PI / 2)
+  // Build one chunk mesh for map tile (tx, ty) at `zoom` with a res² grid.
+  // Its tile 3×3 neighbourhood at that zoom must already be cached (the
+  // ChunkManager ensures it first). Vertex normals come from central
+  // differences of the per-zoom sampler, so normals are identical on both
+  // sides of a same-zoom border — no lighting seam. A skirt (the edge ring
+  // extruded straight down) hides the hairline cracks that DO exist across
+  // LOD-ring boundaries, where two zooms resample the relief differently.
+  addChunk(zoom, tx, ty, res) {
+    const { samplers, minH, span, sTint } = this._chunkCfg
+    const sample = samplers.get(zoom)
+    const proj = this.heightFields.get(zoom).projection
+    const size = proj.tileWorldSize
+    const eps = size / res // normal probe = one grid cell
+    const skirtDepth = size * 0.03
+    const center = proj.tileCenterWorld(tx, ty)
 
-    const arr = geo.attributes.position.array
-    const count = geo.attributes.position.count
+    const n1 = res + 1
+    const gridCount = n1 * n1
+    const count = gridCount + 4 * n1 // grid + 4 skirt edges
+    const posArr = new Float32Array(count * 3)
     const normals = new Float32Array(count * 3)
     const colors = new Float32Array(count * 3)
-    for (let i = 0; i < count; i++) {
-      const wx = center.x + arr[i * 3]
-      const wz = center.z + arr[i * 3 + 2]
-      const h = sample(wx, wz)
-      arr[i * 3 + 1] = h
+    const uvs = new Float32Array(count * 2)
+    const half = size / 2
 
-      // seam-free normal: central differences of the global sampler
-      const nx = sample(wx - eps, wz) - sample(wx + eps, wz)
-      const nz = sample(wx, wz - eps) - sample(wx, wz + eps)
-      const inv = 1 / Math.hypot(nx, 2 * eps, nz)
-      normals[i * 3] = nx * inv
-      normals[i * 3 + 1] = 2 * eps * inv
-      normals[i * 3 + 2] = nz * inv
+    for (let iy = 0; iy < n1; iy++) {
+      for (let ix = 0; ix < n1; ix++) {
+        const i = iy * n1 + ix
+        const lx = -half + ix * eps
+        const lz = -half + iy * eps
+        const wx = center.x + lx
+        const wz = center.z + lz
+        const h = sample(wx, wz)
+        posArr[i * 3] = lx
+        posArr[i * 3 + 1] = h
+        posArr[i * 3 + 2] = lz
+        uvs[i * 2] = ix / res
+        uvs[i * 2 + 1] = 1 - iy / res
 
-      // vertex tint: height-graded value + slope darkening + grain jitter
-      // (world-coherent, so it too runs continuously across chunks)
-      const hn = (h - minH) / span
-      let v = lerp(0.62, 0.95, Math.pow(hn, 0.85))
-      v *= lerp(0.78, 1.0, Math.pow(Math.max(0, normals[i * 3 + 1]), 0.6))
-      v += fbm(sTint, wx * 1.7, wz * 1.7, 2, 2.2, 0.5) * 0.05
-      colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = v
+        // seam-free normal: central differences of the per-zoom sampler
+        const nx = sample(wx - eps, wz) - sample(wx + eps, wz)
+        const nz = sample(wx, wz - eps) - sample(wx, wz + eps)
+        const inv = 1 / Math.hypot(nx, 2 * eps, nz)
+        normals[i * 3] = nx * inv
+        normals[i * 3 + 1] = 2 * eps * inv
+        normals[i * 3 + 2] = nz * inv
+
+        // vertex tint: height-graded value + slope darkening + grain jitter
+        // (world-coherent, so it too runs continuously across chunks).
+        // hn clamped ≥ 0: coastal DEM data dips a few meters BELOW the fixed
+        // 0 m floor, and pow(negative, 0.85) is NaN → black fog-proof shards.
+        const hn = Math.max(0, (h - minH) / span)
+        let v = lerp(0.62, 0.95, Math.pow(hn, 0.85))
+        v *= lerp(0.78, 1.0, Math.pow(Math.max(0, normals[i * 3 + 1]), 0.6))
+        v += fbm(sTint, wx * 1.7, wz * 1.7, 2, 2.2, 0.5) * 0.05
+        colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = v
+      }
     }
+
+    // skirt vertices: copies of the 4 edge rings pushed straight down. Normals
+    // and colors reuse the edge vertex values — the wall is near-vertical and
+    // in shadow of the rim, so lighting continuity beats geometric correctness.
+    const edges = new Array(4 * n1)
+    for (let ix = 0; ix < n1; ix++) edges[ix] = ix // north row
+    for (let ix = 0; ix < n1; ix++) edges[n1 + ix] = res * n1 + ix // south row
+    for (let iy = 0; iy < n1; iy++) edges[2 * n1 + iy] = iy * n1 // west col
+    for (let iy = 0; iy < n1; iy++) edges[3 * n1 + iy] = iy * n1 + res // east col
+    for (let j = 0; j < edges.length; j++) {
+      const s = edges[j]
+      const d = gridCount + j
+      posArr[d * 3] = posArr[s * 3]
+      posArr[d * 3 + 1] = posArr[s * 3 + 1] - skirtDepth
+      posArr[d * 3 + 2] = posArr[s * 3 + 2]
+      normals[d * 3] = normals[s * 3]
+      normals[d * 3 + 1] = normals[s * 3 + 1]
+      normals[d * 3 + 2] = normals[s * 3 + 2]
+      colors[d * 3] = colors[s * 3]
+      colors[d * 3 + 1] = colors[s * 3 + 1]
+      colors[d * 3 + 2] = colors[s * 3 + 2]
+      uvs[d * 2] = uvs[s * 2]
+      uvs[d * 2 + 1] = uvs[s * 2 + 1]
+    }
+
+    // indices: grid triangles + skirt quads. Skirt quads are emitted with both
+    // windings (they're cheap) so every wall faces outward regardless of edge.
+    const IndexArray = count > 65535 ? Uint32Array : Uint16Array
+    const idx = new IndexArray(res * res * 6 + 4 * res * 12)
+    let o = 0
+    for (let iy = 0; iy < res; iy++) {
+      for (let ix = 0; ix < res; ix++) {
+        const a = iy * n1 + ix
+        const b = a + 1
+        const c = a + n1
+        const d = c + 1
+        idx[o++] = a
+        idx[o++] = c
+        idx[o++] = b
+        idx[o++] = b
+        idx[o++] = c
+        idx[o++] = d
+      }
+    }
+    for (let e = 0; e < 4; e++) {
+      for (let i = 0; i < res; i++) {
+        const t0 = edges[e * n1 + i]
+        const t1 = edges[e * n1 + i + 1]
+        const s0 = gridCount + e * n1 + i
+        const s1 = s0 + 1
+        idx[o++] = t0
+        idx[o++] = t1
+        idx[o++] = s0
+        idx[o++] = t1
+        idx[o++] = s1
+        idx[o++] = s0
+        idx[o++] = t0
+        idx[o++] = s0
+        idx[o++] = t1
+        idx[o++] = t1
+        idx[o++] = s0
+        idx[o++] = s1
+      }
+    }
+
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.BufferAttribute(posArr, 3))
     geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3))
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    geo.setAttribute('uv', new THREE.BufferAttribute(uvs, 2))
+    geo.setIndex(new THREE.BufferAttribute(idx, 1))
 
     const chunk = new THREE.Mesh(geo, this.material)
     chunk.position.set(center.x, 0, center.z)
     chunk.receiveShadow = true
     chunk.castShadow = true
+    chunk.userData = { zoom, tx, ty, res }
     this.chunkGroup.add(chunk)
-    this.chunkMap.set(`${tx},${ty}`, chunk)
+    this.chunkMap.set(`${zoom}/${tx}/${ty}`, chunk)
     return chunk
   }
 

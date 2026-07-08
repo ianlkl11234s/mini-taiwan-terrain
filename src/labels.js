@@ -70,7 +70,7 @@ function settleHeight(sample, x, z, halfW) {
 // `center` follows the pan target in streamed real-world mode: labels re-sow
 // around wherever the camera is (P1 degraded placement — same seeded pattern,
 // translated; smarter per-feature placement is a P3 item).
-export function createLabels(sample, seed, { real = false, toFeet, center = { x: 0, z: 0 } } = {}) {
+export function createLabels(sample, seed, { real = false, toFeet, center = { x: 0, z: 0 }, spots = true } = {}) {
   const group = new THREE.Group()
   const rng = mulberry32(seed * 13 + 29)
 
@@ -97,8 +97,9 @@ export function createLabels(sample, seed, { real = false, toFeet, center = { x:
     })
   }
 
-  // spot elevations: real feet when a DEM drives the terrain
-  const spotCount = real ? 14 : 9
+  // spot elevations: real feet when a DEM drives the terrain. P2 far views
+  // (LOD ≤ 11) stop sowing them — a spot number means nothing at island scale.
+  const spotCount = real ? (spots ? 14 : 0) : 9
   const minDist = real ? 3 : BASIN_BLEND + 1
   for (let i = 0; i < spotCount; i++) {
     const angle = rng() * Math.PI * 2

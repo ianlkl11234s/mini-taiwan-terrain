@@ -183,19 +183,45 @@ scene.background = new THREE.Color(params.fogColor)
 // where the terrain is fully swallowed, hiding the mesh edge
 scene.fog = new THREE.Fog(new THREE.Color(params.fogColor), params.fogNear, params.fogFar)
 
-const camera = new THREE.PerspectiveCamera(params.fov, window.innerWidth / window.innerHeight, 0.5, 220)
+// far plane covers the whole-island view (P2): max dolly 1000 + a scaled fog
+// wall; near stays 0.5 (ratio 6000 — comfortably inside 24-bit depth)
+const camera = new THREE.PerspectiveCamera(params.fov, window.innerWidth / window.innerHeight, 0.5, 3000)
 camera.position.set(0, 18, 19)
 
 // MapControls: left drag = pan across the terrain, right drag = rotate,
-// wheel = dolly — the explore-the-map interaction the chunk grid exists for
+// wheel = dolly — the explore-the-map interaction the chunk grid exists for.
+// maxDistance 1000 in real mode = the whole-island view (applySourceMode
+// keeps procedural mode at the legacy 60).
 const controls = new MapControls(camera, renderer.domElement)
 controls.target.set(0, -0.3, 0)
 controls.enableDamping = true
 controls.dampingFactor = 0.06
 controls.maxPolarAngle = Math.PI * 0.49
 controls.minDistance = 5
-controls.maxDistance = 60
+controls.maxDistance = 1000
 controls.update()
+
+// ---------------------------------------------------------------- P2: distance LOD
+// targetZoom = clamp(12 - round(log2(dist / D0)), 10, 13) with ±15% hysteresis
+// on the crossover distances so the LOD never flaps at a boundary. fogScale
+// is the master far-view multiplier: 1 at dist ≤ D0 (near view = exactly the
+// P1 look), then fog wall / contour interval / survey grid / streaming radius
+// all scale with it.
+const LOD_D0 = 30 // camera distance that maps to z12 (the P0/P1 default view)
+const LOD_MIN = 10
+const LOD_MAX = 13
+const LOD_HYST = 1.15
+let lodZoom = 12
+let fogScale = 1
+
+// camera distance where the ideal zoom flips between z and z-1
+const lodCrossover = (z) => LOD_D0 * Math.pow(2, 12 - z + 0.5)
+function nextLodZoom(dist) {
+  let z = lodZoom
+  while (z > LOD_MIN && dist > lodCrossover(z) * LOD_HYST) z--
+  while (z < LOD_MAX && dist < lodCrossover(z + 1) / LOD_HYST) z++
+  return z
+}
 
 // P1 streams chunks wherever the target goes — pan is only clamped to the
 // Taiwan tile-coverage bbox (beyond it every tile is open sea). Procedural
@@ -274,8 +300,35 @@ function updateSunAnchor() {
 }
 placeSun()
 
+// P2: the ±26 shadow frustum grows with fogScale up to 2×, then the shadow
+// fades out entirely on the way to the island view (dist 60 → 120) — a huge
+// VSM frustum is mush; slope tint + hypso carry the far relief instead.
+const SHADOW_BASE = 26
+let _shadowScale = 1
+let _shadowFade = 1
+function updateShadowScale(dist) {
+  const s = Math.min(Math.max(1, dist / LOD_D0), 2)
+  if (Math.abs(s - _shadowScale) > 0.01) {
+    _shadowScale = s
+    const r = SHADOW_BASE * s
+    sun.shadow.camera.left = -r
+    sun.shadow.camera.right = r
+    sun.shadow.camera.top = r
+    sun.shadow.camera.bottom = -r
+    sun.shadow.camera.far = 80 * s
+    sun.shadow.camera.updateProjectionMatrix()
+    if (params.shadowMode === 'static') renderer.shadowMap.needsUpdate = true
+  }
+  const fade = 1 - THREE.MathUtils.clamp((dist - 60) / 60, 0, 1)
+  if (fade !== _shadowFade) {
+    _shadowFade = fade
+    sun.shadow.intensity = fade
+    applyShadowMode() // stop casting altogether once fully faded
+  }
+}
+
 function applyShadowMode() {
-  sun.castShadow = params.shadowMode !== 'off'
+  sun.castShadow = params.shadowMode !== 'off' && _shadowFade > 0.02
   renderer.shadowMap.autoUpdate = params.shadowMode === 'dynamic'
   if (params.shadowMode === 'static') renderer.shadowMap.needsUpdate = true
 }
@@ -286,8 +339,14 @@ const terrain = new Terrain(params)
 scene.add(terrain.group)
 
 // chunk streaming: which chunks exist follows the pan target (radius tied to
-// the fog wall) — meshes build incrementally so dragging never blocks
-const chunkManager = new ChunkManager(terrain, { radius: () => params.fogFar * 1.15 })
+// the EFFECTIVE fog wall, so it grows with the far-view fogScale) — meshes
+// build incrementally so dragging never blocks. targetZoom/innerRes feed the
+// P2 LOD rings.
+const chunkManager = new ChunkManager(terrain, {
+  radius: () => params.fogFar * fogScale * 1.15,
+  targetZoom: () => lodZoom,
+  innerRes: () => params.chunkRes,
+})
 chunkManager.onChunksChanged = () => {
   if (params.shadowMode === 'static') renderer.shadowMap.needsUpdate = true
 }
@@ -300,6 +359,7 @@ const labelOpts = () => ({
   toFeet: (h) => terrain.heightToFeet(h),
   // streamed world: labels re-sow around the pan target (see tick throttle)
   center: params.source === 'real' ? { x: controls.target.x, z: controls.target.z } : undefined,
+  spots: lodZoom >= 12, // P2: no spot elevations in far views
 })
 let labels = createLabels(terrain.sample, params.seed, labelOpts())
 labels.visible = params.labels
@@ -340,10 +400,16 @@ let heightField = null
 let demBusy = false
 
 const poiFeet = (h) => terrain.heightToFeet(h)
-// real Taiwan peaks around the pan target when a DEM is loaded; hill-climb otherwise
+// real Taiwan peaks around the pan target when a DEM is loaded; hill-climb
+// otherwise. P2: the search radius follows the scaled fog wall, and far views
+// show only the top-8 island peaks (spread apart) so the label field never crowds.
 function computePois() {
   if (params.source === 'real' && heightField) {
-    const real = findRealPeaks(heightField, terrain.sample, poiFeet, controls.target, params.fogFar)
+    const far = lodZoom <= 11
+    const real = findRealPeaks(heightField, terrain.sample, poiFeet, controls.target, params.fogFar * fogScale, {
+      limit: far ? 8 : 6,
+      minSep: 1.5 * fogScale,
+    })
     if (real.length) return real
   }
   return findPois(terrain.sample, params.seed, poiFeet)
@@ -564,12 +630,15 @@ controls.addEventListener('start', () => {
   camera.up.set(0, 1, 0)
 })
 
-// real-world mode strips the fiction: no cone/reticle, no dial platform
+// real-world mode strips the fiction: no cone/reticle, no dial platform.
+// P2: only real mode gets the island-scale dolly range — procedural keeps the
+// legacy 60 (its single plane has nothing to show beyond the fog).
 function applySourceMode() {
   const real = params.source === 'real'
   cone.group.visible = !real
   hud3.platform.visible = !real
   hud2.setReticleVisible(!real)
+  controls.maxDistance = real ? 1000 : 60
 }
 
 function regenerateHud() {
@@ -667,8 +736,15 @@ async function loadRealTerrain() {
   loadingEl.textContent = 'fetching elevation tiles…'
   loadingEl.classList.remove('hidden')
   try {
-    const projection = makeProjection({ lat: params.demLat, lon: params.demLon, zoom: params.demZoom })
-    const hf = new HeightField(projection)
+    // P2: one projection + tile cache per LOD level. They all share the same
+    // world coordinates (K is anchored at z12 regardless of zoom) and, below,
+    // the same frozen datum — so any zoom's chunks land on the same relief.
+    const fields = new Map()
+    for (const z of [LOD_MIN, 11, 12, LOD_MAX]) {
+      fields.set(z, new HeightField(makeProjection({ lat: params.demLat, lon: params.demLon, zoom: z })))
+    }
+    const hf = fields.get(12) // primary: the z12 anchor level
+    const projection = hf.projection
     // seed the 5×5 core (the footprint P0 loaded) and freeze the vertical
     // datum off it — the datum must never shift as tiles stream in later
     const o = projection.worldToPixel(0, 0)
@@ -680,8 +756,9 @@ async function loadRealTerrain() {
     }
     await hf.ensureTiles(core)
     hf.freezeDatum()
+    for (const f of fields.values()) f.datumM = hf.datumM // one datum across LODs
     heightField = hf
-    terrain.setHeightField(hf)
+    terrain.setHeightFields(fields, 12)
     // pan stays inside the tile-coverage bbox (beyond it is all open sea)
     const a = projection.lonLatToWorld(TAIWAN_BBOX.minLon, TAIWAN_BBOX.maxLat)
     const b = projection.lonLatToWorld(TAIWAN_BBOX.maxLon, TAIWAN_BBOX.minLat)
@@ -737,11 +814,12 @@ function applyPreset(name) {
 }
 
 // radar scan: expands from wherever the pan target is when triggered, out to
-// the fog wall (uScanR ≈ the P0 look of 42 units at the default fogFar 50)
+// the fog wall (uScanR ≈ the P0 look of 42 units at the default fogFar 50;
+// scaled with the far-view fogScale so the island view scans the island)
 function triggerScan() {
   scanStart = performance.now() / 1000
   terrain.mapUniforms.uScanCenter.value.set(controls.target.x, controls.target.z)
-  terrain.mapUniforms.uScanR.value = params.fogFar * 0.84
+  terrain.mapUniforms.uScanR.value = params.fogFar * fogScale * 0.84
 }
 
 let rebuildPending = false
@@ -827,9 +905,9 @@ fSource
   .onChange(applyPreset) // fly-to inside the streamed world (no rebuild)
 latCtrl.lat = fSource.add(params, 'demLat', -85, 85, 0.0001).name('latitude')
 latCtrl.lon = fSource.add(params, 'demLon', -180, 180, 0.0001).name('longitude')
-// P1 locks the world to a single zoom (12) — mixing zooms in one streamed
-// world is the P2 LOD-ring work
-latCtrl.zoom = fSource.add(params, 'demZoom', [10, 11, 12, 13]).name('zoom (P2 LOD)').disable()
+// P2: zoom is distance-driven — this is a read-only indicator of the current
+// LOD target (params.demZoom mirrors lodZoom every frame via .listen())
+latCtrl.zoom = fSource.add(params, 'demZoom', [10, 11, 12, 13]).name('lod (auto)').disable().listen()
 fSource
   .add(params, 'demExaggeration', 0.5, 5, 0.1)
   .name('vertical scale')
@@ -1118,8 +1196,11 @@ window.__exp = {
     return {
       chunks: terrain.chunkMap.size,
       queue: chunkManager.queue.length,
-      tiles: heightField ? heightField.tiles.size : 0,
+      tiles: terrain.heightFields ? [...terrain.heightFields.values()].reduce((n, f) => n + f.tiles.size, 0) : 0,
       tileStats: heightField ? { ...heightField.stats } : null,
+      lod: lodZoom,
+      dist: +camera.position.distanceTo(controls.target).toFixed(1),
+      fogScale: +fogScale.toFixed(2),
       fps: Math.round(fps),
     }
   },
@@ -1180,6 +1261,33 @@ function tick() {
     clampPan() // free navigation only — tours / fly-tos manage their own path
   }
 
+  // P2: distance LOD + far-view scaling. At dist ≤ D0 everything resolves to
+  // exactly the P1 values (fogScale = 1); dollying out pushes the fog wall,
+  // contour interval and survey grid out proportionally (the map "morphs" to
+  // the new scale), fades the shadows, and re-targets the LOD rings through
+  // the hysteresis.
+  const camDist = camera.position.distanceTo(controls.target)
+  const realMode = params.source === 'real' && heightField
+  fogScale = realMode ? Math.max(1, camDist / LOD_D0) : 1
+  scene.fog.near = params.fogNear * fogScale
+  scene.fog.far = params.fogFar * fogScale
+  terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
+  terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
+  updateShadowScale(realMode ? camDist : LOD_D0)
+  if (realMode) {
+    const z = nextLodZoom(camDist)
+    if (z !== lodZoom) {
+      lodZoom = z
+      params.demZoom = z // GUI "lod (auto)" indicator
+      if (!rebuildPending) {
+        // far/near label policies changed — re-sow peaks + spot elevations now
+        refreshPoiAnchor()
+        regenerateHud()
+        regenerateLabels()
+      }
+    }
+  }
+
   // chunk streaming + shadow frustum follow the pan target every frame
   // (also during tours/flights, so terrain grows along the flight path)
   chunkManager.update(dt, controls.target.x, controls.target.z)
@@ -1211,7 +1319,7 @@ function tick() {
     gpsAcc = 0
     if (params.source === 'real' && heightField) {
       const ll = heightField.projection.worldToLonLat(controls.target.x, controls.target.z)
-      hud2.setGps(ll.lat, ll.lon, heightField.zoom)
+      hud2.setGps(ll.lat, ll.lon, lodZoom)
     }
   }
 
@@ -1247,6 +1355,7 @@ function tick() {
       az: THREE.MathUtils.radToDeg(sph.theta),
       el: 90 - THREE.MathUtils.radToDeg(sph.phi),
       focus: params.focusDistance,
+      lod: params.source === 'real' && heightField ? lodZoom : null,
       fps,
       clock: `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`,
       coneAlt: cone.group.position.y,

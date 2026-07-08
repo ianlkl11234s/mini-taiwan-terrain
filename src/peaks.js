@@ -7,7 +7,7 @@ import PEAKS from './data/peaks.json'
 // the world streams). Returns POIs shaped like hud3d's findPois() output,
 // or [] when no catalogued peak falls inside `radius` of `center`.
 
-export function findRealPeaks(heightField, sample, toFeet, center, radius) {
+export function findRealPeaks(heightField, sample, toFeet, center, radius, { limit = 6, minSep = 1.5 } = {}) {
   const proj = heightField.projection
 
   const inRange = []
@@ -17,13 +17,15 @@ export function findRealPeaks(heightField, sample, toFeet, center, radius) {
     inRange.push({ ...p, x, z })
   }
 
-  // highest first, drop near-duplicates (twin summits crowd their labels)
+  // highest first, drop near-duplicates (twin summits crowd their labels);
+  // P2 far views raise minSep with the camera distance so the island view
+  // spreads its few labels instead of stacking the central range
   inRange.sort((a, b) => b.elev - a.elev)
   const picked = []
   for (const p of inRange) {
-    if (picked.every((q) => Math.hypot(q.x - p.x, q.z - p.z) >= 1.5)) {
+    if (picked.every((q) => Math.hypot(q.x - p.x, q.z - p.z) >= minSep)) {
       picked.push(p)
-      if (picked.length === 6) break
+      if (picked.length === limit) break
     }
   }
 
