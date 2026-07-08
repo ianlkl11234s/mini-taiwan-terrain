@@ -35,6 +35,23 @@ export default function Settings({ engine }) {
       <Row label="品質 Quality">
         <Segmented options={[32, 64, 128]} value={p.chunkRes} onChange={(v) => { engine.setParams({ chunkRes: v }); setP((prev) => ({ ...prev, chunkRes: v })) }} />
       </Row>
+      <Row label="精緻度 Detail">
+        {/* 標準 = 現況；高 = LOD +1（遠景更銳利）；超高 = +1 且外環滿解析（實驗性，島景重） */}
+        <Segmented
+          options={['標準', '高', '超高']}
+          value={p.detailBias ? (p.outerChunkRes >= 128 ? '超高' : '高') : '標準'}
+          onChange={(label) => {
+            const patch =
+              label === '標準'
+                ? { detailBias: 0, outerChunkRes: 64 }
+                : label === '高'
+                  ? { detailBias: 1, outerChunkRes: 64 }
+                  : { detailBias: 1, outerChunkRes: 128 }
+            engine.setParams(patch)
+            setP((prev) => ({ ...prev, ...patch }))
+          }}
+        />
+      </Row>
 
       <SectionHeader>Map</SectionHeader>
       <Slider label="等高線間距 Contour interval" min={0.04} max={0.6} step={0.01} value={p.contourInterval} onChange={live('contourInterval')} format={(v) => v.toFixed(2)} />

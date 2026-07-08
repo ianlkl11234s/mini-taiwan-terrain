@@ -77,6 +77,7 @@ export function findPois(sample, seed, toFeet = (h) => Math.round(4800 + h * 420
   pois.push({ ...low, id: 'DEP-05', kind: 'BASIN' })
   pois.forEach((p) => {
     p.feet = toFeet(p.h)
+    p.elevM = Math.round(p.feet / 3.28084)
     p.grid = `E ${(p.x + 28).toFixed(1)} · N ${(p.z + 28).toFixed(1)}`
     p.top = new THREE.Vector3(p.x, p.h + 2.1, p.z)
   })

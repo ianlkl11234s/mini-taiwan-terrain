@@ -79,13 +79,14 @@ export function createStage(params, container) {
   controls.maxDistance = 1000
   controls.update()
 
-  let lodZoom = 12
+  let lodBase = 12 // unbiased hysteresis state: clamp(12 − round(log2(dist/30)), 10, 13)
+  let lodZoom = 12 // published target = lodBase + detailBias, re-clamped to tile coverage
   let fogScale = 1
 
   // camera distance where the ideal zoom flips between z and z-1
   const lodCrossover = (z) => LOD_D0 * Math.pow(2, 12 - z + 0.5)
   function nextLodZoom(dist) {
-    let z = lodZoom
+    let z = lodBase
     while (z > LOD_MIN && dist > lodCrossover(z) * LOD_HYST) z--
     while (z < LOD_MAX && dist < lodCrossover(z + 1) / LOD_HYST) z++
     return z
@@ -314,7 +315,11 @@ export function createStage(params, container) {
       updateShadowScale(realMode ? camDist : LOD_D0)
       let lodChanged = false
       if (realMode) {
-        const z = nextLodZoom(camDist)
+        lodBase = nextLodZoom(camDist)
+        // detailBias (0|1, Settings 精緻度) lifts the whole LOD ladder one
+        // level — including the far clamp, so the island view targets z11
+        // (~150 land tiles) instead of z10 — capped at the z13 tile ceiling
+        const z = THREE.MathUtils.clamp(lodBase + (params.detailBias ?? 0), LOD_MIN, LOD_MAX)
         if (z !== lodZoom) {
           lodZoom = z
           params.demZoom = z // GUI "lod (auto)" indicator

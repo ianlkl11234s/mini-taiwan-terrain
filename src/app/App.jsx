@@ -62,7 +62,7 @@ export default function App() {
             <Telemetry engine={engine} />
             <PoiTags engine={engine} />
           </div>
-          <TitleBlock />
+          <TitleBlock engine={engine} />
           <IconRailSidebar engine={engine} />
         </>
       )}

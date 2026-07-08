@@ -7,7 +7,7 @@ import PEAKS from './data/peaks.json'
 // the world streams). Returns POIs shaped like hud3d's findPois() output,
 // or [] when no catalogued peak falls inside `radius` of `center`.
 
-export function findRealPeaks(heightField, sample, toFeet, center, radius, { limit = 6, minSep = 1.5 } = {}) {
+export function findRealPeaks(heightField, sample, center, radius, { limit = 6, minSep = 1.5 } = {}) {
   const proj = heightField.projection
 
   const inRange = []
@@ -36,8 +36,13 @@ export function findRealPeaks(heightField, sample, toFeet, center, radius, { lim
       z: p.z,
       h,
       id: `${p.name} ${Math.round(p.elev)}`,
+      name: p.name,
       kind: 'PEAK',
-      feet: toFeet(h),
+      // display elevations come from the CATALOGUE, not the sampled height —
+      // tiles under far peaks may not be resident (heightAtWorld reads 0 m
+      // there, which used to surface as "0 FT" in the Tour panel)
+      elevM: Math.round(p.elev),
+      feet: Math.round(p.elev * 3.28084),
       grid: `${p.lat.toFixed(4)}, ${p.lon.toFixed(4)}`,
       top: new THREE.Vector3(p.x, h + 2.1, p.z),
     }

@@ -11,6 +11,7 @@ import { ChunkManager } from './chunks.js'
 import { findRealPeaks } from './peaks.js'
 import { createStage, LOD_MIN, LOD_MAX } from './scene.js'
 import { createMotion } from './tour.js'
+import { createKeyPan } from './keypan.js'
 
 // Engine facade — the ONLY module the UI layer imports. Owns the whole 3D
 // world (stage + terrain + chunk streaming + POIs + camera motion) and talks
@@ -44,6 +45,8 @@ export const DEFAULT_PARAMS = {
   demZoom: 12,
   demExaggeration: 1.6,
   chunkRes: 128, // per-chunk grid density (real mode; 25 chunks share it)
+  detailBias: 0, // 0|1 — lifts the distance-LOD ladder one zoom (Settings 精緻度; read by scene.tickView)
+  outerChunkRes: 64, // grid density for outer LOD-ring chunks (64 標準/高, 128 超高)
 
   // terrain generation
   seed: 7,
@@ -174,8 +177,9 @@ const REBUILD_KEYS = new Set([
   'detailScale',
   'resolution',
 ])
-// rebuild only when a DEM world is active
-const REAL_REBUILD_KEYS = new Set(['demExaggeration', 'chunkRes'])
+// rebuild only when a DEM world is active (detailBias needs none: scene.tickView
+// re-targets the LOD next frame and the chunk rings re-stream incrementally)
+const REAL_REBUILD_KEYS = new Set(['demExaggeration', 'chunkRes', 'outerChunkRes'])
 
 export async function createEngine({ container, params: overrides = {} } = {}) {
   const params = { ...DEFAULT_PARAMS, ...overrides }
@@ -222,6 +226,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     radius: () => params.fogFar * stage.fogScale * 1.15,
     targetZoom: () => stage.lodZoom,
     innerRes: () => params.chunkRes,
+    outerRes: () => params.outerChunkRes,
   })
   chunkManager.onChunksChanged = () => stage.shadowNeedsUpdate()
 
@@ -258,7 +263,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function computePois() {
     if (params.source === 'real' && heightField) {
       const far = stage.lodZoom <= 11
-      const real = findRealPeaks(heightField, terrain.sample, poiFeet, controls.target, params.fogFar * stage.fogScale, {
+      const real = findRealPeaks(heightField, terrain.sample, controls.target, params.fogFar * stage.fogScale, {
         limit: far ? 8 : 6,
         minSep: 1.5 * stage.fogScale,
       })
@@ -286,6 +291,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
 
   // user grabbing the camera cancels any fly-to or tour
   controls.addEventListener('start', () => motion.cancel())
+
+  // arrow-key / WASD smooth pan — a mapped keydown cancels motion the same way
+  const keyPan = createKeyPan({ camera, controls, onEngage: () => motion.cancel() })
 
   // ---------------------------------------------------------------- selection
   const HOME = { pos: new THREE.Vector3(0, 18, 19), target: new THREE.Vector3(0, -0.3, 0) }
@@ -653,8 +661,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
 
     // camera motion: tour > fly tween > free navigation (with pan clamp)
     if (!motion.tick(dt)) {
+      keyPan.tick(dt) // arrow/WASD velocity, applied before damping + clamp
       controls.update()
       stage.clampPan() // free navigation only — tours / fly-tos manage their own path
+    } else {
+      keyPan.reset() // no residual glide fighting an active tour/fly-to
     }
 
     // P2: distance LOD + far-view scaling. At dist ≤ D0 everything resolves to
@@ -815,6 +826,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       disposed = true
       cancelAnimationFrame(rafId)
       window.removeEventListener('pointermove', onPointerMove)
+      keyPan.dispose()
       controls.dispose()
       stage.renderer.dispose()
       stage.renderer.domElement.remove()

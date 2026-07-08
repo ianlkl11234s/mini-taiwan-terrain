@@ -21,11 +21,12 @@ const MIN_ZOOM = 10
 const keyOf = (zoom, tx, ty) => zoom + '/' + tx + '/' + ty
 
 export class ChunkManager {
-  constructor(terrain, { radius, targetZoom, innerRes }) {
+  constructor(terrain, { radius, targetZoom, innerRes, outerRes }) {
     this.terrain = terrain
     this.radius = radius // () => world units (effective fog far × 1.15)
     this.targetZoom = targetZoom // () => LOD zoom for the inner ring (10–13)
     this.innerRes = innerRes // () => grid res for inner-ring chunks
+    this.outerRes = outerRes // () => grid res for outer-ring chunks (≤ innerRes)
     this.enabled = false
     this.queue = [] // [{zoom, tx, ty, res, k, d2, state: pending|fetching|ready, rebuild}]
     this.queued = new Map() // k → queue entry
@@ -96,7 +97,7 @@ export class ChunkManager {
     const R2 = R * R
     const R1sq = R * INNER_FRACTION * (R * INNER_FRACTION)
     const resI = this.innerRes()
-    const resO = Math.max(16, resI >> 1)
+    const resO = Math.max(16, Math.min(this.outerRes(), resI)) // never finer than the inner ring
 
     // Desired set, assembled at OUTER-tile granularity: an outer tile whose 4
     // child tiles all sit inside R1 contributes the children (inner zoom,

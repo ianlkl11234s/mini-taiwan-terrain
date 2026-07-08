@@ -70,10 +70,13 @@ export default function Tour({ engine }) {
   return (
     <div>
       <SectionHeader>Points of Interest</SectionHeader>
+      {/* label 用 name（真實山峰 id 是「玉山 3952」— 海拔只顯示一處）；右欄公尺
+          來自 elevM（山峰目錄海拔，不再取樣 height field — 舊 feet 取樣在圖磚
+          未載入時讀 0，顯示成 0 FT） */}
       {pois.map((poi, i) => (
-        <Row key={poi.id} label={poi.id} onClick={() => engine.selectPoi(i)} active={i === selected}>
+        <Row key={poi.id} label={poi.name ?? poi.id} onClick={() => engine.selectPoi(i)} active={i === selected}>
           <span style={{ fontFamily: FONT_DATA, fontSize: T.fs.sm, color: i === selected ? T.accent : T.textFaint }}>
-            {poi.feet.toLocaleString()} FT
+            {poi.elevM.toLocaleString()} m
           </span>
         </Row>
       ))}
