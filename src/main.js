@@ -22,13 +22,14 @@ import { createCone } from './cone.js'
 import { createLabels, disposeLabels } from './labels.js'
 import { createHud3D, findPois } from './hud3d.js'
 import { createHud2D } from './hud2d.js'
-import { loadDem } from './dem.js'
-import { makeProjection, HeightField } from './geo.js'
+import { makeProjection, HeightField, TAIWAN_BBOX } from './geo.js'
+import { ChunkManager } from './chunks.js'
 import { findRealPeaks } from './peaks.js'
 
 // ------------------------------------------------------------------ params
 
-// Taiwan presets: [lat, lon, zoom] — self-hosted NLSC tiles cover z10–13
+// Taiwan presets: [lat, lon, zoom]. P1: one streamed world locked to z12 —
+// presets are fly-to targets inside it (zoom entries kept for the P2 LOD work)
 const DEM_PRESETS = {
   '玉山 Yushan': [23.47, 120.9575, 12],
   '雪山 Xueshan': [24.3836, 121.2317, 12],
@@ -196,15 +197,20 @@ controls.minDistance = 5
 controls.maxDistance = 60
 controls.update()
 
-// P0 has no streaming: chunks only cover the fixed 5×5 grid, so keep the pan
-// target inside its core — the fog wall hides the world's edge beyond it.
-// 0.3 × grid extent = ±28 units at z12 and scales with the loaded zoom.
+// P1 streams chunks wherever the target goes — pan is only clamped to the
+// Taiwan tile-coverage bbox (beyond it every tile is open sea). Procedural
+// mode keeps the legacy ±28 box around its single 56×56 plane.
+let panBounds = null // world-space {minX, maxX, minZ, maxZ}, set when the world loads
 const _panPre = new THREE.Vector3()
 function clampPan() {
-  const limit = heightField ? heightField.extentWorld * 0.3 : 28
   _panPre.copy(controls.target)
-  controls.target.x = THREE.MathUtils.clamp(controls.target.x, -limit, limit)
-  controls.target.z = THREE.MathUtils.clamp(controls.target.z, -limit, limit)
+  if (params.source === 'real' && panBounds) {
+    controls.target.x = THREE.MathUtils.clamp(controls.target.x, panBounds.minX, panBounds.maxX)
+    controls.target.z = THREE.MathUtils.clamp(controls.target.z, panBounds.minZ, panBounds.maxZ)
+  } else {
+    controls.target.x = THREE.MathUtils.clamp(controls.target.x, -28, 28)
+    controls.target.z = THREE.MathUtils.clamp(controls.target.z, -28, 28)
+  }
   // shift the camera by the same correction so clamping doesn't swing the view
   camera.position.add(_panPre.subVectors(controls.target, _panPre))
 }
@@ -232,16 +238,38 @@ sun.shadow.radius = params.shadowSoftness
 sun.shadow.blurSamples = 16
 scene.add(sun)
 
+// the ±26 shadow frustum follows the pan target: light DIRECTION never
+// changes, only the frustum center translates with the world
+const sunTarget = new THREE.Object3D()
+scene.add(sunTarget)
+sun.target = sunTarget
+
 const hemi = new THREE.HemisphereLight(0xdadada, 0x5c5c5c, params.hemiIntensity)
 scene.add(hemi)
 
+const _sunOffset = new THREE.Vector3()
+const _sunAnchor = new THREE.Vector2(NaN, NaN)
 function placeSun() {
   const az = THREE.MathUtils.degToRad(params.sunAzimuth)
   const el = THREE.MathUtils.degToRad(params.sunElevation)
   const r = 34
-  sun.position.set(Math.cos(az) * Math.cos(el) * r, Math.sin(el) * r, Math.sin(az) * Math.cos(el) * r)
+  _sunOffset.set(Math.cos(az) * Math.cos(el) * r, Math.sin(el) * r, Math.sin(az) * Math.cos(el) * r)
   sun.intensity = params.sunIntensity
   hemi.intensity = params.hemiIntensity
+  _sunAnchor.set(NaN, NaN) // force updateSunAnchor to re-place the light
+  updateSunAnchor()
+}
+
+// called every frame — snaps the anchor to a coarse 0.5-unit grid so the VSM
+// shadow doesn't shimmer continuously while panning
+function updateSunAnchor() {
+  const ax = Math.round(controls.target.x * 2) / 2
+  const az = Math.round(controls.target.z * 2) / 2
+  if (ax === _sunAnchor.x && az === _sunAnchor.y) return
+  _sunAnchor.set(ax, az)
+  sunTarget.position.set(ax, 0, az)
+  sun.position.set(_sunOffset.x + ax, _sunOffset.y, _sunOffset.z + az)
+  // VSM maps must re-render once the frustum moves, even in static mode
   if (params.shadowMode === 'static') renderer.shadowMap.needsUpdate = true
 }
 placeSun()
@@ -257,10 +285,22 @@ function applyShadowMode() {
 const terrain = new Terrain(params)
 scene.add(terrain.group)
 
+// chunk streaming: which chunks exist follows the pan target (radius tied to
+// the fog wall) — meshes build incrementally so dragging never blocks
+const chunkManager = new ChunkManager(terrain, { radius: () => params.fogFar * 1.15 })
+chunkManager.onChunksChanged = () => {
+  if (params.shadowMode === 'static') renderer.shadowMap.needsUpdate = true
+}
+
 const cone = createCone()
 scene.add(cone.group)
 
-const labelOpts = () => ({ real: params.source === 'real', toFeet: (h) => terrain.heightToFeet(h) })
+const labelOpts = () => ({
+  real: params.source === 'real',
+  toFeet: (h) => terrain.heightToFeet(h),
+  // streamed world: labels re-sow around the pan target (see tick throttle)
+  center: params.source === 'real' ? { x: controls.target.x, z: controls.target.z } : undefined,
+})
 let labels = createLabels(terrain.sample, params.seed, labelOpts())
 labels.visible = params.labels
 scene.add(labels)
@@ -292,22 +332,28 @@ const tween = {
 let selectedPoi = -1
 let fps = 60
 let scanStart = -1
+let gpsAcc = 0 // SECTOR GPS refresh throttle
+let poiAcc = 0 // peaks/labels refresh throttle
 
 // real-world heightfield (declared before the first POI pass — computePois reads it)
 let heightField = null
 let demBusy = false
 
 const poiFeet = (h) => terrain.heightToFeet(h)
-// real Taiwan peaks when a DEM is loaded and any fall in range; hill-climb otherwise
+// real Taiwan peaks around the pan target when a DEM is loaded; hill-climb otherwise
 function computePois() {
   if (params.source === 'real' && heightField) {
-    const real = findRealPeaks(heightField, terrain.sample, poiFeet)
+    const real = findRealPeaks(heightField, terrain.sample, poiFeet, controls.target, params.fogFar)
     if (real.length) return real
   }
   return findPois(terrain.sample, params.seed, poiFeet)
 }
 let pois = computePois()
-let hud3 = createHud3D(params.seed, pois, { ink: params.hudInk, accent: params.hudAccent })
+let hud3 = createHud3D(params.seed, pois, {
+  ink: params.hudInk,
+  accent: params.hudAccent,
+  platform: params.source !== 'real',
+})
 hud3.lines.visible = params.surveyLines
 scene.add(hud3.group)
 
@@ -498,7 +544,7 @@ const hud2 = createHud2D({
     returnPose.saved = false
   },
   onScan() {
-    scanStart = performance.now() / 1000
+    triggerScan()
     cone.kick(3)
   },
 })
@@ -530,7 +576,11 @@ function regenerateHud() {
   scene.remove(hud3.group)
   hud3.dispose()
   pois = computePois()
-  hud3 = createHud3D(params.seed, pois, { ink: params.hudInk, accent: params.hudAccent })
+  hud3 = createHud3D(params.seed, pois, {
+    ink: params.hudInk,
+    accent: params.hudAccent,
+    platform: params.source !== 'real',
+  })
   hud3.lines.visible = params.surveyLines
   scene.add(hud3.group)
   hud2.setPois(pois)
@@ -602,18 +652,40 @@ window.addEventListener('pointermove', (e) => {
 
 // ------------------------------------------------------------------ real-world DEM loading
 
+// The whole session lives in ONE world: the projection is anchored at the
+// first loaded location (Yushan by default) and never rebuilt — presets and
+// custom coordinates are camera flights inside it, with chunk streaming
+// growing the terrain along the way.
 async function loadRealTerrain() {
+  if (heightField) {
+    // world already exists (e.g. switching back from procedural) — re-enter it
+    regenerateTerrain()
+    return
+  }
   if (demBusy) return
   demBusy = true
   loadingEl.textContent = 'fetching elevation tiles…'
   loadingEl.classList.remove('hidden')
   try {
-    // 5×5 tile mosaic: the height source for the 5×5 chunk grid — every chunk
-    // vertex samples this one surface, so chunk borders are seam-free
-    const dem = await loadDem({ lat: params.demLat, lon: params.demLon, zoom: params.demZoom, tilesAcross: 5 })
     const projection = makeProjection({ lat: params.demLat, lon: params.demLon, zoom: params.demZoom })
-    heightField = new HeightField(dem, projection)
-    terrain.setHeightField(heightField)
+    const hf = new HeightField(projection)
+    // seed the 5×5 core (the footprint P0 loaded) and freeze the vertical
+    // datum off it — the datum must never shift as tiles stream in later
+    const o = projection.worldToPixel(0, 0)
+    const ctileX = Math.floor(o.px / 256)
+    const ctileY = Math.floor(o.py / 256)
+    const core = []
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) core.push({ tx: ctileX + dx, ty: ctileY + dy })
+    }
+    await hf.ensureTiles(core)
+    hf.freezeDatum()
+    heightField = hf
+    terrain.setHeightField(hf)
+    // pan stays inside the tile-coverage bbox (beyond it is all open sea)
+    const a = projection.lonLatToWorld(TAIWAN_BBOX.minLon, TAIWAN_BBOX.maxLat)
+    const b = projection.lonLatToWorld(TAIWAN_BBOX.maxLon, TAIWAN_BBOX.minLat)
+    panBounds = { minX: a.x, maxX: b.x, minZ: a.z, maxZ: b.z }
     params.source = 'real'
     gui.controllersRecursive().forEach((c) => c.updateDisplay())
     loadingEl.textContent = 'generating terrain…'
@@ -630,6 +702,48 @@ async function loadRealTerrain() {
   }
 }
 
+// Fly the pan target to a geographic coordinate (same fly/tween as POI focus);
+// streaming fills the terrain in. Rejects coordinates outside tile coverage.
+const _flyOffset = new THREE.Vector3()
+function flyToLonLat(lon, lat) {
+  if (!heightField) return false
+  if (lon < TAIWAN_BBOX.minLon || lon > TAIWAN_BBOX.maxLon || lat < TAIWAN_BBOX.minLat || lat > TAIWAN_BBOX.maxLat) {
+    loadingEl.textContent = `outside tile coverage (lon ${TAIWAN_BBOX.minLon}–${TAIWAN_BBOX.maxLon} / lat ${TAIWAN_BBOX.minLat}–${TAIWAN_BBOX.maxLat})`
+    loadingEl.classList.remove('hidden')
+    setTimeout(() => {
+      loadingEl.classList.add('hidden')
+      loadingEl.textContent = 'generating terrain…'
+    }, 2600)
+    return false
+  }
+  const { x, z } = heightField.projection.lonLatToWorld(lon, lat)
+  _flyOffset.subVectors(camera.position, controls.target) // keep the current view offset
+  const target = new THREE.Vector3(x, controls.target.y, z)
+  flyTo(target.clone().add(_flyOffset), target)
+  hud2.setStatic(params) // refresh the SECTOR location name
+  return true
+}
+
+function applyPreset(name) {
+  const p = DEM_PRESETS[name]
+  if (!p) return // Custom: use the lat/lon fields + load button
+  params.demLocation = name
+  params.demLat = p[0]
+  params.demLon = p[1]
+  gui.controllersRecursive().forEach((c) => c.updateDisplay())
+  if (params.source !== 'real') return
+  if (heightField) flyToLonLat(p[1], p[0])
+  else loadRealTerrain()
+}
+
+// radar scan: expands from wherever the pan target is when triggered, out to
+// the fog wall (uScanR ≈ the P0 look of 42 units at the default fogFar 50)
+function triggerScan() {
+  scanStart = performance.now() / 1000
+  terrain.mapUniforms.uScanCenter.value.set(controls.target.x, controls.target.z)
+  terrain.mapUniforms.uScanR.value = params.fogFar * 0.84
+}
+
 let rebuildPending = false
 function regenerateTerrain() {
   if (rebuildPending) return
@@ -640,13 +754,30 @@ function regenerateTerrain() {
     setTimeout(() => {
       terrain.rebuild(params)
       terrain.rebuildRoughness(params)
+      if (params.source === 'real' && heightField) {
+        // streamed world: existing chunks re-queue and rebuild incrementally
+        // (near → far); missing ones stream in via the manager's own loop
+        chunkManager.setEnabled(true)
+        chunkManager.invalidate()
+      } else {
+        chunkManager.setEnabled(false)
+        chunkManager.clear()
+      }
       regenerateLabels()
       regenerateHud()
+      refreshPoiAnchor()
       if (params.shadowMode === 'static') renderer.shadowMap.needsUpdate = true
       rebuildPending = false
       loadingEl.classList.add('hidden')
     }, 30)
   )
+}
+
+// where peaks/labels were last computed — the tick throttle refreshes them
+// once the target wanders far enough from this anchor
+const poiAnchor = new THREE.Vector2(0, 0)
+function refreshPoiAnchor() {
+  poiAnchor.set(controls.target.x, controls.target.z)
 }
 
 // ------------------------------------------------------------------ GUI
@@ -693,25 +824,12 @@ const latCtrl = { lat: null, lon: null, zoom: null }
 fSource
   .add(params, 'demLocation', Object.keys(DEM_PRESETS))
   .name('location')
-  .onChange((name) => {
-    const p = DEM_PRESETS[name]
-    if (!p) return // Custom: use the lat/lon fields below
-    params.demLat = p[0]
-    params.demLon = p[1]
-    params.demZoom = p[2]
-    latCtrl.lat.updateDisplay()
-    latCtrl.lon.updateDisplay()
-    latCtrl.zoom.updateDisplay()
-    if (params.source === 'real') loadRealTerrain()
-  })
+  .onChange(applyPreset) // fly-to inside the streamed world (no rebuild)
 latCtrl.lat = fSource.add(params, 'demLat', -85, 85, 0.0001).name('latitude')
 latCtrl.lon = fSource.add(params, 'demLon', -180, 180, 0.0001).name('longitude')
-latCtrl.zoom = fSource
-  .add(params, 'demZoom', [10, 11, 12, 13])
-  .name('detail (zoom)')
-  .onChange(() => {
-    if (params.source === 'real') loadRealTerrain()
-  })
+// P1 locks the world to a single zoom (12) — mixing zooms in one streamed
+// world is the P2 LOD-ring work
+latCtrl.zoom = fSource.add(params, 'demZoom', [10, 11, 12, 13]).name('zoom (P2 LOD)').disable()
 fSource
   .add(params, 'demExaggeration', 0.5, 5, 0.1)
   .name('vertical scale')
@@ -724,7 +842,17 @@ fSource
   .onFinishChange(() => {
     if (params.source === 'real') regenerateTerrain()
   })
-fSource.add({ load: () => loadRealTerrain() }, 'load').name('load location ⤓')
+fSource
+  .add(
+    {
+      load: () => {
+        if (heightField && params.source === 'real') flyToLonLat(params.demLon, params.demLat)
+        else loadRealTerrain()
+      },
+    },
+    'load'
+  )
+  .name('load location ⤓')
 
 const fTerrain = gui.addFolder('Terrain')
 fTerrain.add(params, 'seed', 1, 9999, 1).onFinishChange(regenerateTerrain)
@@ -877,7 +1005,7 @@ fHud
   .add(params, 'scanDispFalloff', 0.1, 6, 0.05)
   .name('wave falloff')
   .onChange((v) => (terrain.mapUniforms.uScanDispW.value = v))
-fHud.add({ scan: () => (scanStart = performance.now() / 1000) }, 'scan').name('trigger scan')
+fHud.add({ scan: triggerScan }, 'scan').name('trigger scan')
 
 const fMotion = gui.addFolder('Motion')
 fMotion.add(params, 'coneSpin', 0, 3, 0.05).name('cone spin')
@@ -977,9 +1105,24 @@ window.__exp = {
   controls,
   params,
   terrain,
+  chunkManager,
   loadRealTerrain,
+  flyToLonLat,
+  applyPreset,
+  regenerateTerrain,
+  triggerScan,
   get labels() { return labels },
   get heightField() { return heightField },
+  get fps() { return fps },
+  stats() {
+    return {
+      chunks: terrain.chunkMap.size,
+      queue: chunkManager.queue.length,
+      tiles: heightField ? heightField.tiles.size : 0,
+      tileStats: heightField ? { ...heightField.stats } : null,
+      fps: Math.round(fps),
+    }
+  },
 }
 
 // real world is the default source — fetch its tiles on startup
@@ -1037,6 +1180,11 @@ function tick() {
     clampPan() // free navigation only — tours / fly-tos manage their own path
   }
 
+  // chunk streaming + shadow frustum follow the pan target every frame
+  // (also during tours/flights, so terrain grows along the flight path)
+  chunkManager.update(dt, controls.target.x, controls.target.z)
+  updateSunAnchor()
+
   // refresh camera matrices NOW so DOM projections match this frame's render
   // (otherwise labels are projected with last frame's matrices and lag behind)
   camera.updateMatrixWorld()
@@ -1054,6 +1202,33 @@ function tick() {
       terrain.mapUniforms.uScanT.value = -1
     } else {
       terrain.mapUniforms.uScanT.value = p
+    }
+  }
+
+  // live SECTOR GPS: the pan target's geographic coordinate (throttled)
+  gpsAcc += dt
+  if (gpsAcc > 0.5) {
+    gpsAcc = 0
+    if (params.source === 'real' && heightField) {
+      const ll = heightField.projection.worldToLonLat(controls.target.x, controls.target.z)
+      hud2.setGps(ll.lat, ll.lon, heightField.zoom)
+    }
+  }
+
+  // peaks + spot labels follow the pan target: refresh once it wanders far
+  // enough from the last anchor (throttled; skipped mid-flight/tour so POI
+  // sets don't churn under an active animation)
+  poiAcc += dt
+  if (poiAcc > 2) {
+    poiAcc = 0
+    if (params.source === 'real' && heightField && !tour.active && !tween.active && !rebuildPending) {
+      const moved = Math.hypot(controls.target.x - poiAnchor.x, controls.target.z - poiAnchor.y)
+      if (moved > 4) {
+        refreshPoiAnchor()
+        const fresh = computePois()
+        if (fresh.map((p) => p.id).join('|') !== pois.map((p) => p.id).join('|')) regenerateHud()
+        regenerateLabels()
+      }
     }
   }
 

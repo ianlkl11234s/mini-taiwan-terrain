@@ -1,20 +1,19 @@
 import * as THREE from 'three'
 import PEAKS from './data/peaks.json'
 
-// Real Taiwan peaks (name / elev / lat / lon) projected into the loaded chunk
-// grid via the shared world projection (geo.js), so peaks land exactly on the
-// height field. Returns POIs shaped like hud3d's findPois() output, or []
-// when no catalogued peak falls inside the loaded terrain.
+// Real Taiwan peaks (name / elev / lat / lon) projected into the streamed
+// world via the shared projection (geo.js), so peaks land exactly on the
+// height field. Search is centered on the pan target (peaks enter/leave as
+// the world streams). Returns POIs shaped like hud3d's findPois() output,
+// or [] when no catalogued peak falls inside `radius` of `center`.
 
-export function findRealPeaks(heightField, sample, toFeet) {
+export function findRealPeaks(heightField, sample, toFeet, center, radius) {
   const proj = heightField.projection
-  // keep a small margin so labels don't sit on the fogged chunk-grid edge
-  const limit = heightField.extentWorld * 0.47
 
   const inRange = []
   for (const p of PEAKS) {
     const { x, z } = proj.lonLatToWorld(p.lon, p.lat)
-    if (Math.abs(x) > limit || Math.abs(z) > limit) continue
+    if (Math.hypot(x - center.x, z - center.z) > radius) continue
     inRange.push({ ...p, x, z })
   }
 

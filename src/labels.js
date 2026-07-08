@@ -67,7 +67,10 @@ function settleHeight(sample, x, z, halfW) {
   return h + 0.14
 }
 
-export function createLabels(sample, seed, { real = false, toFeet } = {}) {
+// `center` follows the pan target in streamed real-world mode: labels re-sow
+// around wherever the camera is (P1 degraded placement — same seeded pattern,
+// translated; smarter per-feature placement is a P3 item).
+export function createLabels(sample, seed, { real = false, toFeet, center = { x: 0, z: 0 } } = {}) {
   const group = new THREE.Group()
   const rng = mulberry32(seed * 13 + 29)
 
@@ -75,16 +78,16 @@ export function createLabels(sample, seed, { real = false, toFeet } = {}) {
   if (!real) {
     const region = makeLabelMesh('N A V A J O   P L A T E A U', { size: 110, italic: false, spacing: 0.9, opacity: 0.78 }, 22)
     region.rotation.x = -Math.PI / 2
-    region.position.set(0, 0, -12.5)
-    region.position.y = settleHeight(sample, 0, -12.5, 11)
+    region.position.set(center.x, 0, center.z - 12.5)
+    region.position.y = settleHeight(sample, center.x, center.z - 12.5, 11)
     group.add(region)
 
     const names = [...PLACE_NAMES].sort(() => rng() - 0.5).slice(0, 7)
     names.forEach((name) => {
       const angle = rng() * Math.PI * 2
       const dist = BASIN_BLEND + 2.5 + rng() * 12
-      const x = Math.cos(angle) * dist
-      const z = Math.sin(angle) * dist
+      const x = center.x + Math.cos(angle) * dist
+      const z = center.z + Math.sin(angle) * dist
       const width = 3.6 + rng() * 1.8
       const mesh = makeLabelMesh(name, { size: 96, italic: true, spacing: 0.3, opacity: 0.85 }, width)
       mesh.rotation.x = -Math.PI / 2
@@ -100,8 +103,8 @@ export function createLabels(sample, seed, { real = false, toFeet } = {}) {
   for (let i = 0; i < spotCount; i++) {
     const angle = rng() * Math.PI * 2
     const dist = minDist + rng() * (24 - minDist)
-    const x = Math.cos(angle) * dist
-    const z = Math.sin(angle) * dist
+    const x = center.x + Math.cos(angle) * dist
+    const z = center.z + Math.sin(angle) * dist
     const h = sample(x, z)
     const feet = toFeet ? toFeet(h) : Math.round(4800 + h * 420 + rng() * 40)
     const mesh = makeLabelMesh(`· ${feet}`, { size: 78, italic: false, spacing: 0.06, opacity: 0.85, color: '#2a241c' }, 1.5)

@@ -33,6 +33,8 @@ export class Terrain {
       uSlopeTint: { value: params.slopeTint },
       uContourColor: { value: new THREE.Color(params.contourColor) },
       uScanT: { value: -1 }, // scan progress 0..1, negative = inactive
+      uScanR: { value: 42 }, // full sweep radius, world units (main.js ties it to fog far)
+      uScanCenter: { value: new THREE.Vector2(0, 0) }, // pan target at trigger time
       uScanColor: { value: new THREE.Color(params.scanColor) },
       uScanWidth: { value: params.scanWidth },
       uScanBlur: { value: params.scanBlur },
@@ -48,6 +50,8 @@ export class Terrain {
           `#include <common>
 varying vec3 vWorldPos;
 uniform float uScanT;
+uniform float uScanR;
+uniform vec2 uScanCenter;
 uniform float uScanDispH;
 uniform float uScanDispW;`
         )
@@ -59,8 +63,8 @@ uniform float uScanDispW;`
 // coords would give each chunk its own wave center)
 if (uScanT >= 0.0) {
   vec3 wPre = (modelMatrix * vec4(transformed, 1.0)).xyz;
-  float dV = length(wPre.xz);
-  float RV = uScanT * 42.0;
+  float dV = length(wPre.xz - uScanCenter);
+  float RV = uScanT * uScanR;
   float bumpV = exp(-pow((dV - RV) / max(uScanDispW, 0.05), 2.0));
   transformed.y += uScanDispH * bumpV * (1.0 - smoothstep(0.6, 1.0, uScanT));
 }
@@ -83,6 +87,8 @@ uniform float uHeightPivot;
 uniform float uSlopeTint;
 uniform vec3 uContourColor;
 uniform float uScanT;
+uniform float uScanR;
+uniform vec2 uScanCenter;
 uniform vec3 uScanColor;
 uniform float uScanWidth;
 uniform float uScanBlur;`
@@ -128,8 +134,8 @@ uniform float uScanBlur;`
 
   // --- radar scan wavefront paints the surface (additive-only washes out on white terrain)
   if (uScanT >= 0.0) {
-    float dScan = length(vWorldPos.xz);
-    float Rs = uScanT * 42.0;
+    float dScan = length(vWorldPos.xz - uScanCenter);
+    float Rs = uScanT * uScanR;
     float aaS = fwidth(dScan);
     float edgeS = abs(dScan - Rs) - uScanWidth * 0.5;
     float bandS = 1.0 - smoothstep(0.0, max(uScanBlur, aaS), edgeS);
@@ -143,8 +149,8 @@ uniform float uScanBlur;`
           `#include <emissivemap_fragment>
 // radar scan ripple: an emissive wavefront expanding from the center across the relief
 if (uScanT >= 0.0) {
-  float d = length(vWorldPos.xz);
-  float R = uScanT * 42.0;
+  float d = length(vWorldPos.xz - uScanCenter);
+  float R = uScanT * uScanR;
   float edgeE = abs(d - R) - uScanWidth * 0.5;
   float band = 1.0 - smoothstep(0.0, max(uScanBlur, fwidth(d)), edgeE);
   float fade = 1.0 - smoothstep(0.6, 1.0, uScanT);
@@ -154,7 +160,8 @@ if (uScanT >= 0.0) {
     }
     // group holds both terrain forms; main.js adds terrain.group to the scene.
     // - procedural mode: the legacy single 56×56 plane (this.mesh)
-    // - real mode: a grid of chunk meshes, one per map tile (this.chunkGroup)
+    // - real mode: streamed chunk meshes, one per map tile (this.chunkGroup),
+    //   built/removed by the ChunkManager (chunks.js) as the pan target moves
     // All chunks share this.material — one shader, world-space overlays, so
     // contours / grid / hypsometric tint run continuously across chunk borders.
     this.group = new THREE.Group()
@@ -164,7 +171,7 @@ if (uScanT >= 0.0) {
     this.group.add(this.mesh)
     this.chunkGroup = new THREE.Group()
     this.group.add(this.chunkGroup)
-    this.chunks = []
+    this.chunkMap = new Map() // "tx,ty" → chunk mesh
     this.heightField = null // real-world height source (geo.js), set via setHeightField()
     this.rebuild(params)
     this.rebuildRoughness(params)
@@ -180,12 +187,12 @@ if (uScanT >= 0.0) {
   }
 
   // Sampler over the real-world height field: world xz → meters → scene units.
-  // Heights are datum-shifted (mosaic mean → y 0) so framing, fog and camera
-  // keep working; XY and Y share the projection's K so proportions are true.
+  // Heights are datum-shifted (initial-core mean → y 0) so framing, fog and
+  // camera keep working; XY and Y share the projection's K so proportions are true.
   _makeDemSampler(params) {
     const hf = this.heightField
     const scale = hf.projection.K * params.demExaggeration
-    const datumM = hf.dem.meanM
+    const datumM = hf.datumM
     this._h2ft = (h) => Math.round((h / scale + datumM) * 3.28084)
 
     const sDetail = new Simplex2(mulberry32(params.seed))
@@ -269,89 +276,94 @@ if (uScanT >= 0.0) {
   rebuild(params) {
     const sample = this._makeSampler(params)
     this.sample = sample
-    if (params.source === 'real' && this.heightField) {
-      this.mesh.visible = false
-      this._rebuildChunks(params, sample)
+    const real = params.source === 'real' && this.heightField
+    this.mesh.visible = !real
+    this.chunkGroup.visible = !!real
+    if (real) {
+      // chunk meshes are owned by the ChunkManager — nothing builds here,
+      // only the shared shading config the incremental builds will use
+      this._prepareChunkShading(params)
     } else {
-      this._disposeChunks()
-      this.mesh.visible = true
       this._rebuildSinglePlane(params, sample)
     }
   }
 
-  _disposeChunks() {
-    for (const chunk of this.chunks) {
-      this.chunkGroup.remove(chunk)
-      chunk.geometry.dispose() // material is shared — never disposed here
-    }
-    this.chunks = []
-  }
-
-  // Real-world mode: one mesh per map tile, all sampling the same height
-  // field, all sharing the single material. Vertex normals come from central
-  // differences of the height sampler (not computeVertexNormals), so normals
-  // are identical on both sides of a chunk border — no lighting seam.
-  _rebuildChunks(params, sample) {
-    this._disposeChunks()
+  // Shading config shared by every chunk build. The height range is the FIXED
+  // island-wide range (heightField.minM/maxM) — chunks built minutes apart
+  // must normalize hypsometric tint identically or borders would seam.
+  _prepareChunkShading(params) {
     const hf = this.heightField
     const proj = hf.projection
-    const res = params.chunkRes
-    const size = proj.tileWorldSize
-    const eps = size / res // normal probe distance = one grid cell
     const scale = proj.K * params.demExaggeration
-    const datumM = hf.dem.meanM
-
-    // global height range straight off the mosaic — one range for every chunk
-    // keeps the hypsometric ramp and vertex tint continuous across borders
-    const minH = (hf.dem.minM - datumM) * scale
-    const maxH = (hf.dem.maxM - datumM) * scale
+    const minH = (hf.minM - hf.datumM) * scale
+    const maxH = (hf.maxM - hf.datumM) * scale
     this.mapUniforms.uHeightRange.value.set(minH, maxH)
-    const span = Math.max(1e-5, maxH - minH)
-    const sTint = new Simplex2(mulberry32(params.seed + 101))
-
-    for (let ty = hf.tileY0; ty < hf.tileY0 + hf.tilesAcross; ty++) {
-      for (let tx = hf.tileX0; tx < hf.tileX0 + hf.tilesAcross; tx++) {
-        const center = proj.tileCenterWorld(tx, ty)
-        const geo = new THREE.PlaneGeometry(size, size, res, res)
-        geo.rotateX(-Math.PI / 2)
-
-        const arr = geo.attributes.position.array
-        const count = geo.attributes.position.count
-        const normals = new Float32Array(count * 3)
-        const colors = new Float32Array(count * 3)
-        for (let i = 0; i < count; i++) {
-          const wx = center.x + arr[i * 3]
-          const wz = center.z + arr[i * 3 + 2]
-          const h = sample(wx, wz)
-          arr[i * 3 + 1] = h
-
-          // seam-free normal: central differences of the global sampler
-          const nx = sample(wx - eps, wz) - sample(wx + eps, wz)
-          const nz = sample(wx, wz - eps) - sample(wx, wz + eps)
-          const inv = 1 / Math.hypot(nx, 2 * eps, nz)
-          normals[i * 3] = nx * inv
-          normals[i * 3 + 1] = 2 * eps * inv
-          normals[i * 3 + 2] = nz * inv
-
-          // vertex tint: height-graded value + slope darkening + grain jitter
-          // (world-coherent, so it too runs continuously across chunks)
-          const hn = (h - minH) / span
-          let v = lerp(0.62, 0.95, Math.pow(hn, 0.85))
-          v *= lerp(0.78, 1.0, Math.pow(Math.max(0, normals[i * 3 + 1]), 0.6))
-          v += fbm(sTint, wx * 1.7, wz * 1.7, 2, 2.2, 0.5) * 0.05
-          colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = v
-        }
-        geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3))
-        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-
-        const chunk = new THREE.Mesh(geo, this.material)
-        chunk.position.set(center.x, 0, center.z)
-        chunk.receiveShadow = true
-        chunk.castShadow = true
-        this.chunkGroup.add(chunk)
-        this.chunks.push(chunk)
-      }
+    this._chunkCfg = {
+      res: params.chunkRes,
+      size: proj.tileWorldSize,
+      eps: proj.tileWorldSize / params.chunkRes, // normal probe = one grid cell
+      minH,
+      span: Math.max(1e-5, maxH - minH),
+      sTint: new Simplex2(mulberry32(params.seed + 101)),
     }
+  }
+
+  // Build one chunk mesh for map tile (tx, ty). Its tile 3×3 neighbourhood
+  // must already be cached (the ChunkManager ensures it first). Vertex normals
+  // come from central differences of the global height sampler (not
+  // computeVertexNormals), so normals are identical on both sides of a chunk
+  // border — no lighting seam.
+  addChunk(tx, ty) {
+    const { res, size, eps, minH, span, sTint } = this._chunkCfg
+    const sample = this.sample
+    const center = this.heightField.projection.tileCenterWorld(tx, ty)
+    const geo = new THREE.PlaneGeometry(size, size, res, res)
+    geo.rotateX(-Math.PI / 2)
+
+    const arr = geo.attributes.position.array
+    const count = geo.attributes.position.count
+    const normals = new Float32Array(count * 3)
+    const colors = new Float32Array(count * 3)
+    for (let i = 0; i < count; i++) {
+      const wx = center.x + arr[i * 3]
+      const wz = center.z + arr[i * 3 + 2]
+      const h = sample(wx, wz)
+      arr[i * 3 + 1] = h
+
+      // seam-free normal: central differences of the global sampler
+      const nx = sample(wx - eps, wz) - sample(wx + eps, wz)
+      const nz = sample(wx, wz - eps) - sample(wx, wz + eps)
+      const inv = 1 / Math.hypot(nx, 2 * eps, nz)
+      normals[i * 3] = nx * inv
+      normals[i * 3 + 1] = 2 * eps * inv
+      normals[i * 3 + 2] = nz * inv
+
+      // vertex tint: height-graded value + slope darkening + grain jitter
+      // (world-coherent, so it too runs continuously across chunks)
+      const hn = (h - minH) / span
+      let v = lerp(0.62, 0.95, Math.pow(hn, 0.85))
+      v *= lerp(0.78, 1.0, Math.pow(Math.max(0, normals[i * 3 + 1]), 0.6))
+      v += fbm(sTint, wx * 1.7, wz * 1.7, 2, 2.2, 0.5) * 0.05
+      colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = v
+    }
+    geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3))
+    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+
+    const chunk = new THREE.Mesh(geo, this.material)
+    chunk.position.set(center.x, 0, center.z)
+    chunk.receiveShadow = true
+    chunk.castShadow = true
+    this.chunkGroup.add(chunk)
+    this.chunkMap.set(`${tx},${ty}`, chunk)
+    return chunk
+  }
+
+  removeChunk(key) {
+    const chunk = this.chunkMap.get(key)
+    if (!chunk) return
+    this.chunkGroup.remove(chunk)
+    chunk.geometry.dispose() // material is shared — never disposed here
+    this.chunkMap.delete(key)
   }
 
   // Procedural mode: the original single 56×56 plane, untouched.

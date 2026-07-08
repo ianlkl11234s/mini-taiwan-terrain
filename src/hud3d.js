@@ -227,18 +227,26 @@ function drawPulseRing(ctx, size, accent) {
   ctx.stroke()
 }
 
-export function createHud3D(seed, pois, { ink, accent }) {
+export function createHud3D(seed, pois, { ink, accent, platform: withPlatform = true }) {
   const rng = mulberry32(seed * 51 + 17)
   const group = new THREE.Group()
   const baseY = FLOOR_Y + 0.02
 
-  // dial + rings + sweep live in their own subgroup so real-world mode can hide them
+  // dial + rings + sweep live in their own subgroup. Real-world mode skips
+  // building them entirely (they'd be hidden anyway, and the 2048² dial canvas
+  // is too expensive for the throttled POI refreshes that happen mid-pan).
   const platform = new THREE.Group()
-  const dial = flatPlane(canvasTex(2048, (ctx, s) => drawDial(ctx, s, ink, accent, rng)), 12.6, baseY, 0.95)
-  const ringA = flatPlane(canvasTex(1024, (ctx, s) => drawDashRing(ctx, s, ink, 0.86, 24)), 10.6, baseY + 0.02, 0.85)
-  const ringB = flatPlane(canvasTex(1024, (ctx, s) => drawDashRing(ctx, s, accent, 0.62, 48)), 8.0, baseY + 0.03, 0.7)
-  const sweep = flatPlane(canvasTex(1024, (ctx, s) => drawSweep(ctx, s, accent)), 12.2, baseY + 0.01, 0.8)
-  platform.add(dial, ringA, ringB, sweep)
+  let dial = null
+  let ringA = null
+  let ringB = null
+  let sweep = null
+  if (withPlatform) {
+    dial = flatPlane(canvasTex(2048, (ctx, s) => drawDial(ctx, s, ink, accent, rng)), 12.6, baseY, 0.95)
+    ringA = flatPlane(canvasTex(1024, (ctx, s) => drawDashRing(ctx, s, ink, 0.86, 24)), 10.6, baseY + 0.02, 0.85)
+    ringB = flatPlane(canvasTex(1024, (ctx, s) => drawDashRing(ctx, s, accent, 0.62, 48)), 8.0, baseY + 0.03, 0.7)
+    sweep = flatPlane(canvasTex(1024, (ctx, s) => drawSweep(ctx, s, accent)), 12.2, baseY + 0.01, 0.8)
+    platform.add(dial, ringA, ringB, sweep)
+  }
   group.add(platform)
 
   // POI stems: thin vertical hairline + accent cap marker
@@ -288,10 +296,12 @@ export function createHud3D(seed, pois, { ink, accent }) {
       pulses.push(p)
     },
     update(dt, t, { ringSpeed, sweepSpeed }) {
-      ringA.rotation.z += 0.11 * ringSpeed * dt
-      ringB.rotation.z -= 0.07 * ringSpeed * dt
-      sweep.rotation.z -= sweepSpeed * dt
-      dial.material.opacity = 0.88 + Math.sin(t * 1.8) * 0.07
+      if (dial) {
+        ringA.rotation.z += 0.11 * ringSpeed * dt
+        ringB.rotation.z -= 0.07 * ringSpeed * dt
+        sweep.rotation.z -= sweepSpeed * dt
+        dial.material.opacity = 0.88 + Math.sin(t * 1.8) * 0.07
+      }
       for (let i = pulses.length - 1; i >= 0; i--) {
         const p = pulses[i]
         p.userData.age += dt

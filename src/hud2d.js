@@ -116,6 +116,11 @@ export function createHud2D({ onSelectPoi, onDeselect, onScan }) {
         ? 'ELEV: NLSC 20M DTM (2024)'
         : `SEED ${String(p.seed).padStart(4, '0')} · MESH ${p.resolution}²`
     },
+    // live GPS readout while panning (real mode) — the rest of the sector
+    // block keeps the loaded-center name from setStatic()
+    setGps(lat, lon, zoom) {
+      q(sector, 'gps').textContent = `GPS: ${lat.toFixed(4)}, ${lon.toFixed(4)} · Z${zoom}`
+    },
     setSelected(i, poi) {
       selected = i
       poiEls.forEach((m, j) => m.classList.toggle('active', j === i))
