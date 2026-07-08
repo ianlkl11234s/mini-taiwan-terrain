@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { MapControls } from 'three/addons/controls/MapControls.js'
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js'
 import GUI from 'lil-gui'
 import {
@@ -23,6 +23,7 @@ import { createLabels, disposeLabels } from './labels.js'
 import { createHud3D, findPois } from './hud3d.js'
 import { createHud2D } from './hud2d.js'
 import { loadDem } from './dem.js'
+import { makeProjection, HeightField } from './geo.js'
 import { findRealPeaks } from './peaks.js'
 
 // ------------------------------------------------------------------ params
@@ -48,6 +49,7 @@ const params = {
   demLon: 120.9575,
   demZoom: 12,
   demExaggeration: 1.6,
+  chunkRes: 128, // per-chunk grid density (real mode; 25 chunks share it)
 
   // terrain generation
   seed: 7,
@@ -183,14 +185,29 @@ scene.fog = new THREE.Fog(new THREE.Color(params.fogColor), params.fogNear, para
 const camera = new THREE.PerspectiveCamera(params.fov, window.innerWidth / window.innerHeight, 0.5, 220)
 camera.position.set(0, 18, 19)
 
-const controls = new OrbitControls(camera, renderer.domElement)
+// MapControls: left drag = pan across the terrain, right drag = rotate,
+// wheel = dolly — the explore-the-map interaction the chunk grid exists for
+const controls = new MapControls(camera, renderer.domElement)
 controls.target.set(0, -0.3, 0)
 controls.enableDamping = true
 controls.dampingFactor = 0.06
 controls.maxPolarAngle = Math.PI * 0.49
-controls.minDistance = 6
+controls.minDistance = 5
 controls.maxDistance = 60
 controls.update()
+
+// P0 has no streaming: chunks only cover the fixed 5×5 grid, so keep the pan
+// target inside its core — the fog wall hides the world's edge beyond it.
+// 0.3 × grid extent = ±28 units at z12 and scales with the loaded zoom.
+const _panPre = new THREE.Vector3()
+function clampPan() {
+  const limit = heightField ? heightField.extentWorld * 0.3 : 28
+  _panPre.copy(controls.target)
+  controls.target.x = THREE.MathUtils.clamp(controls.target.x, -limit, limit)
+  controls.target.z = THREE.MathUtils.clamp(controls.target.z, -limit, limit)
+  // shift the camera by the same correction so clamping doesn't swing the view
+  camera.position.add(_panPre.subVectors(controls.target, _panPre))
+}
 
 // image-based lighting for believable PBR speculars
 const pmrem = new THREE.PMREMGenerator(renderer)
@@ -238,7 +255,7 @@ function applyShadowMode() {
 // ------------------------------------------------------------------ world
 
 const terrain = new Terrain(params)
-scene.add(terrain.mesh)
+scene.add(terrain.group)
 
 const cone = createCone()
 scene.add(cone.group)
@@ -277,14 +294,14 @@ let fps = 60
 let scanStart = -1
 
 // real-world heightfield (declared before the first POI pass — computePois reads it)
-let dem = null
+let heightField = null
 let demBusy = false
 
 const poiFeet = (h) => terrain.heightToFeet(h)
 // real Taiwan peaks when a DEM is loaded and any fall in range; hill-climb otherwise
 function computePois() {
-  if (params.source === 'real' && dem) {
-    const real = findRealPeaks(dem, terrain.sample, poiFeet)
+  if (params.source === 'real' && heightField) {
+    const real = findRealPeaks(heightField, terrain.sample, poiFeet)
     if (real.length) return real
   }
   return findPois(terrain.sample, params.seed, poiFeet)
@@ -591,8 +608,12 @@ async function loadRealTerrain() {
   loadingEl.textContent = 'fetching elevation tiles…'
   loadingEl.classList.remove('hidden')
   try {
-    dem = await loadDem({ lat: params.demLat, lon: params.demLon, zoom: params.demZoom })
-    terrain.setDem(dem)
+    // 5×5 tile mosaic: the height source for the 5×5 chunk grid — every chunk
+    // vertex samples this one surface, so chunk borders are seam-free
+    const dem = await loadDem({ lat: params.demLat, lon: params.demLon, zoom: params.demZoom, tilesAcross: 5 })
+    const projection = makeProjection({ lat: params.demLat, lon: params.demLon, zoom: params.demZoom })
+    heightField = new HeightField(dem, projection)
+    terrain.setHeightField(heightField)
     params.source = 'real'
     gui.controllersRecursive().forEach((c) => c.updateDisplay())
     loadingEl.textContent = 'generating terrain…'
@@ -694,6 +715,12 @@ latCtrl.zoom = fSource
 fSource
   .add(params, 'demExaggeration', 0.5, 5, 0.1)
   .name('vertical scale')
+  .onFinishChange(() => {
+    if (params.source === 'real') regenerateTerrain()
+  })
+fSource
+  .add(params, 'chunkRes', [32, 64, 128])
+  .name('chunk resolution')
   .onFinishChange(() => {
     if (params.source === 'real') regenerateTerrain()
   })
@@ -944,7 +971,16 @@ fLight.close()
 // ------------------------------------------------------------------ loop
 
 // console access for debugging/scripting
-window.__exp = { scene, camera, controls, params, terrain, loadRealTerrain, get labels() { return labels } }
+window.__exp = {
+  scene,
+  camera,
+  controls,
+  params,
+  terrain,
+  loadRealTerrain,
+  get labels() { return labels },
+  get heightField() { return heightField },
+}
 
 // real world is the default source — fetch its tiles on startup
 if (params.source === 'real') loadRealTerrain()
@@ -998,6 +1034,7 @@ function tick() {
     if (tween.t >= 1) tween.active = false
   } else {
     controls.update()
+    clampPan() // free navigation only — tours / fly-tos manage their own path
   }
 
   // refresh camera matrices NOW so DOM projections match this frame's render

@@ -1,6 +1,5 @@
 import * as THREE from 'three'
 import { Simplex2, mulberry32, fbm, ridged, smoothstep, lerp } from './noise.js'
-import { sampleDem } from './dem.js'
 
 export const TERRAIN_SIZE = 56
 export const BASIN_RADIUS = 6.6 // flat excavation floor
@@ -56,8 +55,11 @@ uniform float uScanDispW;`
           '#include <begin_vertex>',
           `#include <begin_vertex>
 // scan wave physically lifts the surface as it sweeps outward
+// (distance measured in WORLD space — chunk meshes are translated, so local
+// coords would give each chunk its own wave center)
 if (uScanT >= 0.0) {
-  float dV = length(transformed.xz);
+  vec3 wPre = (modelMatrix * vec4(transformed, 1.0)).xyz;
+  float dV = length(wPre.xz);
   float RV = uScanT * 42.0;
   float bumpV = exp(-pow((dV - RV) / max(uScanDispW, 0.05), 2.0));
   transformed.y += uScanDispH * bumpV * (1.0 - smoothstep(0.6, 1.0, uScanT));
@@ -150,16 +152,26 @@ if (uScanT >= 0.0) {
 }`
         )
     }
+    // group holds both terrain forms; main.js adds terrain.group to the scene.
+    // - procedural mode: the legacy single 56×56 plane (this.mesh)
+    // - real mode: a grid of chunk meshes, one per map tile (this.chunkGroup)
+    // All chunks share this.material — one shader, world-space overlays, so
+    // contours / grid / hypsometric tint run continuously across chunk borders.
+    this.group = new THREE.Group()
     this.mesh = new THREE.Mesh(new THREE.BufferGeometry(), this.material)
     this.mesh.receiveShadow = true
     this.mesh.castShadow = true
-    this.dem = null // real-world heightfield, set via setDem()
+    this.group.add(this.mesh)
+    this.chunkGroup = new THREE.Group()
+    this.group.add(this.chunkGroup)
+    this.chunks = []
+    this.heightField = null // real-world height source (geo.js), set via setHeightField()
     this.rebuild(params)
     this.rebuildRoughness(params)
   }
 
-  setDem(dem) {
-    this.dem = dem
+  setHeightField(heightField) {
+    this.heightField = heightField
   }
 
   // scene height → display elevation in feet (real when a DEM drives the terrain)
@@ -167,21 +179,21 @@ if (uScanT >= 0.0) {
     return this._h2ft ? this._h2ft(h) : Math.round(4800 + h * 420)
   }
 
-  // Sampler over a fetched real-world DEM: world xz → bilinear meters → scene units.
+  // Sampler over the real-world height field: world xz → meters → scene units.
+  // Heights are datum-shifted (mosaic mean → y 0) so framing, fog and camera
+  // keep working; XY and Y share the projection's K so proportions are true.
   _makeDemSampler(params) {
-    const dem = this.dem
-    const scale = (TERRAIN_SIZE / dem.extentMeters) * params.demExaggeration
-    const meanM = dem.meanM
-    this._h2ft = (h) => Math.round((h / scale + meanM) * 3.28084)
+    const hf = this.heightField
+    const scale = hf.projection.K * params.demExaggeration
+    const datumM = hf.dem.meanM
+    this._h2ft = (h) => Math.round((h / scale + datumM) * 3.28084)
 
     const sDetail = new Simplex2(mulberry32(params.seed))
-    const { size } = dem
     const { detail, detailScale } = params
 
     return (x, z) => {
-      const px = (x / TERRAIN_SIZE + 0.5) * (size - 1)
-      const py = (z / TERRAIN_SIZE + 0.5) * (size - 1)
-      let h = (sampleDem(dem, px, py) - meanM) * scale
+      const h = (hf.heightAtWorld(x, z) - datumM) * scale
+      if (detail === 0) return h // fast path — chunk normals sample 5× per vertex
 
       // optional fine grain on top of the (smoother) 30m-class data
       const fine =
@@ -194,7 +206,7 @@ if (uScanT >= 0.0) {
 
   // Height field sampler for the current seed — kept so other objects can query it.
   _makeSampler(params) {
-    if (params.source === 'real' && this.dem) return this._makeDemSampler(params)
+    if (params.source === 'real' && this.heightField) return this._makeDemSampler(params)
     this._h2ft = null // procedural: fictional elevations
     const rng = mulberry32(params.seed)
     const sWarp = new Simplex2(rng)
@@ -255,12 +267,98 @@ if (uScanT >= 0.0) {
   }
 
   rebuild(params) {
+    const sample = this._makeSampler(params)
+    this.sample = sample
+    if (params.source === 'real' && this.heightField) {
+      this.mesh.visible = false
+      this._rebuildChunks(params, sample)
+    } else {
+      this._disposeChunks()
+      this.mesh.visible = true
+      this._rebuildSinglePlane(params, sample)
+    }
+  }
+
+  _disposeChunks() {
+    for (const chunk of this.chunks) {
+      this.chunkGroup.remove(chunk)
+      chunk.geometry.dispose() // material is shared — never disposed here
+    }
+    this.chunks = []
+  }
+
+  // Real-world mode: one mesh per map tile, all sampling the same height
+  // field, all sharing the single material. Vertex normals come from central
+  // differences of the height sampler (not computeVertexNormals), so normals
+  // are identical on both sides of a chunk border — no lighting seam.
+  _rebuildChunks(params, sample) {
+    this._disposeChunks()
+    const hf = this.heightField
+    const proj = hf.projection
+    const res = params.chunkRes
+    const size = proj.tileWorldSize
+    const eps = size / res // normal probe distance = one grid cell
+    const scale = proj.K * params.demExaggeration
+    const datumM = hf.dem.meanM
+
+    // global height range straight off the mosaic — one range for every chunk
+    // keeps the hypsometric ramp and vertex tint continuous across borders
+    const minH = (hf.dem.minM - datumM) * scale
+    const maxH = (hf.dem.maxM - datumM) * scale
+    this.mapUniforms.uHeightRange.value.set(minH, maxH)
+    const span = Math.max(1e-5, maxH - minH)
+    const sTint = new Simplex2(mulberry32(params.seed + 101))
+
+    for (let ty = hf.tileY0; ty < hf.tileY0 + hf.tilesAcross; ty++) {
+      for (let tx = hf.tileX0; tx < hf.tileX0 + hf.tilesAcross; tx++) {
+        const center = proj.tileCenterWorld(tx, ty)
+        const geo = new THREE.PlaneGeometry(size, size, res, res)
+        geo.rotateX(-Math.PI / 2)
+
+        const arr = geo.attributes.position.array
+        const count = geo.attributes.position.count
+        const normals = new Float32Array(count * 3)
+        const colors = new Float32Array(count * 3)
+        for (let i = 0; i < count; i++) {
+          const wx = center.x + arr[i * 3]
+          const wz = center.z + arr[i * 3 + 2]
+          const h = sample(wx, wz)
+          arr[i * 3 + 1] = h
+
+          // seam-free normal: central differences of the global sampler
+          const nx = sample(wx - eps, wz) - sample(wx + eps, wz)
+          const nz = sample(wx, wz - eps) - sample(wx, wz + eps)
+          const inv = 1 / Math.hypot(nx, 2 * eps, nz)
+          normals[i * 3] = nx * inv
+          normals[i * 3 + 1] = 2 * eps * inv
+          normals[i * 3 + 2] = nz * inv
+
+          // vertex tint: height-graded value + slope darkening + grain jitter
+          // (world-coherent, so it too runs continuously across chunks)
+          const hn = (h - minH) / span
+          let v = lerp(0.62, 0.95, Math.pow(hn, 0.85))
+          v *= lerp(0.78, 1.0, Math.pow(Math.max(0, normals[i * 3 + 1]), 0.6))
+          v += fbm(sTint, wx * 1.7, wz * 1.7, 2, 2.2, 0.5) * 0.05
+          colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = v
+        }
+        geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3))
+        geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+
+        const chunk = new THREE.Mesh(geo, this.material)
+        chunk.position.set(center.x, 0, center.z)
+        chunk.receiveShadow = true
+        chunk.castShadow = true
+        this.chunkGroup.add(chunk)
+        this.chunks.push(chunk)
+      }
+    }
+  }
+
+  // Procedural mode: the original single 56×56 plane, untouched.
+  _rebuildSinglePlane(params, sample) {
     const res = params.resolution
     const geo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, res, res)
     geo.rotateX(-Math.PI / 2)
-
-    const sample = this._makeSampler(params)
-    this.sample = sample
 
     const pos = geo.attributes.position
     const count = pos.count
