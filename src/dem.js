@@ -1,8 +1,9 @@
-// Real-world elevation via AWS Terrain Tiles (Mapzen/Tilezen "terrarium" PNGs).
-// Public S3 bucket, no API key. meters = (R*256 + G + B/256) - 32768
-// Attribution: Terrain Tiles / Mapzen / Tilezen — AWS Open Data.
+// Real-world elevation via NLSC 20m DTM (2024) re-encoded as terrarium RGB PNGs.
+// Self-hosted XYZ tiles, z10–13, Taiwan only. meters = (R*256 + G + B/256) - 32768
+// Pure-sea tiles are not generated — a missing tile reads as elevation 0.
 
-const TILE_URL = (z, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`
+const TILE_BASE = import.meta.env.VITE_TILE_BASE ?? '/tiles'
+const TILE_URL = (z, x, y) => `${TILE_BASE}/${z}/${x}/${y}.png`
 const TILE_PX = 256
 
 export async function loadDem({ lat, lon, zoom, tilesAcross = 3 }) {
@@ -17,6 +18,10 @@ export async function loadDem({ lat, lon, zoom, tilesAcross = 3 }) {
   canvas.width = canvas.height = sizePx
   const ctx = canvas.getContext('2d', { willReadFrequently: true })
 
+  // pre-fill with terrarium sea level (0 m = R128 G0 B0) so missing tiles read as 0
+  ctx.fillStyle = 'rgb(128, 0, 0)'
+  ctx.fillRect(0, 0, sizePx, sizePx)
+
   const jobs = []
   for (let dy = -half; dy <= half; dy++) {
     for (let dx = -half; dx <= half; dx++) {
@@ -26,11 +31,16 @@ export async function loadDem({ lat, lon, zoom, tilesAcross = 3 }) {
       jobs.push(
         fetch(TILE_URL(zoom, tx, ty))
           .then((r) => {
-            if (!r.ok) throw new Error(`elevation tile ${zoom}/${tx}/${ty} → HTTP ${r.status}`)
+            // vite's SPA fallback answers missing tiles with 200 + index.html — treat as missing
+            if (!r.ok || !(r.headers.get('content-type') || '').includes('image')) {
+              throw new Error(`elevation tile ${zoom}/${tx}/${ty} → HTTP ${r.status}`)
+            }
             return r.blob()
           })
           .then(createImageBitmap)
           .then((img) => ctx.drawImage(img, (dx + half) * TILE_PX, (dy + half) * TILE_PX))
+          // missing / failed tile = open sea → keep the pre-filled 0 m, never reject
+          .catch(() => {})
       )
     }
   }

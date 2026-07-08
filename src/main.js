@@ -23,26 +23,29 @@ import { createLabels, disposeLabels } from './labels.js'
 import { createHud3D, findPois } from './hud3d.js'
 import { createHud2D } from './hud2d.js'
 import { loadDem } from './dem.js'
+import { findRealPeaks } from './peaks.js'
 
 // ------------------------------------------------------------------ params
 
+// Taiwan presets: [lat, lon, zoom] — self-hosted NLSC tiles cover z10–13
 const DEM_PRESETS = {
-  'Monument Valley': [36.998, -110.0984],
-  'Grand Canyon': [36.0997, -112.1124],
-  Matterhorn: [45.9766, 7.6585],
-  'Mount Fuji': [35.3606, 138.7274],
-  'Death Valley': [36.2679, -116.8253],
-  'Everest Massif': [27.9881, 86.925],
-  Landmannalaugar: [63.983, -19.056],
+  '玉山 Yushan': [23.47, 120.9575, 12],
+  '雪山 Xueshan': [24.3836, 121.2317, 12],
+  '大霸尖山 Dabajian': [24.4607, 121.2578, 13],
+  '南湖大山 Nanhu': [24.362, 121.4383, 12],
+  '合歡山 Hehuan': [24.1436, 121.2716, 12],
+  '太魯閣 Taroko': [24.1735, 121.4906, 12],
+  '嘉明湖 Jiaming Lake': [23.2907, 121.0325, 13],
+  '七星山 Qixing': [25.17, 121.556, 13],
   Custom: null,
 }
 
 const params = {
   // terrain source
   source: 'real',
-  demLocation: 'Monument Valley',
-  demLat: 36.998,
-  demLon: -110.0984,
+  demLocation: '玉山 Yushan',
+  demLat: 23.47,
+  demLon: 120.9575,
   demZoom: 12,
   demExaggeration: 1.6,
 
@@ -273,8 +276,20 @@ let selectedPoi = -1
 let fps = 60
 let scanStart = -1
 
+// real-world heightfield (declared before the first POI pass — computePois reads it)
+let dem = null
+let demBusy = false
+
 const poiFeet = (h) => terrain.heightToFeet(h)
-let pois = findPois(terrain.sample, params.seed, poiFeet)
+// real Taiwan peaks when a DEM is loaded and any fall in range; hill-climb otherwise
+function computePois() {
+  if (params.source === 'real' && dem) {
+    const real = findRealPeaks(dem, terrain.sample, poiFeet)
+    if (real.length) return real
+  }
+  return findPois(terrain.sample, params.seed, poiFeet)
+}
+let pois = computePois()
 let hud3 = createHud3D(params.seed, pois, { ink: params.hudInk, accent: params.hudAccent })
 hud3.lines.visible = params.surveyLines
 scene.add(hud3.group)
@@ -497,7 +512,7 @@ function applySourceMode() {
 function regenerateHud() {
   scene.remove(hud3.group)
   hud3.dispose()
-  pois = findPois(terrain.sample, params.seed, poiFeet)
+  pois = computePois()
   hud3 = createHud3D(params.seed, pois, { ink: params.hudInk, accent: params.hudAccent })
   hud3.lines.visible = params.surveyLines
   scene.add(hud3.group)
@@ -506,6 +521,7 @@ function regenerateHud() {
   selectedPoi = -1
   hud2.setSelected(-1, null)
   applySourceMode()
+  refreshTourOptions()
 }
 applySourceMode()
 
@@ -569,8 +585,6 @@ window.addEventListener('pointermove', (e) => {
 
 // ------------------------------------------------------------------ real-world DEM loading
 
-let dem = null
-let demBusy = false
 async function loadRealTerrain() {
   if (demBusy) return
   demBusy = true
@@ -616,7 +630,12 @@ function regenerateTerrain() {
 
 // ------------------------------------------------------------------ GUI
 
-const gui = new GUI({ title: 'EXPERIMENT / 001' })
+// dock the panel on the LEFT (below the title block) instead of lil-gui's
+// default top-right auto-placement
+const guiDock = document.createElement('div')
+guiDock.id = 'gui-dock'
+document.body.appendChild(guiDock)
+const gui = new GUI({ title: 'TERRAIN ART / 001', container: guiDock })
 
 const copyCtrl = gui
   .add(
@@ -649,7 +668,7 @@ fSource
     if (v === 'real') loadRealTerrain()
     else regenerateTerrain()
   })
-const latCtrl = { lat: null, lon: null }
+const latCtrl = { lat: null, lon: null, zoom: null }
 fSource
   .add(params, 'demLocation', Object.keys(DEM_PRESETS))
   .name('location')
@@ -658,14 +677,16 @@ fSource
     if (!p) return // Custom: use the lat/lon fields below
     params.demLat = p[0]
     params.demLon = p[1]
+    params.demZoom = p[2]
     latCtrl.lat.updateDisplay()
     latCtrl.lon.updateDisplay()
+    latCtrl.zoom.updateDisplay()
     if (params.source === 'real') loadRealTerrain()
   })
 latCtrl.lat = fSource.add(params, 'demLat', -85, 85, 0.0001).name('latitude')
 latCtrl.lon = fSource.add(params, 'demLon', -180, 180, 0.0001).name('longitude')
-fSource
-  .add(params, 'demZoom', [10, 11, 12, 13, 14])
+latCtrl.zoom = fSource
+  .add(params, 'demZoom', [10, 11, 12, 13])
   .name('detail (zoom)')
   .onChange(() => {
     if (params.source === 'real') loadRealTerrain()
@@ -840,10 +861,21 @@ fMotion.add(params, 'ringSpeed', 0, 6, 0.1).name('ring speed')
 fMotion.add(params, 'flyDuration', 0.4, 4, 0.1).name('fly duration')
 fMotion.add(params, 'flyEasing', ['smooth', 'glide', 'linear']).name('fly easing')
 
-const POI_IDS = ['PK-01', 'PK-02', 'PK-03', 'PK-04', 'DEP-05']
 const fTour = gui.addFolder('Tour')
-fTour.add(params, 'tourFrom', POI_IDS).name('from')
-fTour.add(params, 'tourTo', POI_IDS).name('to')
+let tourFromCtrl = fTour.add(params, 'tourFrom', pois.map((p) => p.id)).name('from')
+let tourToCtrl = fTour.add(params, 'tourTo', pois.map((p) => p.id)).name('to')
+
+// POI ids change whenever the terrain regenerates (real peak names vs PK-xx) —
+// rebuild both dropdowns and keep them at the top of the folder
+function refreshTourOptions() {
+  const ids = pois.map((p) => p.id)
+  if (!ids.includes(params.tourFrom)) params.tourFrom = ids[0]
+  if (!ids.includes(params.tourTo)) params.tourTo = ids[1] ?? ids[0]
+  tourFromCtrl = tourFromCtrl.options(ids).name('from')
+  tourToCtrl = tourToCtrl.options(ids).name('to')
+  fTour.$children.prepend(tourToCtrl.domElement)
+  fTour.$children.prepend(tourFromCtrl.domElement)
+}
 fTour.add(params, 'tourDuration', 4, 40, 0.5).name('duration (s)')
 fTour.add(params, 'tourAltitude', 0.8, 10, 0.1).name('altitude')
 fTour.add(params, 'tourSmoothing', 0, 1, 0.02).name('path smoothing')
@@ -896,7 +928,9 @@ fLight
   .name('shadow softness')
   .onChange((v) => (sun.shadow.radius = v))
 
-// only Terrain source and Tour start expanded
+// only Terrain source starts expanded (Tour closed too — the GUI now docks on
+// the left and a fully expanded column would cover the bottom-left telemetry)
+fTour.close()
 fTerrain.close()
 fSurface.close()
 fCamera.close()

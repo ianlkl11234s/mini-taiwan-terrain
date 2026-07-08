@@ -113,7 +113,7 @@ export function createHud2D({ onSelectPoi, onDeselect, onScan }) {
         ? `GPS: ${p.demLat.toFixed(4)}, ${p.demLon.toFixed(4)} · Z${p.demZoom}`
         : 'GPS: 46.4076, 11.8524 · GRID 56×56'
       q(sector, 'meta').textContent = real
-        ? 'ELEV: TERRAIN TILES © MAPZEN/TILEZEN'
+        ? 'ELEV: NLSC 20M DTM (2024)'
         : `SEED ${String(p.seed).padStart(4, '0')} · MESH ${p.resolution}²`
     },
     setSelected(i, poi) {

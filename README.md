@@ -1,66 +1,46 @@
-# MONOLITH — interactive 3D topographic map
+# Terrain Art — 台灣 3D 地形視覺化
 
-An interactive, real-time 3D terrain map in the style of a vintage USGS topographic sheet, crossed with a sci-fi FUI overlay. Load **real-world elevation data** for anywhere on Earth, or generate procedural mountain ranges — then explore them with contour lines, hypsometric tinting, survey grids, spot elevations, clickable peak markers, radar scans, and cinematic camera tours.
+台灣版的互動 3D 地形圖：復古 USGS 地形圖紙質感 + FUI 掃描介面，載入**台灣真實高程**（玉山、雪山、大霸尖山、太魯閣…8 個 preset，或自訂經緯度），以等高線、分層設色、測量網格、真實山峰 POI 與電影式飛覽探索。
 
-**Live demo:** https://kaolti.github.io/monolith-terrain/
+Fork 自 [kaolti/monolith-terrain](https://github.com/kaolti/monolith-terrain)（MIT），資料源由 AWS Terrain Tiles 換成自家 NLSC 20m DTM 圖磚，並加上真實山峰標註與台灣 preset。
 
-## How to use
+## 資料來源
 
-| Action | How |
-|---|---|
-| Look around | Drag to orbit, scroll to zoom, right-drag to pan |
-| Inspect a peak / basin | Click a `PK-xx` / `DEP-xx` marker — the camera flies in and a data panel opens |
-| Go back | Click ✕ on the panel — the camera returns to where you were |
-| Cinematic flyover | Open **Tour**, pick *from* / *to*, press **▶ start tour** (drag to cancel mid-flight) |
-| Radar scan | **HUD → trigger scan** — a wave sweeps the terrain and physically lifts the surface |
-| Change location | **Terrain source → location** presets, or *Custom* + latitude/longitude, then **load location** |
-| Save your settings | **copy parameters** puts the full state on your clipboard as JSON |
+- **高程**：內政部國土測繪中心（NLSC）20 公尺網格數值地形模型（DTM），2024 年版，[政府資料開放授權條款](https://data.gov.tw/license)。已重編碼為 terrarium RGB PNG XYZ 圖磚（z10–13，`meters = R*256 + G + B/256 - 32768`；純海域 tile 不產生，缺 tile 視為海平面 0 m）。
+- **山峰**：`src/data/peaks.json`（40 筆，name / elev / lat / lon）。
 
-### Terrain sources
+## 圖磚接線
 
-- **real world (DEM)** — fetches elevation tiles for the chosen coordinates and rebuilds the map with true landforms. Spot elevations and peak data show real values.
-  - **detail (zoom)** — z10–14: how large an area you get (z12 ≈ 28 km across, z13 ≈ 14 km)
-  - **vertical scale** — relief exaggeration; real proportions read flat at map scale, so 1.5–3 is typical
-- **procedural noise** — seeded multi-octave simplex terrain with a hovering monolith and an excavated instrument basin. Every knob (octaves, warp, amplitude…) is live.
+圖磚不進 git（`public/tiles` 已 ignore）。兩種接法：
 
-### Parameter folders
+```bash
+# A. symlink 到本機圖磚目錄（開發用）
+ln -s /path/to/taipei-gis-analytics/data/processed/base_map/terrain_rgb/tiles public/tiles
 
-**Map overlay** (hypsometric gradient stops, contour interval/color, survey grid) · **Surface material** (roughness, micro bump) · **Camera & focus** (real depth of field with autofocus) · **Look** (exposure, contrast, grain, fog) · **HUD** (accent/ink colors, scan wave shape + displacement) · **Motion / Tour** (fly-to easing, tour path smoothing, banking, look-ahead) · **Performance** (render scale, static shadows, shadow resolution) · **Light** (sun azimuth/elevation, shadow softness).
+# B. 環境變數指到任一 tile server / CDN
+VITE_TILE_BASE=https://example.com/tiles npm run dev
+```
 
-## Run locally
+未設 `VITE_TILE_BASE` 時預設抓 `/tiles/{z}/{x}/{y}.png`。
+
+## Dev
 
 ```bash
 npm install
 npm run dev     # http://localhost:5173
-npm run build   # static build in dist/
+npm run build   # 靜態產物在 dist/
 ```
 
-No API keys or environment variables needed.
+## 操作
 
-## Deploy
-
-Pushing to `main` auto-deploys to GitHub Pages via the included workflow. Alternatively, any static host works:
-
-```bash
-npm run build
-npx wrangler deploy   # Cloudflare (uses wrangler.jsonc)
-```
-
-## Tech
-
-- [three.js](https://threejs.org) — rendering; terrain map styling (gradient, contours, grid, scan wave) is injected into the standard PBR shader via `onBeforeCompile`
-- [postprocessing](https://github.com/pmndrs/postprocessing) — real depth-buffer DOF, ACES tone mapping, grain, vignette, SMAA
-- [lil-gui](https://lil-gui.georgealways.com) — parameter panel
-- [Vite](https://vitejs.dev) — build; plain JavaScript, no framework
-- Hand-rolled seeded simplex noise / FBM / ridged multifractal for procedural terrain
-- Tours: Catmull-Rom path sampled by arc length, trapezoidal velocity profile, damped-gimbal rotation controller
-
-## Elevation data & attribution
-
-Real-world mode uses the **[Terrain Tiles](https://registry.opendata.aws/terrain-tiles/)** dataset (Terrarium encoding), publicly hosted through the AWS Open Data program — no key required.
-
-> Terrain tiles by [Mapzen](https://www.mapzen.com/) / [Tilezen](https://github.com/tilezen/joerd), from the AWS Open Data Terrain Tiles dataset. Underlying data sources include SRTM (NASA), USGS 3DEP/NED, ETOPO1 (NOAA) and others — see the [full attribution list](https://github.com/tilezen/joerd/blob/master/docs/attribution.md).
+| 動作 | 方式 |
+|---|---|
+| 環視 | 拖曳旋轉、滾輪縮放、右鍵平移 |
+| 看某座山 | 點山峰標籤（真名 + 海拔）— 鏡頭飛入並開啟資料卡 |
+| 電影式飛覽 | 左側面板 **Tour** 選 from / to，按 **▶ start tour** |
+| 換地點 | **Terrain source → location** 選 preset，或 Custom + 經緯度後按 **load location** |
+| 雷達掃描 | **HUD → trigger scan** |
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — 沿用上游 kaolti/monolith-terrain 之授權，LICENSE 檔保留原作者版權聲明。
