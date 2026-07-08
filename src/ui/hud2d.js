@@ -1,8 +1,8 @@
-import * as THREE from 'three'
-
 // Screen-space FUI layer: sector data block, telemetry, cone tracking reticle,
-// POI markers with leader lines, and a selection panel. Anchored elements are
-// projected from world space every frame.
+// POI markers with leader lines, and a selection panel. Pure DOM — all world →
+// screen projection happens engine-side; frame() receives ready screen-space
+// coordinates (the engine's 'frame' event). This is the layer the React shell
+// (R2) will replace.
 
 const el = (cls, html = '') => {
   const d = document.createElement('div')
@@ -76,7 +76,6 @@ export function createHud2D({ onSelectPoi, onDeselect, onScan }) {
   // ---- POI markers
   let poiEls = []
   let selected = -1
-  const v = new THREE.Vector3()
 
   function setPois(pois) {
     poiEls.forEach((p) => p.remove())
@@ -91,15 +90,6 @@ export function createHud2D({ onSelectPoi, onDeselect, onScan }) {
     })
   }
 
-  function project(camera, w, h, world, out) {
-    v.copy(world).project(camera)
-    out.visible = v.z < 1
-    out.x = (v.x * 0.5 + 0.5) * w
-    out.y = (-v.y * 0.5 + 0.5) * h
-    return out
-  }
-
-  const pos = { x: 0, y: 0, visible: true }
   let acc = 0
   let reticleOn = true
 
@@ -135,34 +125,33 @@ export function createHud2D({ onSelectPoi, onDeselect, onScan }) {
         panel.style.display = 'none'
       }
     },
-    update(dt, camera, w, h, data) {
+    // engine 'frame' event payload: screen-space anchors + telemetry numbers
+    frame(data) {
       // anchored: reticle on the cone
       if (reticleOn) {
-        project(camera, w, h, data.conePoint, pos)
-        reticle.style.transform = `translate(${pos.x.toFixed(1)}px, ${pos.y.toFixed(1)}px)`
-        reticle.style.opacity = pos.visible ? 1 : 0
+        reticle.style.transform = `translate(${data.reticle.x.toFixed(1)}px, ${data.reticle.y.toFixed(1)}px)`
+        reticle.style.opacity = data.reticle.visible ? 1 : 0
       }
 
       // anchored: POI markers
-      data.pois.forEach((p, i) => {
+      data.poiScreens.forEach((pos, i) => {
         const m = poiEls[i]
         if (!m) return
-        project(camera, w, h, p.top, pos)
         m.style.transform = `translate(${pos.x.toFixed(1)}px, ${pos.y.toFixed(1)}px)`
         m.style.opacity = pos.visible ? 1 : 0
       })
 
       // anchored: selection panel follows its marker, just below the tag
-      if (selected >= 0 && data.pois[selected]) {
-        project(camera, w, h, data.pois[selected].top, pos)
-        const px = Math.min(Math.max(pos.x + 14, 10), w - 270)
-        const py = Math.min(pos.y + 16, h - 190)
+      if (selected >= 0 && data.poiScreens[selected]) {
+        const pos = data.poiScreens[selected]
+        const px = Math.min(Math.max(pos.x + 14, 10), window.innerWidth - 270)
+        const py = Math.min(pos.y + 16, window.innerHeight - 190)
         panel.style.transform = `translate(${px.toFixed(1)}px, ${py.toFixed(1)}px)`
         panel.style.opacity = pos.visible ? 1 : 0
       }
 
       // throttled text refresh
-      acc += dt
+      acc += data.dt
       if (acc > 0.15) {
         acc = 0
         q(telem, 'az').textContent = `${data.az.toFixed(1)}°`
@@ -184,6 +173,14 @@ export function createHud2D({ onSelectPoi, onDeselect, onScan }) {
     },
     setOpacity(o) {
       root.style.opacity = o
+    },
+    // HUD theming lives in CSS custom properties (shared with the gui dock)
+    setTheme({ accent, ink, blur, bgAlpha } = {}) {
+      const s = document.documentElement.style
+      if (accent !== undefined) s.setProperty('--hud-accent', accent)
+      if (ink !== undefined) s.setProperty('--hud-ink', ink)
+      if (blur !== undefined) s.setProperty('--hud-blur', `${blur}px`)
+      if (bgAlpha !== undefined) s.setProperty('--hud-bg-alpha', bgAlpha)
     },
   }
 }
