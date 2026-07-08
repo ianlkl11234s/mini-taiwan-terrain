@@ -140,6 +140,7 @@ export function createDebugPanel(engine, hud2) {
   fLook.add(params, 'saturation', -1, 0, 0.02).onChange(set('saturation'))
   fLook.add(params, 'vignette', 0, 1, 0.02).onChange(set('vignette'))
   fLook.add(params, 'grain', 0, 0.5, 0.01).onChange(set('grain'))
+  fLook.add(params, 'viewRange', 1, 2.5, 0.05).name('view distance').onChange(set('viewRange'))
   fLook.add(params, 'fogNear', 5, 60, 0.5).name('fog start').onChange(set('fogNear'))
   fLook.add(params, 'fogFar', 15, 90, 0.5).name('fog end').onChange(set('fogFar'))
   fLook.addColor(params, 'fogColor').onChange(set('fogColor'))

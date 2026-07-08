@@ -7,6 +7,10 @@ body {
   height: 100%;
 }
 
+#root {
+  height: 100%;
+}
+
 #app,
 #app canvas {
   display: block;
@@ -14,241 +18,166 @@ body {
   height: 100vh;
 }
 
-/* title block — top-left, above the docked GUI */
-.overlay {
-  position: fixed;
-  left: 26px;
-  top: 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  pointer-events: none;
-  font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
-  color: rgba(20, 20, 20, 0.82);
-  user-select: none;
-  z-index: 6;
-}
-
-.overlay .title {
-  font-size: 14px;
-  letter-spacing: 3px;
-  font-weight: 700;
-}
-
-.overlay .sub {
-  font-size: 10px;
-  letter-spacing: 0.12em;
-  opacity: 0.6;
-}
-
-#loading {
-  position: fixed;
-  left: 50%;
-  bottom: 28px;
-  transform: translateX(-50%);
-  font-family: 'SF Mono', ui-monospace, monospace;
-  font-size: 11px;
-  letter-spacing: 0.15em;
-  color: rgba(15, 15, 15, 0.75);
-  background: rgba(255, 255, 255, 0.35);
-  border: 1px solid rgba(0, 0, 0, 0.15);
-  padding: 6px 14px;
-  border-radius: 3px;
-  backdrop-filter: blur(6px);
-  transition: opacity 0.2s;
-}
-
-#loading.hidden {
-  opacity: 0;
-}
-
-/* ------------------------------------------------------------- HUD (FUI) */
+/* accent for POI tags / kickers — engine hudAccent mirrors into this var */
 :root {
-  --hud-ink: #17191b;
   --hud-accent: #ff4d00;
-  --hud-blur: 7px;
-  --hud-bg-alpha: 0.55;
-  --hud-paper: rgb(248 247 244 / var(--hud-bg-alpha));
 }
 
-.hud {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  font-family: 'SF Mono', 'Fira Code', ui-monospace, monospace;
-  color: var(--hud-ink);
-  z-index: 5;
-  transition: opacity 0.25s;
+/* --------------------------------------------------------- React shell bits */
+
+@keyframes ta-panel-in {
+  from {
+    opacity: 0;
+    transform: translateX(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
-.hud-corner {
-  position: absolute;
+/* thin scrollbar inside the floating panel */
+.ta-panel-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.ta-panel-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+
+/* range slider — ink thumb on a subtle track (pulse light control language) */
+.ta-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 14px;
+  background: transparent;
+  margin: 0;
+  display: block;
+}
+.ta-slider::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.12);
+}
+.ta-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #1f2937;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  margin-top: -4.5px;
+  cursor: pointer;
+}
+.ta-slider::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.12);
+}
+.ta-slider::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #1f2937;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+}
+
+/* color swatch input */
+.ta-color {
+  -webkit-appearance: none;
+  appearance: none;
   width: 26px;
-  height: 26px;
-  border: 1px solid var(--hud-ink);
-  opacity: 0.55;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
 }
-.hud-corner.tl { top: 14px; left: 14px; border-right: 0; border-bottom: 0; }
-.hud-corner.tr { top: 14px; right: 14px; border-left: 0; border-bottom: 0; }
-.hud-corner.bl { bottom: 14px; left: 14px; border-right: 0; border-top: 0; }
-.hud-corner.br { bottom: 14px; right: 14px; border-left: 0; border-top: 0; }
+.ta-color::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+.ta-color::-webkit-color-swatch {
+  border: none;
+  border-radius: 2px;
+}
 
-.hud-block {
-  position: absolute;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  line-height: 1.75;
-  text-transform: uppercase;
-  background: var(--hud-paper);
-  border: 1px solid rgba(20, 22, 24, 0.3);
-  backdrop-filter: blur(var(--hud-blur));
-  padding: 10px 14px;
-  min-width: 190px;
-}
-.hud-tl { top: 16px; right: 16px; } /* SECTOR card: top-right */
-.hud-brt { bottom: 78px; left: 34px; min-width: 160px; } /* TELEMETRY: bottom-left */
-
-.hud-kicker {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-weight: 700;
-  letter-spacing: 0.3em;
-  margin-bottom: 4px;
-}
-.hud-kicker .sq,
-.hud-panel-head .sq {
+/* tour "live" dot */
+.ta-live-dot {
   width: 7px;
   height: 7px;
-  background: var(--hud-accent);
-  display: inline-block;
+  border-radius: 50%;
+  background: #0284c7;
+  animation: ta-pulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
 }
-.hud-dim { opacity: 0.6; }
-.hud-strong { font-weight: 700; letter-spacing: 0.22em; }
-.hud-rule { height: 1px; background: var(--hud-ink); opacity: 0.35; margin: 6px 0; }
-
-.hud-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 18px;
+@keyframes ta-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
 }
-.hud-row span { opacity: 0.55; }
-.hud-row b { font-weight: 600; }
-.hud-row .accent { color: var(--hud-accent); }
 
-/* cone tracking reticle */
-.hud-reticle {
+/* --------------------------------------------------- POI screen-anchor tags */
+.ta-poi {
   position: absolute;
   top: 0;
   left: 0;
   width: 0;
   height: 0;
-  opacity: 1;
   transition: opacity 0.2s;
   will-change: transform;
 }
-.hud-reticle .rb {
-  position: absolute;
-  width: 16px;
-  height: 16px;
-  border: 1.5px solid var(--hud-ink);
-  opacity: 0.9;
-}
-.hud-reticle .rb.tl { left: -46px; top: -46px; border-right: 0; border-bottom: 0; }
-.hud-reticle .rb.tr { right: -46px; top: -46px; border-left: 0; border-bottom: 0; }
-.hud-reticle .rb.bl { left: -46px; bottom: -46px; border-right: 0; border-top: 0; }
-.hud-reticle .rb.br { right: -46px; bottom: -46px; border-left: 0; border-top: 0; }
-
-.hud-ret-label {
-  position: absolute;
-  left: 58px;
-  top: 0;
-  transform: translateY(-50%);
-  white-space: nowrap;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  pointer-events: auto;
-  cursor: pointer;
-  padding: 4px 8px;
-  background: var(--hud-paper);
-  border-left: 2px solid var(--hud-accent);
-  backdrop-filter: blur(var(--hud-blur));
-}
-.hud-ret-label:hover { background: rgba(255, 255, 255, 0.8); }
-.hud-ret-name { font-weight: 700; }
-.hud-ret-name i { color: var(--hud-accent); font-style: normal; }
-.hud-ret-sub { opacity: 0.6; font-size: 9px; }
-
-/* POI markers */
-.hud-poi {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 0;
-  height: 0;
-  pointer-events: auto;
-  cursor: pointer;
-  transition: opacity 0.2s;
-  will-change: transform;
-}
-.hud-poi .tag {
+.ta-poi .tag {
   position: absolute;
   left: 12px;
   top: 0;
   transform: translateY(-50%);
+  pointer-events: auto;
+  cursor: pointer;
+  font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, monospace;
   font-size: 9.5px;
   letter-spacing: 0.14em;
   white-space: nowrap;
   padding: 3px 7px;
-  background: var(--hud-paper);
-  border: 1px solid rgba(20, 22, 24, 0.35);
-  backdrop-filter: blur(var(--hud-blur));
+  color: #1f2937;
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 4px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
-.hud-poi .tag b { font-weight: 700; }
-.hud-poi .tag i { font-style: normal; opacity: 0.6; display: none; margin-left: 6px; }
-.hud-poi:hover .tag i,
-.hud-poi.active .tag i { display: inline; }
-.hud-poi.active .tag { border-color: var(--hud-accent); box-shadow: inset 2px 0 0 var(--hud-accent); }
-
-/* selection panel — positioned next to its marker from JS */
-.hud-panel {
-  position: absolute;
-  left: 0;
-  top: 0;
-  min-width: 230px;
-  font-size: 10px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  background: var(--hud-paper);
-  border: 1px solid rgba(20, 22, 24, 0.4);
-  backdrop-filter: blur(var(--hud-blur));
-  padding: 10px 14px;
-  pointer-events: auto;
-  line-height: 1.8;
-  will-change: transform;
-}
-.hud-panel-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.ta-poi .tag b {
   font-weight: 700;
-  letter-spacing: 0.25em;
-  margin-bottom: 5px;
+  color: #111827;
 }
-.hud-panel-head b { flex: 1; }
-.hud-x {
-  all: unset;
-  cursor: pointer;
-  opacity: 0.6;
-  padding: 0 3px;
+.ta-poi .tag i {
+  font-style: normal;
+  color: #6b7280;
+  display: none;
+  margin-left: 6px;
 }
-.hud-x:hover { opacity: 1; color: var(--hud-accent); }
+.ta-poi:hover .tag i,
+.ta-poi.active .tag i {
+  display: inline;
+}
+.ta-poi.active .tag {
+  border-color: var(--hud-accent);
+  box-shadow: inset 2px 0 0 var(--hud-accent);
+}
 
-/* lil-gui docked on the left, below the title block */
+/* ------------------------------------------- lil-gui dock (?debug=1 only) */
 #gui-dock {
   position: fixed;
   top: 72px;
-  left: 14px;
+  left: 64px;
   z-index: 1001;
   /* leave the bottom-left corner to the TELEMETRY card */
   max-height: calc(100vh - 310px);

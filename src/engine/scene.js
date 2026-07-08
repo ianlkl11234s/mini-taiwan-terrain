@@ -305,7 +305,10 @@ export function createStage(params, container) {
     // frustum grows/fades, and the LOD target re-evaluates through the
     // hysteresis. Returns lodChanged so the engine can re-sow labels/POIs.
     tickView(camDist, realMode) {
-      fogScale = realMode ? Math.max(1, camDist / LOD_D0) : 1
+      // R2 viewRange: user-facing "view distance" folds into the same scale so
+      // everything tied to the fog wall (streaming radius, scan, POI search,
+      // contour/grid morphing) stretches together.
+      fogScale = (realMode ? Math.max(1, camDist / LOD_D0) : 1) * (params.viewRange ?? 1)
       scene.fog.near = params.fogNear * fogScale
       scene.fog.far = params.fogFar * fogScale
       updateShadowScale(realMode ? camDist : LOD_D0)

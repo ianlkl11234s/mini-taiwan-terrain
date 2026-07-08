@@ -1,0 +1,59 @@
+import { useCallback, useEffect, useState } from 'react'
+import { T } from '../../theme.js'
+import { SectionHeader, Row, Slider, Segmented, ColorSwatch } from '../controls.jsx'
+
+// 設定面板（精選）。rebuild 類參數（demExaggeration / chunkRes）只在放開/點選時
+// commit — R1 的教訓：live 送會連環觸發全地形重建。
+
+export default function Settings({ engine }) {
+  const [p, setP] = useState(() => ({ ...engine.getParams() }))
+
+  useEffect(() => engine.on('params', () => setP({ ...engine.getParams() })), [engine])
+
+  const live = useCallback(
+    (key) => (v) => {
+      engine.setParams({ [key]: v })
+      setP((prev) => ({ ...prev, [key]: v }))
+    },
+    [engine]
+  )
+  const commit = useCallback((key) => (v) => engine.setParams({ [key]: v }), [engine])
+
+  return (
+    <div>
+      <SectionHeader>View</SectionHeader>
+      <Slider label="視距 View distance" min={1} max={2.5} step={0.05} value={p.viewRange} onChange={live('viewRange')} format={(v) => `${v.toFixed(2)}×`} />
+      <Slider
+        label="垂直放大 Vertical scale"
+        min={0.5}
+        max={5}
+        step={0.1}
+        value={p.demExaggeration}
+        commit={commit('demExaggeration')}
+        format={(v) => `${v.toFixed(1)}×`}
+      />
+      <Row label="品質 Quality">
+        <Segmented options={[32, 64, 128]} value={p.chunkRes} onChange={(v) => { engine.setParams({ chunkRes: v }); setP((prev) => ({ ...prev, chunkRes: v })) }} />
+      </Row>
+
+      <SectionHeader>Map</SectionHeader>
+      <Slider label="等高線間距 Contour interval" min={0.04} max={0.6} step={0.01} value={p.contourInterval} onChange={live('contourInterval')} format={(v) => v.toFixed(2)} />
+      <Slider label="等高線濃度 Contour opacity" min={0} max={1} step={0.02} value={p.contourOpacity} onChange={live('contourOpacity')} format={(v) => v.toFixed(2)} />
+      <Slider label="顆粒 Grain" min={0} max={0.5} step={0.01} value={p.grain} onChange={live('grain')} format={(v) => v.toFixed(2)} />
+
+      <SectionHeader>Theme</SectionHeader>
+      <Row label="強調色 Accent">
+        <ColorSwatch
+          value={p.hudAccent}
+          onCommit={(v) => {
+            engine.setParams({ hudAccent: v }) // rebuilds the 3D FUI layer
+            document.documentElement.style.setProperty('--hud-accent', v) // POI tags / kickers
+          }}
+        />
+      </Row>
+      <div style={{ fontFamily: 'inherit', fontSize: T.fs.sm, color: T.textFaint, padding: '2px 8px 4px' }}>
+        加 ?debug=1 開發者模式可調全部參數
+      </div>
+    </div>
+  )
+}

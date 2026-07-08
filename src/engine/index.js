@@ -122,6 +122,10 @@ export const DEFAULT_PARAMS = {
   fogNear: 35.5,
   fogFar: 50,
   fogColor: '#ffffff',
+  // R2: multiplies the fog near/far baseline inside the fogScale computation
+  // (scene.tickView) — pushes the fog wall out; chunk streaming, scan radius
+  // and POI search all key off fogFar × fogScale so they follow automatically.
+  viewRange: 1.0,
   surveyLines: true,
 
   // motion
