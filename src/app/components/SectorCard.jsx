@@ -47,7 +47,7 @@ export default function SectorCard({ engine }) {
         {real ? p.demLocation : 'PROCEDURAL RANGE'}
       </div>
       <div ref={gpsRef} style={dim}>
-        {real ? `GPS: ${p.demLat.toFixed(4)}, ${p.demLon.toFixed(4)} · Z${p.demZoom}` : 'GPS: 46.4076, 11.8524'}
+        {real ? `GPS: ${p.demLat.toFixed(4)}, ${p.demLon.toFixed(4)} · Z${p.demZoom}` : 'GPS: —'}
       </div>
       <div style={dim}>{real ? 'ELEV: NLSC 20M DTM (2024)' : `SEED ${String(p.seed).padStart(4, '0')} · MESH ${p.resolution}²`}</div>
     </div>
