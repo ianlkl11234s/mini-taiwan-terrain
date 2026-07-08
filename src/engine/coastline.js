@@ -1,9 +1,20 @@
 import * as THREE from 'three'
+import { Line2 } from 'three/addons/lines/Line2.js'
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 import RING from './data/coastline_taiwan.json'
 
 // Taiwan main-island coastline: one closed sea-level ring (county boundaries
 // unioned, largest polygon's exterior, simplified to 100 m — 1,289 points).
 // Only meaningful in real mode; procedural terrain hides it.
+//
+// W2: fat line. THREE.Line renders at 1 px on WebGL — this is Line2 +
+// LineMaterial, which extrudes screen-space quads so linewidth is real pixels
+// (worldUnits stays false). The material needs the viewport in its
+// `resolution` uniform: we share the stage's live Vector2 (scene.js updates it
+// on resize) by swapping it in as the uniform value — LineMaterial's
+// `.resolution` setter would copy instead of share. fog: true works: the
+// shader includes the fog chunks and the line sinks into the white wall.
 //
 // The ring is built once in world xz with y = 0 — the projection is anchored
 // at the first DEM load and never rebuilt, so the horizontal geometry never
@@ -16,14 +27,16 @@ import RING from './data/coastline_taiwan.json'
 // BELOW precision at the island view (dist 850 → δz ≈ 0.09) and the terrain
 // skin eats the line. Linear fogScale scaling stays comfortably above the
 // precision curve across the whole dolly range while remaining sub-pixel.
-export function createCoastline(params) {
-  const material = new THREE.LineBasicMaterial({
-    color: new THREE.Color(params.contourColor), // same ink as the contour lines
+export function createCoastline(params, resolution) {
+  const material = new LineMaterial({
+    color: new THREE.Color(params.coastlineColor), // independent ink (darker than contours)
+    linewidth: params.coastlineWidth, // px
     transparent: true,
     opacity: params.coastlineOpacity,
     fog: true, // sinks into the white fog wall like the terrain does
   })
-  const line = new THREE.Line(new THREE.BufferGeometry(), material)
+  material.uniforms.resolution.value = resolution // shared with scene.js's resize path
+  const line = new Line2(new LineGeometry(), material)
   line.visible = false
   let built = false
   let seaY = 0 // sea level in world units (before the anti-z-fight lift)
@@ -34,7 +47,7 @@ export function createCoastline(params) {
     material,
     // called from the regenerateTerrain path — covers initial load, source
     // switches (noise ↔ real) and vertical-scale changes; the GUI toggle and
-    // opacity slider call it directly
+    // width/opacity/color sliders call it directly
     update(params, heightField) {
       const show = params.source === 'real' && !!heightField && params.coastline
       if (show && !built) {
@@ -45,13 +58,15 @@ export function createCoastline(params) {
           pos[i * 3 + 1] = 0
           pos[i * 3 + 2] = z
         }
-        line.geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+        line.geometry.setPositions(pos)
         built = true
       }
       if (heightField) {
         seaY = (0 - heightField.datumM) * heightField.projection.K * params.demExaggeration
         line.position.y = seaY + lift
       }
+      material.color.set(params.coastlineColor)
+      material.linewidth = params.coastlineWidth
       material.opacity = params.coastlineOpacity
       line.visible = show
     },

@@ -253,11 +253,18 @@ export function createStage(params, container) {
   // skip the whole DOF pass when bokeh is zero — it's pure cost with no visual effect
   dofPass.enabled = params.bokehScale > 0
 
+  // shared viewport uniform for the fat-line materials (Line2/LineMaterial
+  // needs the resolution to convert px linewidth → clip space): the overlay
+  // modules install this exact Vector2 as their uniform value, so updating it
+  // here updates every line material at once
+  const lineResolution = new THREE.Vector2(window.innerWidth, window.innerHeight)
+
   window.addEventListener('resize', () => {
     camera.aspect = window.innerWidth / window.innerHeight
     camera.updateProjectionMatrix()
     renderer.setSize(window.innerWidth, window.innerHeight)
     composer.setSize(window.innerWidth, window.innerHeight)
+    lineResolution.set(window.innerWidth, window.innerHeight)
   })
 
   return {
@@ -266,6 +273,7 @@ export function createStage(params, container) {
     camera,
     controls,
     composer,
+    lineResolution,
     sun,
     dof,
     dofPass,

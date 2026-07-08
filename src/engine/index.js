@@ -1,6 +1,8 @@
 import * as THREE from 'three'
 import { Terrain } from './terrain.js'
 import { createCoastline } from './coastline.js'
+import { createCounties } from './counties.js'
+import { createMarkers } from './markers.js'
 import { createCone } from './cone.js'
 import { createLabels, disposeLabels } from './labels.js'
 import { createHud3D, findPois } from './hud3d.js'
@@ -88,7 +90,13 @@ export const DEFAULT_PARAMS = {
   gridOpacity: 1,
   labels: true,
   coastline: true,
-  coastlineOpacity: 0.55,
+  coastlineWidth: 2.5,
+  coastlineOpacity: 0.85,
+  coastlineColor: '#1c1c1c',
+  counties: true,
+  countiesWidth: 1.5,
+  countiesOpacity: 0.5,
+  countiesColor: '#444444',
 
   // HUD
   hud: true,
@@ -189,8 +197,18 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
 
   // main-island coastline ink line (real mode only) — geometry builds lazily on
   // the first real-mode update, once the projection exists
-  const coastline = createCoastline(params)
+  const coastline = createCoastline(params, stage.lineResolution)
   scene.add(coastline.line)
+
+  // county borders (real mode only) — same lazy-build pattern; every vertex
+  // carries a baked DTM elevation so the line rides the ridgelines
+  const counties = createCounties(params, stage.lineResolution)
+  scene.add(counties.mesh)
+
+  // generic marker sets (real mode only) — pure display layer behind
+  // setMarkerSet/removeMarkerSet/listMarkerSets, never part of the POI system
+  const markers = createMarkers(params)
+  scene.add(markers.group)
 
   // chunk streaming: which chunks exist follows the pan target (radius tied to
   // the EFFECTIVE fog wall, so it grows with the far-view fogScale) — meshes
@@ -362,6 +380,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
           chunkManager.clear()
         }
         coastline.update(params, heightField) // sea-level y tracks the vertical scale
+        counties.update(params, heightField) // ridgeline ys track it too
+        markers.update(params, heightField)
         regenerateLabels()
         regenerateHud()
         refreshPoiAnchor()
@@ -508,10 +528,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     slopeTint: (v) => (terrain.mapUniforms.uSlopeTint.value = v),
     contourInterval: (v) => (terrain.mapUniforms.uContourInterval.value = v),
     contourOpacity: (v) => (terrain.mapUniforms.uContourOpacity.value = v),
-    contourColor: (v) => {
-      terrain.mapUniforms.uContourColor.value.set(v)
-      coastline.material.color.set(v) // coastline shares the contour ink
-    },
+    contourColor: (v) => terrain.mapUniforms.uContourColor.value.set(v),
     gridStep: (v) => (terrain.mapUniforms.uGridStep.value = v),
     gridOpacity: (v) => (terrain.mapUniforms.uGridOpacity.value = v),
     gradLow: () => terrain.rebuildRamp(params),
@@ -522,7 +539,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     gradMid2Pos: () => terrain.rebuildRamp(params),
     labels: (v) => (labels.visible = v),
     coastline: () => coastline.update(params, heightField),
+    coastlineWidth: () => coastline.update(params, heightField),
     coastlineOpacity: () => coastline.update(params, heightField),
+    coastlineColor: () => coastline.update(params, heightField),
+    counties: () => counties.update(params, heightField),
+    countiesWidth: () => counties.update(params, heightField),
+    countiesOpacity: () => counties.update(params, heightField),
+    countiesColor: () => counties.update(params, heightField),
     // look
     exposure: (v) => (stage.exposureFx.uniforms.get('exposure').value = v),
     contrast: (v) => (stage.contrastFx.uniforms.get('contrast').value = v),
@@ -642,6 +665,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
     terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
     coastline.setFogScale(fogScale) // anti-z-fight lift tracks the view scale
+    counties.setFogScale(fogScale)
+    markers.setFogScale(fogScale)
+    markers.tick(dt, camera) // dot rescale / tag sizing / label crowd control
     if (lodChanged && !rebuildPending) {
       // far/near label policies changed — re-sow peaks + spot elevations now
       refreshPoiAnchor()
@@ -769,6 +795,18 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     selectPoi,
     deselect,
     triggerScan,
+    // generic marker sets (pure display layer — see markers.js). Same id
+    // with `points` replaces the set; without `points` patches color/visible.
+    setMarkerSet(id, def) {
+      markers.setSet(id, def)
+      markers.update(params, heightField) // builds now if the world exists
+    },
+    removeMarkerSet(id) {
+      return markers.removeSet(id)
+    },
+    listMarkerSets() {
+      return markers.listSets()
+    },
     dispose() {
       disposed = true
       cancelAnimationFrame(rafId)
@@ -805,6 +843,23 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     },
   }
   engine.debug.engine = engine
+
+  // demo marker set proving the API end-to-end (the 8 preset coordinates,
+  // default hidden — the debug GUI toggles it). 玉山/雪山 carry baked summit
+  // elevations; the rest exercise the heightAtWorld sampling fallback.
+  markers.setSet('demo_locations', {
+    visible: false,
+    points: [
+      { name: '玉山', lat: 23.47, lon: 120.9575, elev: 3952 },
+      { name: '雪山', lat: 24.3836, lon: 121.2317, elev: 3886 },
+      { name: '大霸尖山', lat: 24.4607, lon: 121.2578 },
+      { name: '南湖大山', lat: 24.362, lon: 121.4383 },
+      { name: '合歡山', lat: 24.1436, lon: 121.2716 },
+      { name: '太魯閣', lat: 24.1735, lon: 121.4906 },
+      { name: '嘉明湖', lat: 23.2907, lon: 121.0325 },
+      { name: '七星山', lat: 25.17, lon: 121.556 },
+    ],
+  })
 
   // real world is the default source — fetch its tiles on startup (not
   // awaited: the engine renders + streams while tiles arrive, exactly like

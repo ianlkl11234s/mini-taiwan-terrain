@@ -122,7 +122,17 @@ export function createDebugPanel(engine, hud2) {
   fMap.add(params, 'gridOpacity', 0, 1, 0.02).name('grid opacity').onChange(set('gridOpacity'))
   fMap.add(params, 'labels').name('place labels').onChange(set('labels'))
   fMap.add(params, 'coastline').name('coastline').onChange(set('coastline'))
+  fMap.add(params, 'coastlineWidth', 0.5, 8, 0.1).name('coastline width').onChange(set('coastlineWidth'))
   fMap.add(params, 'coastlineOpacity', 0, 1, 0.02).name('coastline opacity').onChange(set('coastlineOpacity'))
+  fMap.addColor(params, 'coastlineColor').name('coastline color').onChange(set('coastlineColor'))
+  fMap.add(params, 'counties').name('county borders').onChange(set('counties'))
+  fMap.add(params, 'countiesWidth', 0.5, 6, 0.1).name('county width').onChange(set('countiesWidth'))
+  fMap.add(params, 'countiesOpacity', 0, 1, 0.02).name('county opacity').onChange(set('countiesOpacity'))
+  fMap.addColor(params, 'countiesColor').name('county color').onChange(set('countiesColor'))
+  fMap
+    .add({ demo: false }, 'demo')
+    .name('demo markers')
+    .onChange((v) => engine.setMarkerSet('demo_locations', { visible: v }))
 
   const fLook = gui.addFolder('Look')
   fLook.add(params, 'exposure', 0.2, 3, 0.02).onChange(set('exposure'))
