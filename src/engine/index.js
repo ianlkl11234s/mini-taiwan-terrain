@@ -91,6 +91,9 @@ export const DEFAULT_PARAMS = {
   contourColor: '#000000',
   gridStep: 5,
   gridOpacity: 1,
+  peakLimit: 15,
+  peakMinElev: 0,
+  peakRadiusKm: 0,
   labels: true,
   coastline: true,
   coastlineWidth: 2.5,
@@ -266,9 +269,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function computePois() {
     if (params.source === 'real' && heightField) {
       const far = stage.lodZoom <= 11
-      const real = findRealPeaks(heightField, terrain.sample, controls.target, params.fogFar * stage.fogScale, {
-        limit: far ? 8 : 6,
-        minSep: 1.5 * stage.fogScale,
+      const kmRadius = params.peakRadiusKm > 0
+        ? params.peakRadiusKm * 1000 * heightField.projection.K
+        : params.fogFar * stage.fogScale
+      const real = findRealPeaks(heightField, terrain.sample, controls.target, kmRadius, {
+        limit: far ? Math.max(8, params.peakLimit) : params.peakLimit,
+        minSep: 0.6 * stage.fogScale,
+        minElev: params.peakMinElev,
       })
       if (real.length) return real
     }
@@ -554,6 +561,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     gradHigh: () => terrain.rebuildRamp(params),
     gradMid1Pos: () => terrain.rebuildRamp(params),
     gradMid2Pos: () => terrain.rebuildRamp(params),
+    peakLimit: () => regenerateHud(),
+    peakMinElev: () => regenerateHud(),
+    peakRadiusKm: () => regenerateHud(),
     labels: (v) => (labels.visible = v),
     coastline: () => coastline.update(params, heightField),
     coastlineWidth: () => coastline.update(params, heightField),

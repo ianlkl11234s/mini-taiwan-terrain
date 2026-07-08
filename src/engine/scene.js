@@ -75,7 +75,7 @@ export function createStage(params, container) {
   controls.enableDamping = true
   controls.dampingFactor = 0.06
   controls.maxPolarAngle = Math.PI * 0.49
-  controls.minDistance = 5
+  controls.minDistance = 2
   controls.maxDistance = 1000
   controls.update()
 

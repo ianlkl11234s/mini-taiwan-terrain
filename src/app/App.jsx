@@ -3,7 +3,6 @@ import { createEngine } from '../engine/index.js'
 import { T, FONT_DATA, glass } from './theme.js'
 import IconRailSidebar from './components/IconRailSidebar.jsx'
 import TitleBlock from './components/TitleBlock.jsx'
-import SectorCard from './components/SectorCard.jsx'
 import Telemetry from './components/Telemetry.jsx'
 import PoiTags from './components/PoiTags.jsx'
 
@@ -58,7 +57,6 @@ export default function App() {
       {engine && (
         <>
           <div ref={hudRootRef}>
-            <SectorCard engine={engine} />
             <Telemetry engine={engine} />
             <PoiTags engine={engine} />
           </div>

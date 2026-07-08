@@ -53,6 +53,11 @@ export default function Settings({ engine }) {
         />
       </Row>
 
+      <SectionHeader>Peaks</SectionHeader>
+      <Slider label="搜尋半徑 Radius" min={0} max={80} step={5} value={p.peakRadiusKm} onChange={live('peakRadiusKm')} format={(v) => v === 0 ? '自動' : `${v} km`} />
+      <Slider label="顯示數量 Max peaks" min={3} max={100} step={1} value={p.peakLimit} onChange={live('peakLimit')} format={(v) => String(v)} />
+      <Slider label="最低海拔 Min elevation" min={0} max={3000} step={100} value={p.peakMinElev} onChange={live('peakMinElev')} format={(v) => `${v} m`} />
+
       <SectionHeader>Map</SectionHeader>
       <Slider label="等高線間距 Contour interval" min={0.04} max={0.6} step={0.01} value={p.contourInterval} onChange={live('contourInterval')} format={(v) => v.toFixed(2)} />
       <Slider label="等高線濃度 Contour opacity" min={0} max={1} step={0.02} value={p.contourOpacity} onChange={live('contourOpacity')} format={(v) => v.toFixed(2)} />
