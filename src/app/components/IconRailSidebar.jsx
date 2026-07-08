@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { T, FONT_DATA, glass, RAIL_WIDTH, PANEL_WIDTH } from '../theme.js'
+import { T, FONT_DATA, glass, RAIL_LEFT, RAIL_WIDTH, PANEL_WIDTH } from '../theme.js'
 import { Icon } from './controls.jsx'
 import Locations from './panels/Locations.jsx'
 import Layers from './panels/Layers.jsx'
@@ -51,19 +51,16 @@ export default function IconRailSidebar({ engine }) {
 
   return (
     <>
-      {/* ── icon rail ── */}
+      {/* ── icon rail (floating pill) ── */}
       <div
         style={{
+          ...glass(T.railBg),
           position: 'fixed',
-          left: 0,
-          top: 0,
-          bottom: 0,
+          left: 10,
+          top: 10,
           width: RAIL_WIDTH,
           boxSizing: 'border-box',
-          background: T.railBg,
-          backdropFilter: `blur(${T.blur}px)`,
-          WebkitBackdropFilter: `blur(${T.blur}px)`,
-          borderRight: `1px solid ${T.border}`,
+          boxShadow: T.shadow,
           display: 'flex',
           flexDirection: 'column',
           alignItems: 'center',
@@ -87,7 +84,7 @@ export default function IconRailSidebar({ engine }) {
           style={{
             ...glass(),
             position: 'fixed',
-            left: RAIL_WIDTH + 8,
+            left: RAIL_LEFT + RAIL_WIDTH + 8,
             top: 92,
             width: PANEL_WIDTH,
             maxHeight: '70vh',

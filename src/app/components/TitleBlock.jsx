@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { T, FONT_DATA, glass, RAIL_WIDTH } from '../theme.js'
+import { T, FONT_DATA, glass, RAIL_LEFT, RAIL_WIDTH } from '../theme.js'
 
 // 左上標題（pulse 風）：無底純文字直接疊在地形上，白 text-shadow 疊層保證深色
 // 地形上仍可讀。下方座標讀數 chip（pulse 的 "23.6081, 120.3795 z6.9 …" light 版）：
@@ -44,7 +44,7 @@ export default function TitleBlock({ engine }) {
     <div
       style={{
         position: 'fixed',
-        left: RAIL_WIDTH + 14,
+        left: RAIL_LEFT + RAIL_WIDTH + 14,
         top: 16,
         pointerEvents: 'none',
         userSelect: 'none',

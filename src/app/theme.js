@@ -55,6 +55,7 @@ export const T = {
 }
 
 // pulse IconRailSidebar geometry
+export const RAIL_LEFT = 10
 export const RAIL_WIDTH = 56
 export const PANEL_WIDTH = 288
 

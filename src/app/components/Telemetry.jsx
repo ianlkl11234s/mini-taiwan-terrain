@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { T, FONT_DATA, glass, kickerStyle, RAIL_WIDTH } from '../theme.js'
+import { T, FONT_DATA, glass, kickerStyle, RAIL_LEFT, RAIL_WIDTH } from '../theme.js'
 
 // 左下遙測卡：訂 'frame'（每幀）→ ref 直寫 DOM，絕不 setState；
 // 'stats'（1Hz）補 CHUNKS。文字刷新沿用舊 hud2d 的 0.15s throttle。
@@ -46,7 +46,7 @@ export default function Telemetry({ engine }) {
       style={{
         ...glass(T.cardBg),
         position: 'fixed',
-        left: RAIL_WIDTH + 12,
+        left: RAIL_LEFT + RAIL_WIDTH + 12,
         bottom: 20,
         minWidth: 165,
         padding: '10px 14px',
