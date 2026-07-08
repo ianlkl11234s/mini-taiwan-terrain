@@ -18,6 +18,7 @@ import {
   BlendFunction,
 } from 'postprocessing'
 import { Terrain } from './terrain.js'
+import { createCoastline } from './coastline.js'
 import { createCone } from './cone.js'
 import { createLabels, disposeLabels } from './labels.js'
 import { createHud3D, findPois } from './hud3d.js'
@@ -96,6 +97,8 @@ const params = {
   gridStep: 5,
   gridOpacity: 1,
   labels: true,
+  coastline: true,
+  coastlineOpacity: 0.55,
 
   // HUD
   hud: true,
@@ -337,6 +340,11 @@ function applyShadowMode() {
 
 const terrain = new Terrain(params)
 scene.add(terrain.group)
+
+// main-island coastline ink line (real mode only) — geometry builds lazily on
+// the first real-mode update, once the projection exists
+const coastline = createCoastline(params)
+scene.add(coastline.line)
 
 // chunk streaming: which chunks exist follows the pan target (radius tied to
 // the EFFECTIVE fog wall, so it grows with the far-view fogScale) — meshes
@@ -841,6 +849,7 @@ function regenerateTerrain() {
         chunkManager.setEnabled(false)
         chunkManager.clear()
       }
+      coastline.update(params, heightField) // sea-level y tracks the vertical scale
       regenerateLabels()
       regenerateHud()
       refreshPoiAnchor()
@@ -1017,10 +1026,18 @@ fMap
 fMap
   .addColor(params, 'contourColor')
   .name('contour color')
-  .onChange((v) => terrain.mapUniforms.uContourColor.value.set(v))
+  .onChange((v) => {
+    terrain.mapUniforms.uContourColor.value.set(v)
+    coastline.material.color.set(v) // coastline shares the contour ink
+  })
 fMap.add(params, 'gridStep', 2, 14, 0.5).name('grid size').onChange((v) => (terrain.mapUniforms.uGridStep.value = v))
 fMap.add(params, 'gridOpacity', 0, 1, 0.02).name('grid opacity').onChange((v) => (terrain.mapUniforms.uGridOpacity.value = v))
 fMap.add(params, 'labels').name('place labels').onChange((v) => (labels.visible = v))
+fMap.add(params, 'coastline').name('coastline').onChange(() => coastline.update(params, heightField))
+fMap
+  .add(params, 'coastlineOpacity', 0, 1, 0.02)
+  .name('coastline opacity')
+  .onChange(() => coastline.update(params, heightField))
 
 const fLook = gui.addFolder('Look')
 fLook.add(params, 'exposure', 0.2, 3, 0.02).onChange((v) => (exposureFx.uniforms.get('exposure').value = v))
@@ -1273,6 +1290,7 @@ function tick() {
   scene.fog.far = params.fogFar * fogScale
   terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
   terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
+  coastline.setFogScale(fogScale) // anti-z-fight lift tracks the view scale
   updateShadowScale(realMode ? camDist : LOD_D0)
   if (realMode) {
     const z = nextLodZoom(camDist)
