@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { metersToWorldY, drapeAt } from './geo.js'
 
 // Generic marker sets: named points draped on the real-world terrain. Pure
 // display layer — markers never enter the POI/tour system and are not
@@ -74,9 +75,11 @@ export function createMarkers(params) {
   const _p = new THREE.Vector3()
 
   function pointY(pt) {
-    const scale = heightField.projection.K * params.demExaggeration
-    const m = pt.elev ?? heightField.heightAtWorld(pt._x, pt._z)
-    return (m - heightField.datumM) * scale
+    // baked elev → exact placement; otherwise live-drape (unstreamed tiles read
+    // 0 m, so tick() re-samples every 2 s until chunks settle it)
+    return pt.elev != null
+      ? metersToWorldY(heightField, pt.elev, params.demExaggeration)
+      : drapeAt(heightField, pt._x, pt._z, params.demExaggeration)
   }
 
   // (re)compute world positions + instance matrices for one set
@@ -93,10 +96,40 @@ export function createMarkers(params) {
       _m.makeScale(r, 1, r)
       _m.setPosition(pt._x, y, pt._z)
       entry.dots.setMatrixAt(i, _m)
-      entry.sprites[i].position.set(pt._x, y, pt._z)
+      const s = entry.sprites[i]
+      if (s) s.position.set(pt._x, y, pt._z) // tag not built yet (lazy) — nothing to move
     })
     entry.dots.instanceMatrix.needsUpdate = true
     entry.dots.computeBoundingSphere()
+  }
+
+  // lazily materialize one point's name-tag sprite (canvas texture) — called
+  // from tick()'s crowd control the first time a point ranks in the visible
+  // top-MAX_LABELS. Large sets (e.g. 500+ stations) never pay for the
+  // canvases of points that never surface, only ever building at most
+  // MAX_LABELS-worth per set over the session.
+  function ensureSprite(entry, i) {
+    let s = entry.sprites[i]
+    if (s) return s
+    const pt = entry.def.points[i]
+    const { tex, aspect } = tagTexture(pt.name ?? '')
+    const mat = new THREE.SpriteMaterial({
+      map: tex,
+      transparent: true,
+      opacity: 1,
+      depthTest: false,
+      sizeAttenuation: false, // constant screen size
+      fog: false,
+    })
+    s = new THREE.Sprite(mat)
+    s.center.set(-0.12, 0.5) // tag floats to the right of its dot, HUD-style
+    s.renderOrder = 5
+    s.userData.aspect = aspect
+    s.visible = false // caller reveals it with the correct pixel scale
+    if (pt._x !== undefined) s.position.set(pt._x, pointY(pt) + 0.02, pt._z)
+    entry.group.add(s)
+    entry.sprites[i] = s
+    return s
   }
 
   function build(entry) {
@@ -113,24 +146,7 @@ export function createMarkers(params) {
     entry.dots = new THREE.InstancedMesh(_dotGeo, entry.dotMat, n)
     entry.dots.renderOrder = 4
     entry.group.add(entry.dots)
-    entry.sprites = entry.def.points.map((pt) => {
-      const { tex, aspect } = tagTexture(pt.name ?? '')
-      const mat = new THREE.SpriteMaterial({
-        map: tex,
-        transparent: true,
-        opacity: 1,
-        depthTest: false,
-        sizeAttenuation: false, // constant screen size
-        fog: false,
-      })
-      const s = new THREE.Sprite(mat)
-      s.center.set(-0.12, 0.5) // tag floats to the right of its dot, HUD-style
-      s.renderOrder = 5
-      s.userData.aspect = aspect
-      s.visible = false // tick() reveals it with the correct pixel scale
-      entry.group.add(s)
-      return s
-    })
+    entry.sprites = new Array(n).fill(null) // filled lazily by ensureSprite (crowd control)
     layout(entry)
   }
 
@@ -140,6 +156,7 @@ export function createMarkers(params) {
       entry.dots.dispose()
       entry.dotMat.dispose()
       for (const s of entry.sprites) {
+        if (!s) continue
         s.material.map.dispose()
         s.material.dispose()
       }
@@ -227,19 +244,87 @@ export function createMarkers(params) {
       const k = (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * TAG_PX) / window.innerHeight
       for (const entry of sets.values()) {
         if (!entry.dots || !entry.def.visible) continue
-        const order = entry.sprites
-          .map((s, i) => ({ i, d: _p.copy(s.position).sub(camera.position).lengthSq() }))
+        // distance from the point's own world position (not the sprite's —
+        // most points never get one built) so ranking never forces a build
+        const order = entry.def.points
+          .map((pt, i) => ({ i, d: _p.set(pt._x ?? 0, pointY(pt), pt._z ?? 0).sub(camera.position).lengthSq() }))
           .sort((a, b) => a.d - b.d)
         order.forEach(({ i }, rank) => {
-          const s = entry.sprites[i]
           const show = rank < MAX_LABELS
-          s.visible = show
-          if (show) s.scale.set(k * s.userData.aspect, k, 1)
+          if (show) {
+            const s = ensureSprite(entry, i) // built on first need, kept afterward
+            s.visible = true
+            s.scale.set(k * s.userData.aspect, k, 1)
+          } else if (entry.sprites[i]) {
+            entry.sprites[i].visible = false
+          }
         })
       }
     },
     setFogScale(v) {
       fogScale = v
     },
+  }
+}
+
+// Layer adapter over createMarkers — presents the marker-set collection to the
+// LayerManager as one 'point' layer while keeping the imperative set API
+// (setSet/removeSet/listSets, surfaced by the facade as setMarkerSet/…) intact.
+// Per-set visibility is the panel's control surface, so describe() carries the
+// full `sets` list instead of a single layer toggle/style.
+//
+// Second use (stations): `onActivate` turns the layer's FIRST setVisible(true)
+// into a one-shot hook (e.g. fetch a manifest-driven dataset and populate
+// sets). Until it has fired at least once, describe() omits `sets` entirely
+// so the Layers panel renders a single toggle row instead of an empty
+// "NO MARKER SETS" list — that toggle is what the user clicks to trigger the
+// fetch. If onActivate's promise rejects, activation resets so the row
+// reverts to a toggle the user can retry.
+export function createPointLayer(params, { id = 'markers', label = 'Markers', rowLabel, onActivate } = {}) {
+  const markers = createMarkers(params)
+  let activated = false
+  return {
+    id,
+    kind: 'point',
+    label,
+    rowLabel,
+    object3d: markers.group,
+    // imperative set API (facade back-compat)
+    setSet: (setId, def) => markers.setSet(setId, def),
+    removeSet: (setId) => markers.removeSet(setId),
+    listSets: () => markers.listSets(),
+
+    build() {},
+    update(ctx) {
+      markers.update(ctx.params, ctx.heightField)
+    },
+    tickView(ctx) {
+      markers.setFogScale(ctx.fogScale)
+      markers.tick(ctx.dt, ctx.camera)
+    },
+    setVisible(v) {
+      if (!v || activated || !onActivate) return
+      activated = true
+      Promise.resolve(onActivate()).catch((err) => {
+        console.warn(`[layers] ${id} activation failed`, err)
+        activated = false
+      })
+    },
+    setStyle() {}, // per-set only
+    describe() {
+      const sets = markers.listSets()
+      return {
+        id,
+        kind: 'point',
+        label,
+        rowLabel,
+        count: sets.reduce((n, s) => n + s.count, 0),
+        visible: sets.some((s) => s.visible),
+        styleSchema: null,
+        style: null,
+        sets: sets.length > 0 || activated ? sets : undefined,
+      }
+    },
+    dispose() {},
   }
 }

@@ -1,76 +1,72 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { T, FONT_DATA } from '../../theme.js'
 import { SectionHeader, Row, Toggle, Slider, ColorSwatch } from '../controls.jsx'
 
-// 圖層面板：coastline / counties 各四參數、marker sets 動態列表、peak labels。
-// 這些全是非 rebuild 參數 → slider 走 live onChange（debugPanel 同款）。
+// 圖層面板：完全由 engine.listLayers() 動態渲染 — 每個 layer 一個區塊（toggle +
+// 依 styleSchema 的樣式控制），marker 類 layer 展開成 set 動態列表。訂閱 'layers'
+// 事件即時更新。新增圖層時面板自動長出來，不用改這裡。
 
 export default function Layers({ engine }) {
-  const [p, setP] = useState(() => ({ ...engine.getParams() }))
-  const [sets, setSets] = useState(() => engine.listMarkerSets())
-
-  useEffect(() => engine.on('params', () => setP({ ...engine.getParams() })), [engine])
-
-  const set = useCallback(
-    (key) => (v) => {
-      engine.setParams({ [key]: v })
-      setP((prev) => ({ ...prev, [key]: v }))
-    },
-    [engine]
-  )
-
-  const toggleSet = (id, visible) => {
-    engine.setMarkerSet(id, { visible })
-    setSets(engine.listMarkerSets())
-  }
+  const [layers, setLayers] = useState(() => engine.listLayers())
+  useEffect(() => engine.on('layers', () => setLayers(engine.listLayers())), [engine])
 
   return (
     <div>
-      <SectionHeader>Coastline</SectionHeader>
-      <Row label="海岸線 Coastline">
-        <Toggle on={p.coastline} onChange={set('coastline')} />
-      </Row>
-      {p.coastline && (
-        <>
-          <Slider label="線寬 Width" min={0.5} max={8} step={0.1} value={p.coastlineWidth} onChange={set('coastlineWidth')} format={(v) => v.toFixed(1)} />
-          <Slider label="不透明度 Opacity" min={0} max={1} step={0.02} value={p.coastlineOpacity} onChange={set('coastlineOpacity')} format={(v) => v.toFixed(2)} />
-          <Row label="顏色 Color">
-            <ColorSwatch value={p.coastlineColor} onCommit={set('coastlineColor')} />
-          </Row>
-        </>
-      )}
-
-      <SectionHeader>Counties</SectionHeader>
-      <Row label="縣市界 Counties">
-        <Toggle on={p.counties} onChange={set('counties')} />
-      </Row>
-      {p.counties && (
-        <>
-          <Slider label="線寬 Width" min={0.5} max={6} step={0.1} value={p.countiesWidth} onChange={set('countiesWidth')} format={(v) => v.toFixed(1)} />
-          <Slider label="不透明度 Opacity" min={0} max={1} step={0.02} value={p.countiesOpacity} onChange={set('countiesOpacity')} format={(v) => v.toFixed(2)} />
-          <Row label="顏色 Color">
-            <ColorSwatch value={p.countiesColor} onCommit={set('countiesColor')} />
-          </Row>
-        </>
-      )}
-
-      <SectionHeader>Markers</SectionHeader>
-      {sets.length === 0 && (
-        <div style={{ fontFamily: FONT_DATA, fontSize: T.fs.sm, color: T.textFaint, padding: '2px 8px' }}>NO MARKER SETS</div>
-      )}
-      {sets.map((s) => (
-        <Row key={s.id} label={`${s.id}`}>
-          <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontFamily: FONT_DATA, fontSize: T.fs.sm, color: T.textFaint }}>{s.count} PTS</span>
-            <Toggle on={s.visible} onChange={(v) => toggleSet(s.id, v)} />
-          </span>
-        </Row>
+      {layers.map((layer) => (
+        <LayerBlock key={layer.id} engine={engine} layer={layer} />
       ))}
-
-      <SectionHeader>Labels</SectionHeader>
-      <Row label="山峰標籤 Peak labels">
-        <Toggle on={p.labels} onChange={set('labels')} />
-      </Row>
     </div>
   )
+}
+
+function LayerBlock({ engine, layer }) {
+  return (
+    <>
+      <SectionHeader>{layer.label}</SectionHeader>
+      {layer.sets ? <MarkerSets engine={engine} layerId={layer.id} sets={layer.sets} /> : <SingleLayer engine={engine} layer={layer} />}
+    </>
+  )
+}
+
+// coastline / counties / labels: one toggle row + (when on) styleSchema controls
+function SingleLayer({ engine, layer }) {
+  return (
+    <>
+      <Row label={layer.rowLabel ?? layer.label}>
+        <Toggle on={layer.visible} onChange={(v) => engine.setLayerVisible(layer.id, v)} />
+      </Row>
+      {layer.visible &&
+        layer.styleSchema &&
+        Object.entries(layer.styleSchema).map(([key, sch]) => (
+          <StyleControl key={key} value={layer.style[key]} schema={sch} onChange={(v) => engine.setLayerStyle(layer.id, { [key]: v })} />
+        ))}
+    </>
+  )
+}
+
+function StyleControl({ value, schema, onChange }) {
+  if (schema.type === 'color') {
+    return (
+      <Row label={schema.label}>
+        <ColorSwatch value={value} onCommit={onChange} />
+      </Row>
+    )
+  }
+  // slider (live onChange — all layer style params are non-rebuild)
+  return <Slider label={schema.label} min={schema.min} max={schema.max} step={schema.step} value={value} onChange={onChange} format={schema.format} />
+}
+
+// marker sets: dynamic list, one toggle each (per-set visibility)
+function MarkerSets({ engine, layerId, sets }) {
+  if (sets.length === 0) {
+    return <div style={{ fontFamily: FONT_DATA, fontSize: T.fs.sm, color: T.textFaint, padding: '2px 8px' }}>NO MARKER SETS</div>
+  }
+  return sets.map((s) => (
+    <Row key={s.id} label={s.id}>
+      <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontFamily: FONT_DATA, fontSize: T.fs.sm, color: T.textFaint }}>{s.count} PTS</span>
+        <Toggle on={s.visible} onChange={(v) => engine.setLayerSet(layerId, s.id, { visible: v })} />
+      </span>
+    </Row>
+  ))
 }

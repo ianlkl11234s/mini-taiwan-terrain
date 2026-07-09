@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { Simplex2, mulberry32, fbm, ridged, smoothstep, lerp } from './noise.js'
+import { worldYScale, metersToWorldY } from './geo.js'
 
 export const TERRAIN_SIZE = 56
 export const BASIN_RADIUS = 6.6 // flat excavation floor
@@ -198,7 +199,7 @@ if (uScanT >= 0.0) {
   // camera keep working; XY and Y share the projection's K so proportions are true.
   _makeDemSampler(params) {
     const hf = this.heightField
-    const scale = hf.projection.K * params.demExaggeration
+    const scale = worldYScale(hf, params.demExaggeration)
     const datumM = hf.datumM
     this._h2ft = (h) => Math.round((h / scale + datumM) * 3.28084)
     return this._makeDemSamplerFor(hf, params)
@@ -207,7 +208,7 @@ if (uScanT >= 0.0) {
   // Sampler bound to ONE zoom's tile cache — every LOD level shares the same
   // K and datum, so the same world xz reads (near enough) the same height.
   _makeDemSamplerFor(hf, params) {
-    const scale = hf.projection.K * params.demExaggeration
+    const scale = worldYScale(hf, params.demExaggeration)
     const datumM = hf.datumM
 
     const sDetail = new Simplex2(mulberry32(params.seed))
@@ -291,14 +292,20 @@ if (uScanT >= 0.0) {
   rebuild(params) {
     const sample = this._makeSampler(params)
     this.sample = sample
-    const real = params.source === 'real' && this.heightField
+    // real mode never builds the procedural plane — not even before the DEM
+    // has loaded (heightField null): the plane was previously built once at
+    // construction time (~1M vertices of noise) only to be hidden behind
+    // terrain.group.visible=false while tiles fetch. Chunks stream in via
+    // the ChunkManager once heightField is set and rebuild() runs again.
+    const real = params.source === 'real'
+    const chunksReady = real && !!this.heightField
     this.mesh.visible = !real
-    this.chunkGroup.visible = !!real
-    if (real) {
+    this.chunkGroup.visible = chunksReady
+    if (chunksReady) {
       // chunk meshes are owned by the ChunkManager — nothing builds here,
       // only the shared shading config the incremental builds will use
       this._prepareChunkShading(params)
-    } else {
+    } else if (!real) {
       this._rebuildSinglePlane(params, sample)
     }
   }
@@ -308,10 +315,8 @@ if (uScanT >= 0.0) {
   // must normalize hypsometric tint identically or borders would seam.
   _prepareChunkShading(params) {
     const hf = this.heightField
-    const proj = hf.projection
-    const scale = proj.K * params.demExaggeration
-    const minH = (hf.minM - hf.datumM) * scale
-    const maxH = (hf.maxM - hf.datumM) * scale
+    const minH = metersToWorldY(hf, hf.minM, params.demExaggeration)
+    const maxH = metersToWorldY(hf, hf.maxM, params.demExaggeration)
     this.mapUniforms.uHeightRange.value.set(minH, maxH)
     // P2: one sampler per LOD zoom — a chunk built at zoom z reads z's tile
     // pyramid level (this.sample stays the primary-zoom sampler for labels,

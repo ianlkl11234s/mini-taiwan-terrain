@@ -126,3 +126,72 @@ export function disposeLabels(group) {
     }
   })
 }
+
+// Layer adapter — wraps the whole-group rebuild in the Layer interface. update()
+// keeps the existing behavior: dispose the current label set and re-sow a fresh
+// one (place names + spot elevations re-seed around the pan target). A stable
+// parent Group is the object3d so the scene graph never changes; visibility
+// rides on the parent. Reads everything it needs off ctx (sample / seed / real
+// / toFeet / labelCenter / spots).
+export function createLabelsLayer(params) {
+  const object3d = new THREE.Group()
+  let inner = null
+
+  function sow(ctx) {
+    if (inner) {
+      object3d.remove(inner)
+      disposeLabels(inner)
+    }
+    inner = createLabels(ctx.sample, ctx.seed, {
+      real: ctx.real,
+      toFeet: ctx.toFeet,
+      center: ctx.labelCenter,
+      spots: ctx.spots,
+    })
+    object3d.add(inner)
+  }
+
+  return {
+    id: 'labels',
+    kind: 'label',
+    label: 'Labels',
+    rowLabel: '山峰標籤 Peak labels',
+    object3d,
+    visibleParam: 'labels',
+
+    build(ctx) {
+      sow(ctx)
+      // hide while DEM tiles load (matches the procedural-flash guard)
+      const pending = ctx.params.source === 'real' && !ctx.heightField
+      object3d.visible = ctx.params.labels && !pending
+    },
+    // regenerateTerrain / LOD / pan-refresh path: full rebuild (unchanged)
+    update(ctx) {
+      sow(ctx)
+      object3d.visible = ctx.params.labels
+    },
+    setVisible(v) {
+      object3d.visible = v
+    },
+    setStyle() {},
+    describe() {
+      return {
+        id: 'labels',
+        kind: 'label',
+        label: 'Labels',
+        rowLabel: '山峰標籤 Peak labels',
+        count: inner ? inner.children.length : 0,
+        visible: params.labels,
+        styleSchema: null,
+        style: null,
+      }
+    },
+    dispose() {
+      if (inner) disposeLabels(inner)
+    },
+    // debug/verify hook: the actual rendered label group (reassigned on rebuild)
+    get renderGroup() {
+      return inner
+    },
+  }
+}

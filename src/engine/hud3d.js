@@ -290,6 +290,8 @@ export function createHud3D(seed, pois, { ink, accent, platform: withPlatform = 
     group,
     lines,
     platform,
+    // on-demand render: an expanding pulse is a live animation → keep rendering
+    pulseActive: () => pulses.length > 0,
     pulse() {
       const p = flatPlane(pulseTex, 1, baseY + 0.05, 0.8)
       p.userData.age = 0

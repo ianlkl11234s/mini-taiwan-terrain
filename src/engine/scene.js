@@ -212,6 +212,10 @@ export function createStage(params, container) {
   }
 
   placeSun()
+  // shadowMode isn't otherwise applied until a param change or a fade-driven
+  // rescale — without this, renderer.shadowMap.autoUpdate stays at three's
+  // built-in default (true) regardless of params.shadowMode
+  applyShadowMode()
 
   // ------------------------------------------------------------------ post: real depth-based DOF
 

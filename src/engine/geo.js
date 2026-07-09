@@ -237,3 +237,38 @@ export class HeightField {
     this.datumM = count ? sum / count : 0
   }
 }
+
+// ---------------------------------------------------------------- vertical placement
+// Single source of the meters→scene-Y conversion shared by every draped
+// consumer (terrain sampler, coastline sea level, county ridgelines, marker
+// points). Heights are datum-shifted (the frozen initial-core mean → y 0) then
+// scaled by the projection's K (world units per ground meter) × the user
+// exaggeration, so horizontal and vertical proportions stay true. Previously
+// this formula lived copy-pasted in four modules; keep it here.
+
+// world units per ground meter × exaggeration — the per-vertex hot-loop factor
+// (terrain samplers pull this once and inline the datum shift for speed)
+export function worldYScale(heightField, exaggeration) {
+  return heightField.projection.K * exaggeration
+}
+
+// absolute DTM elevation (meters) → scene Y
+export function metersToWorldY(heightField, meters, exaggeration) {
+  return (meters - heightField.datumM) * heightField.projection.K * exaggeration
+}
+
+// live drape: sample the height field at world xz and place on it. Tiles not
+// yet streamed read 0 m (sea level) — callers needing instant accuracy pass a
+// baked elevation to metersToWorldY instead and let this settle on a refresh.
+export function drapeAt(heightField, x, z, exaggeration) {
+  return metersToWorldY(heightField, heightField.heightAtWorld(x, z), exaggeration)
+}
+
+// anti-z-fight lift: overlay lines sit a hair above the terrain skin. Depth-
+// buffer precision degrades ~dist², so a fixed lift falls below precision at
+// the island view — scaling linearly with fogScale keeps it above the curve
+// while staying sub-pixel. Each layer keeps its own base (sea-level ring 0.03;
+// county lines ride ON the skin so they need a touch more, 0.05).
+export function zFightLift(base, fogScale) {
+  return base * fogScale
+}
