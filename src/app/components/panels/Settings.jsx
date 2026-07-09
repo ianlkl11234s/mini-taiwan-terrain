@@ -73,9 +73,6 @@ export default function Settings({ engine }) {
           }}
         />
       </Row>
-      <div style={{ fontFamily: 'inherit', fontSize: T.fs.sm, color: T.textFaint, padding: '2px 8px 4px' }}>
-        加 ?debug=1 開發者模式可調全部參數
-      </div>
     </div>
   )
 }
