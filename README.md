@@ -4,6 +4,16 @@
 
 > Fork 自 **[kaolti/monolith-terrain](https://github.com/kaolti/monolith-terrain)**（MIT）。高程資料源由原本的 AWS Terrain Tiles 換成自家 **NLSC 20m DTM** 圖磚，並加上真實山峰標註、台灣 preset、以及下列的圖層與颱風系統。詳見 [授權與致謝](#授權與致謝)。
 
+## 展示
+
+![玉山群峰地形圖](docs/screenshots/yushan.jpg)
+
+*玉山群峰（NLSC 20m DTM，z12）— 分層設色、等高線、測量網格與真實山峰標註的復古地形圖美術。*
+
+![南化水庫即時蓄水率](docs/screenshots/nanhua-reservoir.jpg)
+
+*南化水庫（z13）— 水庫圖層以即時蓄水率呈現水面（「南化水庫 90%」，取自 Supabase 即時 RPC）。*
+
 ## 功能
 
 - **真實地形**：8 個台灣名山 preset 或自訂經緯度；單一串流世界，chunk 隨鏡頭增量載入（LOD 分層 z10–z13）。
