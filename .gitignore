@@ -5,3 +5,4 @@ public/tiles
 verify/
 
 .env
+__pycache__/
