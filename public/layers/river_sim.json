@@ -1,0 +1,32 @@
+{
+  "bbox": {
+    "minLon": 120.03353118896484,
+    "maxLon": 122.00729370117188,
+    "maxLat": 25.30057913410351,
+    "minLat": 21.89654409161644
+  },
+  "size": {
+    "w": 5749,
+    "h": 10822
+  },
+  "zoom": 13,
+  "png": "/layers/river_sim.png",
+  "params": {
+    "method": "d8",
+    "mfd_exp": null,
+    "out_stride": 2,
+    "cell_m": 17.51,
+    "a_min_km2": 0.1,
+    "a_full_km2": 45.0,
+    "epsilon": 0.0001,
+    "blur_sigma_steep": 0.8,
+    "blur_sigma_flat": 2.6
+  },
+  "stats": {
+    "demCells": 300810240,
+    "landCellsPct": 39.2,
+    "maxCatchmentKm2": 2990.6,
+    "riverTexelsPct": 6.49
+  },
+  "note": "row 0 = north, col 0 = west; grayscale = river intensity 0..1"
+}

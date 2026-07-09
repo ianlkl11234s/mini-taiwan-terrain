@@ -5,3 +5,5 @@ public/tiles
 verify/
 
 .env
+__pycache__/
+.claude/worktrees/

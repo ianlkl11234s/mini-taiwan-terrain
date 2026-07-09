@@ -32,9 +32,10 @@ export const T = {
   // pulse light rail's active-icon "accent" is ink-gray, blue is reserved
   // for links/actions and darkened for white surfaces (featureTheme LIGHT link)
   accentInk: '#374151', // LIGHT_PALETTE.ACCENT (active rail icon)
-  accent: '#e8450e', // warm orange — matches HUD accent (#ff4d00) on white glass
-  accentSoft: 'rgba(232,69,14,0.10)',
-  accentBlue: '#64aaff', // pulse brand accent (shared across themes)
+  // single source of truth: --hud-accent is set from engine hudAccent param
+  // (App.jsx on mount, Settings.jsx on commit) — do not hardcode a hex here
+  accent: 'var(--hud-accent)',
+  accentSoft: 'color-mix(in srgb, var(--hud-accent) 10%, transparent)',
 
   // ── NEUTRAL fills / control states（LIGHT_PALETTE）────
   bgSubtle: 'rgba(0,0,0,0.04)', // LIGHT_FEATURE.bgSubtle / ROW_HOVER

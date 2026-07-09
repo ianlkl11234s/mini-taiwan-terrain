@@ -20,7 +20,7 @@ body {
 
 /* accent for POI tags / kickers — engine hudAccent mirrors into this var */
 :root {
-  --hud-accent: #ff4d00;
+  --hud-accent: #e8450e;
 }
 
 /* --------------------------------------------------------- React shell bits */
@@ -111,7 +111,7 @@ body {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #0284c7;
+  background: var(--hud-accent);
   animation: ta-pulse 1.2s ease-in-out infinite;
   flex-shrink: 0;
 }

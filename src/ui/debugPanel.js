@@ -129,10 +129,6 @@ export function createDebugPanel(engine, hud2) {
   fMap.add(params, 'countiesWidth', 0.5, 6, 0.1).name('county width').onChange(set('countiesWidth'))
   fMap.add(params, 'countiesOpacity', 0, 1, 0.02).name('county opacity').onChange(set('countiesOpacity'))
   fMap.addColor(params, 'countiesColor').name('county color').onChange(set('countiesColor'))
-  fMap
-    .add({ demo: false }, 'demo')
-    .name('demo markers')
-    .onChange((v) => engine.setMarkerSet('demo_locations', { visible: v }))
 
   const fLook = gui.addFolder('Look')
   fLook.add(params, 'exposure', 0.2, 3, 0.02).onChange(set('exposure'))

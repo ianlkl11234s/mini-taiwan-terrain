@@ -25,13 +25,13 @@ export default function App() {
       }
       eng = e
       // console access for debugging/scripting — same contract as the old shell
-      window.__exp = e.debug
+      if (import.meta.env.DEV) window.__exp = e.debug
       document.documentElement.style.setProperty('--hud-accent', e.getParams().hudAccent)
       e.on('loading', (l) => setLoading((prev) => ({ active: l.active, message: l.message ?? prev.message })))
       setEngine(e)
 
-      // developer mode: lil-gui with every parameter, only behind ?debug=1
-      if (new URLSearchParams(window.location.search).has('debug')) {
+      // developer mode: lil-gui with every parameter, dev-only + behind ?debug=1
+      if (import.meta.env.DEV && new URLSearchParams(window.location.search).has('debug')) {
         import('../ui/debugPanel.js').then(({ createDebugPanel }) => {
           if (disposed) return
           createDebugPanel(e, {

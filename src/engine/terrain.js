@@ -1,5 +1,6 @@
 import * as THREE from 'three'
 import { Simplex2, mulberry32, fbm, ridged, smoothstep, lerp } from './noise.js'
+import { worldYScale, metersToWorldY } from './geo.js'
 
 export const TERRAIN_SIZE = 56
 export const BASIN_RADIUS = 6.6 // flat excavation floor
@@ -40,6 +41,16 @@ export class Terrain {
       uScanBlur: { value: params.scanBlur },
       uScanDispH: { value: params.scanDispHeight },
       uScanDispW: { value: params.scanDispFalloff },
+      // physics-derived river simulation (regional pilot). uRiverTex holds a
+      // flow-accumulation intensity bake (scripts/pilot_flow_accum.py); it tints
+      // valley floors blue where water physically accumulates, glued to the
+      // thalweg by construction. uRiverBounds is the bake's world-XZ footprint
+      // (minX,minZ,maxX,maxZ); uRiverSimOpacity 0 = layer off (branch skipped,
+      // texture never sampled — no cost). Same water-blue as the vector rivers.
+      uRiverTex: { value: null },
+      uRiverBounds: { value: new THREE.Vector4(0, 0, 0, 0) },
+      uRiverSimOpacity: { value: 0 },
+      uRiverSimColor: { value: new THREE.Color(params.riversColor) },
     }
     this.rebuildRamp(params)
     this.material.onBeforeCompile = (shader) => {
@@ -91,7 +102,11 @@ uniform float uScanR;
 uniform vec2 uScanCenter;
 uniform vec3 uScanColor;
 uniform float uScanWidth;
-uniform float uScanBlur;`
+uniform float uScanBlur;
+uniform sampler2D uRiverTex;
+uniform vec4 uRiverBounds;
+uniform float uRiverSimOpacity;
+uniform vec3 uRiverSimColor;`
         )
         .replace(
           '#include <color_fragment>',
@@ -108,6 +123,23 @@ uniform float uScanBlur;`
   // keep the lighting/AO shading from the base surface but let the gradient own the color
   float luma = dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722));
   diffuseColor.rgb = mix(diffuseColor.rgb, ramp * clamp(luma * 2.4, 0.2, 1.4), uTint);
+
+  // --- physics-derived river tint: sample the flow-accumulation bake in the
+  // pilot footprint and paint valley floors blue. Gated by uRiverSimOpacity
+  // (0 → branch skipped, uRiverTex never sampled) and by the world-XZ bounds;
+  // smoothstep soft-edges weak upstream flow, and the bake's own edge fade
+  // means the pilot border dissolves rather than showing a hard rectangle.
+  if (uRiverSimOpacity > 0.0) {
+    vec2 rmin = uRiverBounds.xy;
+    vec2 rmax = uRiverBounds.zw;
+    if (vWorldPos.x >= rmin.x && vWorldPos.x <= rmax.x && vWorldPos.z >= rmin.y && vWorldPos.z <= rmax.y) {
+      vec2 ruv = vec2((vWorldPos.x - rmin.x) / max(rmax.x - rmin.x, 1e-4),
+                      (vWorldPos.z - rmin.y) / max(rmax.y - rmin.y, 1e-4));
+      float rInt = texture2D(uRiverTex, ruv).r;
+      float rw = smoothstep(0.02, 0.20, rInt) * uRiverSimOpacity;
+      diffuseColor.rgb = mix(diffuseColor.rgb, uRiverSimColor, clamp(rw, 0.0, 0.95));
+    }
+  }
 
   // --- contour lines: minor every interval, heavy line every 5th
   float ch = vWorldPos.y / uContourInterval;
@@ -198,7 +230,7 @@ if (uScanT >= 0.0) {
   // camera keep working; XY and Y share the projection's K so proportions are true.
   _makeDemSampler(params) {
     const hf = this.heightField
-    const scale = hf.projection.K * params.demExaggeration
+    const scale = worldYScale(hf, params.demExaggeration)
     const datumM = hf.datumM
     this._h2ft = (h) => Math.round((h / scale + datumM) * 3.28084)
     return this._makeDemSamplerFor(hf, params)
@@ -207,7 +239,7 @@ if (uScanT >= 0.0) {
   // Sampler bound to ONE zoom's tile cache — every LOD level shares the same
   // K and datum, so the same world xz reads (near enough) the same height.
   _makeDemSamplerFor(hf, params) {
-    const scale = hf.projection.K * params.demExaggeration
+    const scale = worldYScale(hf, params.demExaggeration)
     const datumM = hf.datumM
 
     const sDetail = new Simplex2(mulberry32(params.seed))
@@ -291,14 +323,20 @@ if (uScanT >= 0.0) {
   rebuild(params) {
     const sample = this._makeSampler(params)
     this.sample = sample
-    const real = params.source === 'real' && this.heightField
+    // real mode never builds the procedural plane — not even before the DEM
+    // has loaded (heightField null): the plane was previously built once at
+    // construction time (~1M vertices of noise) only to be hidden behind
+    // terrain.group.visible=false while tiles fetch. Chunks stream in via
+    // the ChunkManager once heightField is set and rebuild() runs again.
+    const real = params.source === 'real'
+    const chunksReady = real && !!this.heightField
     this.mesh.visible = !real
-    this.chunkGroup.visible = !!real
-    if (real) {
+    this.chunkGroup.visible = chunksReady
+    if (chunksReady) {
       // chunk meshes are owned by the ChunkManager — nothing builds here,
       // only the shared shading config the incremental builds will use
       this._prepareChunkShading(params)
-    } else {
+    } else if (!real) {
       this._rebuildSinglePlane(params, sample)
     }
   }
@@ -308,10 +346,8 @@ if (uScanT >= 0.0) {
   // must normalize hypsometric tint identically or borders would seam.
   _prepareChunkShading(params) {
     const hf = this.heightField
-    const proj = hf.projection
-    const scale = proj.K * params.demExaggeration
-    const minH = (hf.minM - hf.datumM) * scale
-    const maxH = (hf.maxM - hf.datumM) * scale
+    const minH = metersToWorldY(hf, hf.minM, params.demExaggeration)
+    const maxH = metersToWorldY(hf, hf.maxM, params.demExaggeration)
     this.mapUniforms.uHeightRange.value.set(minH, maxH)
     // P2: one sampler per LOD zoom — a chunk built at zoom z reads z's tile
     // pyramid level (this.sample stays the primary-zoom sampler for labels,

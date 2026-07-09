@@ -1,0 +1,46 @@
+{
+  "layers": [
+    {
+      "id": "rail",
+      "kind": "line",
+      "label": "Rail",
+      "rowLabel": "鐵路 Rail",
+      "url": "/layers/rail_lines.json",
+      "visible": false,
+      "style": { "width": 2, "opacity": 0.9 }
+    },
+    {
+      "id": "stations",
+      "kind": "point",
+      "label": "Stations",
+      "rowLabel": "車站 Stations",
+      "url": "/layers/stations.json",
+      "visible": false
+    },
+    {
+      "id": "rivers",
+      "kind": "line",
+      "label": "Rivers",
+      "rowLabel": "河川 Rivers",
+      "url": "/layers/rivers.json",
+      "surfaceUrl": "/layers/river_surfaces.json",
+      "visible": false
+    },
+    {
+      "id": "river_sim",
+      "kind": "raster",
+      "label": "River Sim",
+      "url": "/layers/river_sim.json",
+      "png": "/layers/river_sim.png",
+      "visible": false
+    },
+    {
+      "id": "reservoirs",
+      "kind": "area",
+      "label": "Reservoirs",
+      "rowLabel": "水庫 Reservoirs",
+      "url": "/layers/reservoirs.json",
+      "visible": false
+    }
+  ]
+}

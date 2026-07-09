@@ -1,10 +1,11 @@
 import * as THREE from 'three'
 import { Terrain } from './terrain.js'
-import { createCoastline } from './coastline.js'
-import { createCounties } from './counties.js'
-import { createMarkers } from './markers.js'
+import { LayerManager } from './layers.js'
+import { createCoastlineLayer, createCountiesLayer, createRailLayer, createRiversLayer } from './polyline.js'
+import { createPointLayer } from './markers.js'
+import { createReservoirLayer } from './water.js'
+import { createLabelsLayer } from './labels.js'
 import { createCone } from './cone.js'
-import { createLabels, disposeLabels } from './labels.js'
 import { createHud3D, findPois } from './hud3d.js'
 import { makeProjection, HeightField, TAIWAN_BBOX } from './geo.js'
 import { ChunkManager } from './chunks.js'
@@ -12,6 +13,9 @@ import { findRealPeaks } from './peaks.js'
 import { createStage, LOD_MIN, LOD_MAX } from './scene.js'
 import { createMotion } from './tour.js'
 import { createKeyPan } from './keypan.js'
+import { Line2 } from 'three/addons/lines/Line2.js'
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 
 // Engine facade — the ONLY module the UI layer imports. Owns the whole 3D
 // world (stage + terrain + chunk streaming + POIs + camera motion) and talks
@@ -103,13 +107,40 @@ export const DEFAULT_PARAMS = {
   countiesWidth: 1.5,
   countiesOpacity: 0.5,
   countiesColor: '#444444',
+  // rail: manifest-driven deferred layer (public/layers/rail_lines.json,
+  // fetched on first railVisible:true) — default off, no color param since
+  // each line keeps its own official color (see polyline.js createRailLayer)
+  railVisible: false,
+  railWidth: 2,
+  railOpacity: 0.9,
+  // rivers: the river layer's BODY is a physics-derived flow-accumulation tint
+  // painted into the terrain shader (terrain.js uRiverTex, whole-island bake
+  // public/layers/river_sim.png — the retired vector centerlines are gone). ONE
+  // toggle (riversVisible) brings up the sim tint + the companion water-surface
+  // sheet (public/layers/river_surfaces.json, riversSurfaceOpacity) + the
+  // river-name sprites (public/layers/rivers.json → labels, riverNames).
+  // riversColor feeds BOTH the sim tint (uRiverSimColor) and the surfaces.
+  riversVisible: false,
+  riversColor: '#3d86c6',
+  riversSurfaceOpacity: 0.5,
+  riverNames: true, // river-name labels (0/1 toggle in the Layers panel)
+  // 河川濃度: density of the physics river tint (uRiverSimOpacity). The whole-
+  // island bake PNG is fetched once, on the first switch-on (see loadRiverSim).
+  riverSimOpacity: 0.75,
+  // reservoirs: deferred water-surface area layer (public/layers/reservoirs.json
+  // + live Supabase storage ratios). ratio is a percent slider — default 100
+  // shows each basin at its live level; touching it overrides all basins.
+  reservoirsVisible: false,
+  reservoirsRatio: 100,
+  reservoirsOpacity: 0.55,
+  reservoirsColor: '#2f8fd0',
 
   // HUD
   hud: true,
   hudOpacity: 1,
   uiBlur: 9,
   uiBgOpacity: 0.4,
-  hudAccent: '#ff4d00',
+  hudAccent: '#e8450e',
   hudInk: '#17191b',
   sweepSpeed: 2.5,
   scanColor: '#ccd6ff',
@@ -145,6 +176,7 @@ export const DEFAULT_PARAMS = {
   paused: false,
 
   // tour
+  tourMode: 'p2p', // 'p2p' | 'orbit' | 'contour'
   tourFrom: 'PK-01',
   tourTo: 'PK-02',
   tourDuration: 14,
@@ -152,11 +184,12 @@ export const DEFAULT_PARAMS = {
   tourSmoothing: 0.7,
   tourLook: 0.1,
   tourBank: 0.8,
+  contourOffset: 300, // meters below the summit for the contour-flight band
 
   // performance
-  pixelRatio: Math.min(window.devicePixelRatio, 2),
-  shadowMode: 'dynamic',
-  shadowRes: 2048,
+  pixelRatio: Math.min(window.devicePixelRatio, 1.5),
+  shadowMode: 'static',
+  shadowRes: 1024,
 
   // light
   sunIntensity: 8.3,
@@ -184,8 +217,33 @@ const REBUILD_KEYS = new Set([
 // re-targets the LOD next frame and the chunk rings re-stream incrementally)
 const REAL_REBUILD_KEYS = new Set(['demExaggeration', 'chunkRes', 'outerChunkRes'])
 
+// P2: minDistance now lets the camera dolly right up to a hillside (see
+// scene.js) — clear the ground by this many world units so it never digs
+// into the mesh at the closest zoom
+const CAMERA_GROUND_MARGIN = 0.06
+
+// Data-layer manifest (public/layers/manifest.json): one small fetch at
+// startup describing every deferred GIS overlay (id/url/default style) — NOT
+// the data itself. Each entry's own JSON (rail_lines.json, stations.json, …)
+// is only fetched the first time its layer is switched on (see
+// loadRailData/loadStationsData below). Missing/broken manifest degrades to
+// the hardcoded fallback URLs, so a fetch failure never blocks the layer.
+async function loadLayerManifest() {
+  try {
+    const res = await fetch('/layers/manifest.json')
+    if (!res.ok) throw new Error(`manifest.json ${res.status}`)
+    const json = await res.json()
+    return json.layers ?? []
+  } catch (err) {
+    console.warn('[layers] manifest fetch failed', err)
+    return []
+  }
+}
+
 export async function createEngine({ container, params: overrides = {} } = {}) {
   const params = { ...DEFAULT_PARAMS, ...overrides }
+  const layerManifest = loadLayerManifest() // fired now; awaited lazily by loadRailData/loadStationsData
+  const manifestUrl = async (id, fallback) => (await layerManifest).find((l) => l.id === id)?.url ?? fallback
 
   // ---------------------------------------------------------------- events
   const listeners = new Map()
@@ -203,26 +261,107 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const stage = createStage(params, container)
   const { scene, camera, controls } = stage
 
+  // ---------------------------------------------------------------- on-demand render
+  // Real mode renders only inside an "activity window" opened by an invalidate
+  // event, plus while anything is still animating; otherwise the tick goes idle
+  // (no composer.render / controls.update / hud / markers work — GPU parks).
+  // Procedural mode has permanent platform/cone animation, so it never idles.
+  const ACTIVE_WINDOW_MS = 2500 // continuous render for this long after each invalidate
+  // Retina-sharp freeze: the one idle frame renders at native DPR (≤2); live
+  // interaction stays at the (lower) params.pixelRatio cap for speed.
+  const IDLE_PIXEL_RATIO = Math.min(window.devicePixelRatio || 1, 2)
+  let activeUntil = 0
+  let idle = false
+  let idleFrameAcc = 0 // idle 2 Hz 'frame' throttle
+  let pixelBumped = false // whether the idle freeze raised the pixel ratio
+  let renderCount = 0 // DEV verify hook: +1 per real composer.render
+
+  // any state change that should show on screen calls this — it (re)opens the
+  // render window; the tick keeps rendering until it expires AND nothing animates
+  function invalidate() {
+    activeUntil = performance.now() + ACTIVE_WINDOW_MS
+  }
+
+  // controls fire 'change' every frame the camera actually moves (drag, wheel,
+  // damping tail, keypan → controls.update, programmatic). 'start'/'end' bracket
+  // a grab so the window opens on mousedown before any motion.
+  controls.addEventListener('start', invalidate)
+  controls.addEventListener('change', invalidate)
+  controls.addEventListener('end', invalidate)
+  const onResize = () => invalidate() // scene.js owns the actual resize handler
+  window.addEventListener('resize', onResize)
+
   const terrain = new Terrain(params)
   scene.add(terrain.group)
   // real mode: hide the procedural placeholder until DEM tiles arrive
   const pendingReal = params.source === 'real'
   if (pendingReal) terrain.group.visible = false
 
-  // main-island coastline ink line (real mode only) — geometry builds lazily on
-  // the first real-mode update, once the projection exists
-  const coastline = createCoastline(params, stage.lineResolution)
-  scene.add(coastline.line)
+  // Overlay layers (coastline / county borders / marker sets / place labels)
+  // live behind ONE ordered registry — the engine drives them via
+  // layers.updateAll() (regenerate path) + layers.tickAll() (non-idle tick)
+  // instead of naming each overlay by hand. All are real-mode-only and build
+  // lazily once the projection exists. Adding a layer next stage = register one.
+  let heightField = null // real-world height source (geo.js) — set on first DEM load
+  let demBusy = false
+  const toFeetFn = (h) => terrain.heightToFeet(h)
 
-  // county borders (real mode only) — same lazy-build pattern; every vertex
-  // carries a baked DTM elevation so the line rides the ridgelines
-  const counties = createCounties(params, stage.lineResolution)
-  scene.add(counties.mesh)
+  // fresh per-call snapshot of the live world state every layer reads from
+  function layerCtx(dt = 0) {
+    return {
+      params,
+      heightField,
+      projection: heightField ? heightField.projection : null,
+      camera,
+      fogScale: stage.fogScale,
+      dt,
+      lineResolution: stage.lineResolution,
+      // label-specific: fictional cartography in noise mode, real spot heights
+      // + pan-following re-sow in streamed real mode
+      sample: terrain.sample,
+      seed: params.seed,
+      real: params.source === 'real',
+      toFeet: toFeetFn,
+      labelCenter: params.source === 'real' ? { x: controls.target.x, z: controls.target.z } : undefined,
+      spots: stage.lodZoom >= 12, // P2: no spot elevations in far views
+    }
+  }
 
-  // generic marker sets (real mode only) — pure display layer behind
-  // setMarkerSet/removeMarkerSet/listMarkerSets, never part of the POI system
-  const markers = createMarkers(params)
-  scene.add(markers.group)
+  const layers = new LayerManager(scene)
+  const pointLayer = createPointLayer(params) // marker sets — imperative set API preserved
+  // stations: a second marker-set collection, grouped one set per transit
+  // system (see loadStationsData below). onActivate fires once, on the
+  // panel's first toggle-on, and fetches public/layers/stations.json.
+  const stationsLayer = createPointLayer(params, {
+    id: 'stations',
+    label: 'Stations',
+    rowLabel: '車站 Stations',
+    onActivate: () => loadStationsData(),
+  })
+  const labelsLayer = createLabelsLayer(params)
+  const reservoirsLayer = createReservoirLayer(params)
+  // registration order = draw / update order (coastline → counties → rail →
+  // rivers → reservoirs → markers → stations → labels)
+  for (const layer of [
+    createCoastlineLayer(params),
+    createCountiesLayer(params),
+    createRailLayer(params),
+    createRiversLayer(params),
+    reservoirsLayer,
+    pointLayer,
+    stationsLayer,
+    labelsLayer,
+  ]) {
+    layers.register(layer, layerCtx())
+  }
+  const regenerateLabels = () => labelsLayer.update(layerCtx())
+  // param keys that map to a layer's visibility/style — a setParams touching any
+  // of them re-emits 'layers' so the dynamic panel refreshes
+  const LAYER_KEYS = new Set()
+  for (const layer of layers.layers.values()) {
+    if (layer.visibleParam) LAYER_KEYS.add(layer.visibleParam)
+    if (layer.paramMap) for (const k in layer.paramMap) LAYER_KEYS.add(layer.paramMap[k])
+  }
 
   // chunk streaming: which chunks exist follows the pan target (radius tied to
   // the EFFECTIVE fog wall, so it grows with the far-view fogScale) — meshes
@@ -234,33 +373,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     innerRes: () => params.chunkRes,
     outerRes: () => params.outerChunkRes,
   })
-  chunkManager.onChunksChanged = () => stage.shadowNeedsUpdate()
+  chunkManager.onChunksChanged = () => {
+    stage.shadowNeedsUpdate()
+    invalidate() // a chunk appeared/vanished (incl. after DEM tiles finish loading)
+  }
 
   const cone = createCone()
   scene.add(cone.group)
-
-  // real-world heightfield (declared before the first POI pass — computePois reads it)
-  let heightField = null
-  let demBusy = false
-
-  const labelOpts = () => ({
-    real: params.source === 'real',
-    toFeet: (h) => terrain.heightToFeet(h),
-    // streamed world: labels re-sow around the pan target (see tick throttle)
-    center: params.source === 'real' ? { x: controls.target.x, z: controls.target.z } : undefined,
-    spots: stage.lodZoom >= 12, // P2: no spot elevations in far views
-  })
-  let labels = createLabels(terrain.sample, params.seed, labelOpts())
-  labels.visible = params.labels && !pendingReal
-  scene.add(labels)
-
-  function regenerateLabels() {
-    scene.remove(labels)
-    disposeLabels(labels)
-    labels = createLabels(terrain.sample, params.seed, labelOpts())
-    labels.visible = params.labels
-    scene.add(labels)
-  }
 
   const poiFeet = (h) => terrain.heightToFeet(h)
   // real Taiwan peaks around the pan target when a DEM is loaded; hill-climb
@@ -291,6 +410,56 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   if (pendingReal) hud3.group.visible = false
   scene.add(hud3.group)
 
+  // ---------------------------------------------------------------- tour tile pre-streaming
+  // The tour planner samples terrain.sample (the primary z12 field). Tiles not
+  // resident read datum-low, so a long route would be planned against phantom
+  // valleys — pre-stream every tile the route crosses first. Each helper races
+  // a timeout so a slow/offline fetch never blocks the flight: planning
+  // proceeds with whatever is cached when the clock runs out.
+  const raceTimeout = (promise, ms) => Promise.race([promise, new Promise((r) => setTimeout(r, ms))])
+  function ensureTourTiles(points, { radiusTiles = 1, timeoutMs = 4000 } = {}) {
+    if (!heightField) return Promise.resolve()
+    const proj = heightField.projection
+    const seen = new Set()
+    const coords = []
+    for (const p of points) {
+      const { px, py } = proj.worldToPixel(p.x, p.z)
+      const ctx = Math.floor(px / 256)
+      const cty = Math.floor(py / 256)
+      for (let dy = -radiusTiles; dy <= radiusTiles; dy++) {
+        for (let dx = -radiusTiles; dx <= radiusTiles; dx++) {
+          const tx = ctx + dx
+          const ty = cty + dy
+          const k = tx + ',' + ty
+          if (!seen.has(k)) {
+            seen.add(k)
+            coords.push({ tx, ty })
+          }
+        }
+      }
+    }
+    return raceTimeout(heightField.ensureTiles(coords), timeoutMs)
+  }
+  function ensureTourDisk(cx, cz, R, { timeoutMs = 4000 } = {}) {
+    if (!heightField) return Promise.resolve()
+    const proj = heightField.projection
+    const c = proj.worldToPixel(cx, cz)
+    const tileW = proj.tileWorldSize
+    const tr = Math.ceil(R / tileW) + 1
+    const ctx = Math.floor(c.px / 256)
+    const cty = Math.floor(c.py / 256)
+    const coords = []
+    for (let dy = -tr; dy <= tr; dy++) {
+      for (let dx = -tr; dx <= tr; dx++) {
+        const tx = ctx + dx
+        const ty = cty + dy
+        const wc = proj.tileCenterWorld(tx, ty)
+        if (Math.hypot(wc.x - cx, wc.z - cz) <= R + tileW * 0.75) coords.push({ tx, ty })
+      }
+    }
+    return raceTimeout(heightField.ensureTiles(coords), timeoutMs)
+  }
+
   // ---------------------------------------------------------------- motion (fly-to + tour)
   const motion = createMotion({
     params,
@@ -298,13 +467,83 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     controls,
     sample: (x, z) => terrain.sample(x, z),
     getPois: () => pois,
+    ensureTiles: ensureTourTiles,
+    ensureDisk: ensureTourDisk,
+    worldPerMeter: () => (heightField ? heightField.projection.K * params.demExaggeration : 0),
   })
+
+  // ---------------------------------------------------------------- tour path preview
+  // A translucent accent line of the planned route, rebuilt whenever the panel
+  // changes from/to/mode/offset. Removed the instant a tour starts and cleared
+  // when the panel closes. It re-plans (and re-streams) on every rebuild, so it
+  // also tracks demExaggeration changes.
+  const tourPreview = { line: null, mat: null, active: false, seq: 0 }
+  let lastPreviewOpts = null
+  function buildPreviewLine(points) {
+    const pos = new Float32Array(points.length * 3)
+    for (let i = 0; i < points.length; i++) {
+      pos[i * 3] = points[i].x
+      pos[i * 3 + 1] = points[i].y
+      pos[i * 3 + 2] = points[i].z
+    }
+    if (!tourPreview.line) {
+      const mat = new LineMaterial({ color: new THREE.Color(params.hudAccent), linewidth: 3.5, transparent: true, opacity: 0.85, fog: true, depthTest: false })
+      mat.uniforms.resolution.value = stage.lineResolution
+      const line = new Line2(new LineGeometry(), mat)
+      line.renderOrder = 5
+      line.frustumCulled = false
+      tourPreview.line = line
+      tourPreview.mat = mat
+      scene.add(line)
+    }
+    tourPreview.mat.color.set(params.hudAccent)
+    const geo = new LineGeometry()
+    geo.setPositions(pos)
+    tourPreview.line.geometry.dispose()
+    tourPreview.line.geometry = geo
+    tourPreview.line.visible = true
+    tourPreview.active = true
+  }
+  function clearTourPreview() {
+    tourPreview.active = false
+    tourPreview.seq++ // invalidate any in-flight preview plan
+    lastPreviewOpts = null
+    if (tourPreview.line) tourPreview.line.visible = false
+    invalidate()
+  }
+  async function doTourPreview(opts = {}) {
+    if (opts.from !== undefined) params.tourFrom = opts.from
+    if (opts.to !== undefined) params.tourTo = opts.to
+    if (opts.mode !== undefined) params.tourMode = opts.mode
+    if (opts.contourOffset !== undefined) params.contourOffset = opts.contourOffset
+    if (!heightField || params.source !== 'real') return null
+    lastPreviewOpts = { ...opts }
+    const seq = ++tourPreview.seq
+    const plan = await motion.planTour({ ...opts, preview: true })
+    if (seq !== tourPreview.seq) return null // superseded by a newer preview / a start
+    if (!plan) {
+      clearTourPreview()
+      return null
+    }
+    buildPreviewLine(plan.previewPoints)
+    invalidate()
+    return plan.summary
+  }
 
   // user grabbing the camera cancels any fly-to or tour
   controls.addEventListener('start', () => motion.cancel())
 
-  // arrow-key / WASD smooth pan — a mapped keydown cancels motion the same way
-  const keyPan = createKeyPan({ camera, controls, onEngage: () => motion.cancel() })
+  // arrow-key / WASD smooth pan — a mapped keydown cancels motion the same way.
+  // onEngage fires on every keydown (incl. OS key-repeat while held), so it also
+  // keeps the render window open when panning against a pan-bound (no 'change').
+  const keyPan = createKeyPan({
+    camera,
+    controls,
+    onEngage: () => {
+      motion.cancel()
+      invalidate()
+    },
+  })
 
   // ---------------------------------------------------------------- selection
   const HOME = { pos: new THREE.Vector3(0, 18, 19), target: new THREE.Vector3(0, -0.3, 0) }
@@ -315,6 +554,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function selectPoi(i) {
     const p = pois[i]
     if (!p) return
+    invalidate()
     if (selectedPoi === -1) {
       returnPose.pos.copy(camera.position)
       returnPose.target.copy(controls.target)
@@ -330,6 +570,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
 
   function deselect() {
+    invalidate()
     selectedPoi = -1
     emit('selection', { index: -1, poi: null })
     motion.flyTo(returnPose.saved ? returnPose.pos : HOME.pos, returnPose.saved ? returnPose.target : HOME.target)
@@ -350,6 +591,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
 
   function regenerateHud() {
+    invalidate()
     scene.remove(hud3.group)
     hud3.dispose()
     pois = computePois()
@@ -377,6 +619,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // the fog wall (uScanR ≈ the P0 look of 42 units at the default fogFar 50;
   // scaled with the far-view fogScale so the island view scans the island)
   function triggerScan({ kick = false } = {}) {
+    invalidate()
     scanStart = performance.now() / 1000
     terrain.mapUniforms.uScanCenter.value.set(controls.target.x, controls.target.z)
     terrain.mapUniforms.uScanR.value = params.fogFar * stage.fogScale * 0.84
@@ -386,6 +629,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   let rebuildPending = false
   function regenerateTerrain() {
     if (rebuildPending) return
+    invalidate()
     rebuildPending = true
     emit('loading', { active: true, message: 'generating terrain…' })
     // let the indicator paint before the synchronous rebuild blocks the thread
@@ -403,14 +647,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
           chunkManager.setEnabled(false)
           chunkManager.clear()
         }
-        coastline.update(params, heightField) // sea-level y tracks the vertical scale
-        counties.update(params, heightField) // ridgeline ys track it too
-        markers.update(params, heightField)
-        regenerateLabels()
+        layers.updateAll(layerCtx()) // coastline sea-level y, county ridgelines, markers, labels
         regenerateHud()
         refreshPoiAnchor()
         stage.shadowNeedsUpdate()
         rebuildPending = false
+        // the vertical scale (demExaggeration) may have moved — re-plan the
+        // visible preview line against the new relief
+        if (tourPreview.active && lastPreviewOpts) doTourPreview(lastPreviewOpts)
         emit('loading', { active: false })
       }, 30)
     )
@@ -421,6 +665,214 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const poiAnchor = new THREE.Vector2(0, 0)
   function refreshPoiAnchor() {
     poiAnchor.set(controls.target.x, controls.target.z)
+  }
+
+  // ---------------------------------------------------------------- deferred GIS layers (rail / stations)
+  // Both public/layers/*.json are baked offline (scripts/bake_layer_elevations.py)
+  // with per-vertex elevation already baked in — no DEM sampling needed here,
+  // just a plain fetch. Neither is requested until the Layers panel switches
+  // the layer on for the first time (see HANDLERS.railVisible and
+  // stationsLayer's onActivate above).
+  let railFetch = { loading: false, loaded: false }
+  async function loadRailData() {
+    if (railFetch.loading || railFetch.loaded) return
+    railFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('rail', '/layers/rail_lines.json'))
+      if (!res.ok) throw new Error(`rail_lines.json ${res.status}`)
+      const data = await res.json()
+      layers.get('rail').setData(
+        data.lines.map((l) => l.points),
+        data.lines.map((l) => l.color)
+      )
+      railFetch.loaded = true
+      layers.get('rail').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] rail fetch failed', err)
+    } finally {
+      railFetch.loading = false
+      invalidate()
+      emit('layers') // refresh the panel's point count now that data (or the failure) landed
+    }
+  }
+
+  // rivers: rivers.json now carries only the river-NAME labels (the vector
+  // centerlines are retired — the river body is the sim tint, loadRiverSim).
+  // rivers.json (labels) + river_surfaces.json (the triangulated water-surface
+  // sheet) are fetched in PARALLEL on the first switch-on; the surface fetch is
+  // best-effort (a 404/network miss just leaves the labels, resolving to null
+  // instead of rejecting the pair). The layer only builds its surface mesh once
+  // setSurfaceData has run, avoiding the empty-geometry-then-fill trap.
+  let riversFetch = { loading: false, loaded: false }
+  async function loadRiversData() {
+    if (riversFetch.loading || riversFetch.loaded) return
+    riversFetch.loading = true
+    try {
+      const entry = (await layerManifest).find((l) => l.id === 'rivers')
+      const linesUrl = entry?.url ?? '/layers/rivers.json'
+      const surfaceUrl = entry?.surfaceUrl ?? '/layers/river_surfaces.json'
+      const [linesRes, surfData] = await Promise.all([
+        fetch(linesUrl),
+        fetch(surfaceUrl)
+          .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`river_surfaces.json ${r.status}`))))
+          .catch((e) => {
+            console.warn('[layers]', e.message || e)
+            return null
+          }),
+      ])
+      if (!linesRes.ok) throw new Error(`rivers.json ${linesRes.status}`)
+      const linesData = await linesRes.json()
+      layers.get('rivers').setLabels(linesData.labels || [])
+      if (surfData) layers.get('rivers').setSurfaceData(surfData.polygons)
+      riversFetch.loaded = true
+      layers.get('rivers').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] rivers fetch failed', err)
+    } finally {
+      riversFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // river SIM: the whole-island physics-derived river body, painted straight
+  // into the terrain shader from a flow-accumulation bake. The PNG (grayscale
+  // intensity) + JSON meta (geographic bounds) are fetched once, on the first
+  // rivers switch-on. Race guard: uRiverTex/uRiverBounds are only wired up AFTER
+  // the texture has finished decoding, and the opacity uniform stays 0 until
+  // then — so a half-loaded texture is never sampled.
+  let riverSimTex = null
+  let riverSimMeta = null
+  const riverSimFetch = { loading: false, loaded: false }
+  function applyRiverSimBounds() {
+    if (!riverSimTex || !riverSimMeta || !heightField) return
+    const b = riverSimMeta.bbox
+    const nw = heightField.projection.lonLatToWorld(b.minLon, b.maxLat) // west / north
+    const se = heightField.projection.lonLatToWorld(b.maxLon, b.minLat) // east / south
+    terrain.mapUniforms.uRiverBounds.value.set(nw.x, nw.z, se.x, se.z)
+    terrain.mapUniforms.uRiverTex.value = riverSimTex
+  }
+  async function loadRiverSim() {
+    if (riverSimFetch.loading || riverSimFetch.loaded) return
+    riverSimFetch.loading = true
+    try {
+      const metaRes = await fetch(await manifestUrl('river_sim', '/layers/river_sim.json'))
+      if (!metaRes.ok) throw new Error(`river_sim.json ${metaRes.status}`)
+      riverSimMeta = await metaRes.json()
+      const pngUrl = riverSimMeta.png ?? '/layers/river_sim.png'
+      const tex = await new Promise((resolve, reject) =>
+        new THREE.TextureLoader().load(pngUrl, resolve, undefined, reject)
+      )
+      // intensity data, not color: no sRGB decode, linear filter, no mipmaps.
+      // flipY false so image row 0 (north) reads at UV v=0, matching the bake's
+      // row-0-is-north convention (see the shader's UV math).
+      tex.flipY = false
+      tex.colorSpace = THREE.NoColorSpace
+      tex.minFilter = THREE.LinearFilter
+      tex.magFilter = THREE.LinearFilter
+      tex.generateMipmaps = false
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping
+      tex.needsUpdate = true
+      riverSimTex = tex
+      riverSimFetch.loaded = true
+    } catch (err) {
+      console.warn('[layers] river sim fetch failed', err)
+    } finally {
+      riverSimFetch.loading = false
+      applyRiverSim() // now that the texture (or its failure) has landed
+    }
+  }
+  // Set the shader uniforms from the rivers toggle / 河川濃度. Kicks the deferred
+  // fetch on the first rivers switch-on; keeps the opacity uniform at 0 (branch
+  // skipped in the shader) until the texture is bound — so the layer is truly
+  // zero-cost while off.
+  function applyRiverSim() {
+    const on = !!params.riversVisible
+    if (on && !riverSimFetch.loaded && !riverSimFetch.loading) loadRiverSim()
+    const active = on && riverSimFetch.loaded
+    if (active) applyRiverSimBounds()
+    terrain.mapUniforms.uRiverSimColor.value.set(params.riversColor)
+    terrain.mapUniforms.uRiverSimOpacity.value = active ? params.riverSimOpacity : 0
+    invalidate()
+  }
+
+  // reservoirs: fetch the baked basin polygons + dam markers, then the LIVE
+  // storage ratios from the mini-taiwan-pulse Supabase RPC (anon read-only key).
+  // A live-fetch failure is non-fatal: every basin falls back to ratio 1.0
+  // (full pool) with a console.warn, so the water surfaces still render.
+  const SUPABASE_URL = 'https://utcmcikhvxnohbxchbrs.supabase.co'
+  const SUPABASE_ANON =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0Y21jaWtodnhub2hieGNoYnJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ1NjgyMDMsImV4cCI6MjA5MDE0NDIwM30.rQSjJ6WD53p9tRZ6M7xleDelktVHfKeZFGPC2ItULVQ'
+  async function fetchReservoirRatios() {
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_reservoir_status_latest`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_ANON,
+          Authorization: `Bearer ${SUPABASE_ANON}`,
+          'Content-Type': 'application/json',
+        },
+        body: '{}',
+      })
+      if (!res.ok) throw new Error(`get_reservoir_status_latest ${res.status}`)
+      const rows = await res.json()
+      const byName = {}
+      let matched = 0
+      for (const r of rows) {
+        if (r.name != null && r.storage_ratio_pct != null) {
+          byName[r.name] = Math.min(1, Math.max(0, r.storage_ratio_pct / 100))
+          matched++
+        }
+      }
+      console.info(`[layers] reservoir live ratios: ${matched} basins from Supabase`)
+      return byName
+    } catch (err) {
+      console.warn('[layers] reservoir live-ratio fetch failed — falling back to full pool (1.0)', err)
+      return {}
+    }
+  }
+  let reservoirsFetch = { loading: false, loaded: false }
+  async function loadReservoirsData() {
+    if (reservoirsFetch.loading || reservoirsFetch.loaded) return
+    reservoirsFetch.loading = true
+    try {
+      const [res, live] = await Promise.all([
+        fetch(await manifestUrl('reservoirs', '/layers/reservoirs.json')),
+        fetchReservoirRatios(),
+      ])
+      if (!res.ok) throw new Error(`reservoirs.json ${res.status}`)
+      const data = await res.json()
+      reservoirsLayer.setData(data.reservoirs, data.dams, live)
+      reservoirsFetch.loaded = true
+      reservoirsLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] reservoirs fetch failed', err)
+    } finally {
+      reservoirsFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // stationsLayer.onActivate — grouped one marker set per transit system.
+  // Never rejects: a fetch failure just leaves the layer showing no sets
+  // (console.warn + graceful "NO MARKER SETS" panel state), matching rail's
+  // fail-quiet behavior.
+  async function loadStationsData() {
+    try {
+      const res = await fetch(await manifestUrl('stations', '/layers/stations.json'))
+      if (!res.ok) throw new Error(`stations.json ${res.status}`)
+      const data = await res.json()
+      for (const [systemId, sys] of Object.entries(data.systems)) {
+        stationsLayer.setSet(systemId, { color: sys.color, visible: true, points: sys.points })
+      }
+      stationsLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] stations fetch failed', err)
+    } finally {
+      invalidate()
+      emit('layers')
+    }
   }
 
   // ---------------------------------------------------------------- real-world DEM loading
@@ -492,6 +944,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       setTimeout(() => emit('loading', { active: false, message: 'generating terrain…' }), 2600)
       return false
     }
+    invalidate()
     const { x, z } = heightField.projection.lonLatToWorld(lon, lat)
     _flyOffset.subVectors(camera.position, controls.target) // keep the current view offset
     const target = new THREE.Vector3(x, controls.target.y, z)
@@ -564,15 +1017,54 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     peakLimit: () => regenerateHud(),
     peakMinElev: () => regenerateHud(),
     peakRadiusKm: () => regenerateHud(),
-    labels: (v) => (labels.visible = v),
-    coastline: () => coastline.update(params, heightField),
-    coastlineWidth: () => coastline.update(params, heightField),
-    coastlineOpacity: () => coastline.update(params, heightField),
-    coastlineColor: () => coastline.update(params, heightField),
-    counties: () => counties.update(params, heightField),
-    countiesWidth: () => counties.update(params, heightField),
-    countiesOpacity: () => counties.update(params, heightField),
-    countiesColor: () => counties.update(params, heightField),
+    // overlay layers: visibility toggle just flips the group; style/geometry
+    // params re-run the layer's full update (lazy build + vertical + material)
+    labels: (v) => labelsLayer.setVisible(v),
+    coastline: () => layers.get('coastline').update(layerCtx()),
+    coastlineWidth: () => layers.get('coastline').update(layerCtx()),
+    coastlineOpacity: () => layers.get('coastline').update(layerCtx()),
+    coastlineColor: () => layers.get('coastline').update(layerCtx()),
+    counties: () => layers.get('counties').update(layerCtx()),
+    countiesWidth: () => layers.get('counties').update(layerCtx()),
+    countiesOpacity: () => layers.get('counties').update(layerCtx()),
+    countiesColor: () => layers.get('counties').update(layerCtx()),
+    // rail: first switch-on triggers the deferred fetch (loadRailData no-ops
+    // once loaded/in-flight); the layer shows its (possibly still empty)
+    // geometry immediately either way, exactly like coastline/counties.
+    railVisible: (v) => {
+      if (v) loadRailData()
+      layers.get('rail').update(layerCtx())
+    },
+    railWidth: () => layers.get('rail').update(layerCtx()),
+    railOpacity: () => layers.get('rail').update(layerCtx()),
+    // rivers: ONE toggle brings up the whole layer — the river-name labels +
+    // water-surface sheet (deferred fetch) and the physics river-body tint
+    // (deferred PNG fetch, via applyRiverSim). Same fail-quiet deferred pattern
+    // as rail; the sim uniform stays 0 until its texture lands (zero-cost off).
+    riversVisible: (v) => {
+      if (v) loadRiversData()
+      layers.get('rivers').update(layerCtx())
+      applyRiverSim()
+    },
+    // 顏色 feeds BOTH the sim tint (uRiverSimColor) and the surface sheet
+    riversColor: () => {
+      layers.get('rivers').update(layerCtx())
+      applyRiverSim()
+    },
+    riversSurfaceOpacity: () => layers.get('rivers').update(layerCtx()),
+    riverNames: () => layers.get('rivers').update(layerCtx()),
+    // 河川濃度: the physics river-body tint density (uRiverSimOpacity). Re-runs
+    // applyRiverSim, which no-ops the uniform until the texture has landed.
+    riverSimOpacity: () => applyRiverSim(),
+    // reservoirs: first switch-on fetches basins + live storage ratios; the
+    // ratio slider drives a global manual override across every water surface
+    reservoirsVisible: (v) => {
+      if (v) loadReservoirsData()
+      reservoirsLayer.update(layerCtx())
+    },
+    reservoirsRatio: (v) => reservoirsLayer.setManualRatio(v / 100),
+    reservoirsOpacity: () => reservoirsLayer.update(layerCtx()),
+    reservoirsColor: () => reservoirsLayer.update(layerCtx()),
     // look
     exposure: (v) => (stage.exposureFx.uniforms.get('exposure').value = v),
     contrast: (v) => (stage.contrastFx.uniforms.get('contrast').value = v),
@@ -617,6 +1109,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       else HANDLERS[k]?.(params[k])
     }
     if (rebuild) regenerateTerrain()
+    if (keys.some((k) => LAYER_KEYS.has(k))) emit('layers') // dynamic panel refresh
+    invalidate() // any settings change must repaint, even from a frozen idle frame
   }
 
   // ---------------------------------------------------------------- pointer
@@ -657,6 +1151,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   let gpsAcc = 0 // SECTOR GPS refresh throttle
   let poiAcc = 0 // peaks/labels refresh throttle
   let statsAcc = 0 // 'stats' event throttle
+  let tourWasActive = false // 'tour' event edge-detect — covers natural finish, stopTour, and controls-drag cancel alike
   let rafId = 0
   let disposed = false
 
@@ -668,19 +1163,126 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const _sph = new THREE.Spherical()
   const _rel = new THREE.Vector3()
 
+  // any live animation forces a render regardless of the activity window.
+  // Procedural mode + the pre-DEM real load have permanent platform/cone motion
+  // (or nothing settled yet) so they're always "animating" and never idle.
+  function isAnimating() {
+    if (params.source !== 'real' || !heightField) return true
+    return (
+      motion.tourActive ||
+      motion.tweenActive ||
+      scanStart >= 0 ||
+      rebuildPending ||
+      chunkManager.queue.length > 0 ||
+      hud3.pulseActive()
+    )
+  }
+
+  // CPU-only HUD payload (screen projections + telemetry). Cheap enough to reuse
+  // verbatim from the idle path at 2 Hz so the T+ clock and telemetry keep
+  // ticking with the composer parked. Camera is static in idle, so last frame's
+  // matrices are still valid.
+  function emitFrame(dt, t) {
+    const w = window.innerWidth
+    const h = window.innerHeight
+    _sph.setFromVector3(_rel.copy(camera.position).sub(controls.target))
+    const secs = Math.floor(t)
+    emit('frame', {
+      dt,
+      reticle: project(cone.getFocusPoint(), w, h),
+      poiScreens: pois.map((p) => project(p.top, w, h)),
+      selected: selectedPoi,
+      az: THREE.MathUtils.radToDeg(_sph.theta),
+      el: 90 - THREE.MathUtils.radToDeg(_sph.phi),
+      focus: params.focusDistance,
+      lod: params.source === 'real' && heightField ? stage.lodZoom : null,
+      fps,
+      clock: `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`,
+      coneAlt: cone.group.position.y,
+      spin: params.coneSpin,
+    })
+  }
+
+  function renderFrame(dt) {
+    stage.composer.render(dt)
+    renderCount++
+  }
+
+  // Freeze: bump to native DPR for a Retina-sharp still, draw exactly one frame
+  // at that resolution, then park. setPixelRatio reallocates the composer
+  // buffers, so this cost lands once per idle transition — never mid-interaction.
+  function enterIdle(dt) {
+    if (IDLE_PIXEL_RATIO > params.pixelRatio + 1e-3) {
+      stage.setPixelRatio(IDLE_PIXEL_RATIO)
+      pixelBumped = true
+    }
+    camera.updateMatrixWorld()
+    renderFrame(dt) // the already-settled scene, unchanged — just sharper
+    idle = true
+    idleFrameAcc = 0
+  }
+
+  // Thaw on the next invalidate: restore the interactive (lower) pixel ratio so
+  // live frames stay cheap. The active tick that follows renders at that ratio.
+  function exitIdle() {
+    if (pixelBumped) {
+      stage.setPixelRatio(params.pixelRatio)
+      pixelBumped = false
+    }
+    idle = false
+  }
+
   function tick() {
     if (disposed) return
     rafId = requestAnimationFrame(tick)
     const dt = Math.min(clock.getDelta(), 0.05)
     const t = clock.elapsedTime
 
+    // on-demand gate: render while an animation runs OR the activity window is
+    // open. Animating frames roll the window forward so any motion always gets a
+    // full ACTIVE_WINDOW_MS tail (damping, settle) before the loop can idle.
+    const animating = isAnimating()
+    if (animating) invalidate()
+    if (!animating && performance.now() >= activeUntil) {
+      if (!idle) {
+        enterIdle(dt) // one Retina still, then park
+      } else {
+        idleFrameAcc += dt
+        if (idleFrameAcc >= 0.5) {
+          idleFrameAcc = 0
+          if (params.hud) emitFrame(dt, t) // ~2 Hz: keep T+ clock / telemetry alive
+        }
+      }
+      return
+    }
+    if (idle) exitIdle()
+
     // camera motion: tour > fly tween > free navigation (with pan clamp)
     if (!motion.tick(dt)) {
       keyPan.tick(dt) // arrow/WASD velocity, applied before damping + clamp
       controls.update()
       stage.clampPan() // free navigation only — tours / fly-tos manage their own path
+      // anti-penetration: floor the camera to the ground sample right below it
+      // + a small margin, so dollying/panning close to a slope can't dig into
+      // the mesh. Cheap XZ-only check (no ray march) — good enough since the
+      // camera moves continuously and this runs every frame.
+      if (terrain.sample) {
+        const minY = terrain.sample(camera.position.x, camera.position.z) + CAMERA_GROUND_MARGIN
+        if (camera.position.y < minY) camera.position.y = minY
+      }
     } else {
       keyPan.reset() // no residual glide fighting an active tour/fly-to
+    }
+
+    // tour state, edge-detected off motion.tourActive — a single source of
+    // truth that catches start, natural finish, stopTour() and the
+    // controls-drag cancel path (index.js 'start' listener → motion.cancel())
+    // alike, without duplicating state. flyTo tweens don't touch tourActive,
+    // so they never trigger this.
+    if (motion.tourActive !== tourWasActive) {
+      tourWasActive = motion.tourActive
+      invalidate() // keep rendering through the tour→free-nav handoff settle
+      emit('tour', { active: tourWasActive })
     }
 
     // P2: distance LOD + far-view scaling. At dist ≤ D0 everything resolves to
@@ -694,10 +1296,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     const fogScale = stage.fogScale
     terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
     terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
-    coastline.setFogScale(fogScale) // anti-z-fight lift tracks the view scale
-    counties.setFogScale(fogScale)
-    markers.setFogScale(fogScale)
-    markers.tick(dt, camera) // dot rescale / tag sizing / label crowd control
+    layers.tickAll(layerCtx(dt)) // anti-z-fight lift tracks the view scale; marker dot rescale / tag crowd control
     if (lodChanged && !rebuildPending) {
       // far/near label policies changed — re-sow peaks + spot elevations now
       refreshPoiAnchor()
@@ -766,24 +1365,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // the UI layer owns the DOM, the engine owns the math
     if (params.hud) {
       fps += (1 / Math.max(dt, 1e-4) - fps) * 0.05
-      const w = window.innerWidth
-      const h = window.innerHeight
-      _sph.setFromVector3(_rel.copy(camera.position).sub(controls.target))
-      const secs = Math.floor(t)
-      emit('frame', {
-        dt,
-        reticle: project(cone.getFocusPoint(), w, h),
-        poiScreens: pois.map((p) => project(p.top, w, h)),
-        selected: selectedPoi,
-        az: THREE.MathUtils.radToDeg(_sph.theta),
-        el: 90 - THREE.MathUtils.radToDeg(_sph.phi),
-        focus: params.focusDistance,
-        lod: params.source === 'real' && heightField ? stage.lodZoom : null,
-        fps,
-        clock: `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`,
-        coneAlt: cone.group.position.y,
-        spin: params.coneSpin,
-      })
+      emitFrame(dt, t)
     }
 
     // coarse stats for non-per-frame consumers (sidebars, debugging)
@@ -793,10 +1375,22 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       emit('stats', stats())
     }
 
-    stage.composer.render(dt)
+    renderFrame(dt)
   }
 
   // ---------------------------------------------------------------- facade
+
+  // shared by setMarkerSet (always targets the generic 'markers' layer) and
+  // the panel's per-system station toggles (setLayerSet) — any point-kind
+  // layer exposing setSet/update can be addressed by id this way.
+  function setLayerSet(layerId, setId, def) {
+    const layer = layers.get(layerId)
+    if (!layer?.setSet) return
+    layer.setSet(setId, def)
+    layer.update?.(layerCtx()) // builds now if the world exists
+    invalidate()
+    emit('layers') // set list/visibility changed → refresh the panel
+  }
 
   const engine = {
     on,
@@ -816,31 +1410,95 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     },
     applyPreset,
     setSource,
-    startTour(opts = {}) {
+    // async planning: pre-stream the route's tiles, build + collision-verify the
+    // spline, then commit. Emits 'tour' {planning:true} up front so the panel can
+    // show a loading state; the tick's edge-detect emits {active} on begin/finish.
+    async startTour(opts = {}) {
       if (opts.from !== undefined) params.tourFrom = opts.from
       if (opts.to !== undefined) params.tourTo = opts.to
-      return motion.startTour()
+      if (opts.mode !== undefined) params.tourMode = opts.mode
+      if (opts.contourOffset !== undefined) params.contourOffset = opts.contourOffset
+      invalidate()
+      emit('tour', { active: false, planning: true })
+      const plan = await motion.planTour(opts)
+      if (!plan) {
+        emit('tour', { active: false, planning: false })
+        return false
+      }
+      clearTourPreview()
+      invalidate()
+      const ok = motion.beginTour(plan)
+      emit('tour', { active: ok, planning: false })
+      if (ok) console.info('[tour] plan', plan.summary)
+      return ok
     },
-    stopTour: motion.stopTour,
+    // planned-route preview line (Tour panel). Returns the plan summary.
+    previewTour(opts = {}) {
+      return doTourPreview(opts)
+    },
+    clearTourPreview() {
+      clearTourPreview()
+    },
+    stopTour() {
+      invalidate() // render the settle-out after the tour hands back
+      motion.stopTour()
+    },
     selectPoi,
     deselect,
     triggerScan,
     // generic marker sets (pure display layer — see markers.js). Same id
     // with `points` replaces the set; without `points` patches color/visible.
     setMarkerSet(id, def) {
-      markers.setSet(id, def)
-      markers.update(params, heightField) // builds now if the world exists
+      setLayerSet('markers', id, def)
     },
     removeMarkerSet(id) {
-      return markers.removeSet(id)
+      invalidate()
+      const removed = pointLayer.removeSet(id)
+      emit('layers')
+      return removed
     },
     listMarkerSets() {
-      return markers.listSets()
+      return pointLayer.listSets()
+    },
+    // generic version of setMarkerSet for any point-kind layer registered
+    // under the LayerManager (e.g. 'stations' — one set per transit system).
+    // The Layers panel's per-set toggle rows call this with the owning
+    // layer's id so they route to the right marker-set collection.
+    setLayerSet,
+    // dynamic layer registry (Layers panel). listLayers() → describe() array;
+    // setLayerVisible/setLayerStyle route param-backed layers through setParams
+    // (so HANDLERS + invalidate + panel refresh all fire on the one path).
+    listLayers() {
+      return layers.describe()
+    },
+    setLayerVisible(id, v) {
+      const layer = layers.get(id)
+      if (!layer) return
+      if (layer.visibleParam) setParams({ [layer.visibleParam]: v })
+      else {
+        layer.setVisible?.(v)
+        emit('layers')
+        invalidate()
+      }
+    },
+    setLayerStyle(id, patch) {
+      const layer = layers.get(id)
+      if (!layer) return
+      if (layer.paramMap) {
+        const mapped = {}
+        for (const k in patch) if (layer.paramMap[k]) mapped[layer.paramMap[k]] = patch[k]
+        setParams(mapped)
+      } else {
+        layer.setStyle?.(patch)
+        emit('layers')
+        invalidate()
+      }
     },
     dispose() {
       disposed = true
       cancelAnimationFrame(rafId)
       window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('resize', onResize)
       keyPan.dispose()
       controls.dispose()
       stage.renderer.dispose()
@@ -862,35 +1520,28 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       regenerateTerrain,
       triggerScan,
       get labels() {
-        return labels
+        return labelsLayer.renderGroup
       },
+      layers,
       get heightField() {
         return heightField
       },
       get fps() {
         return fps
       },
+      // on-demand render verify hooks: renderCount stops climbing once idle,
+      // resumes the instant an invalidate lands
+      get renderCount() {
+        return renderCount
+      },
+      get idle() {
+        return idle
+      },
+      invalidate,
       stats,
     },
   }
   engine.debug.engine = engine
-
-  // demo marker set proving the API end-to-end (the 8 preset coordinates,
-  // default hidden — the debug GUI toggles it). 玉山/雪山 carry baked summit
-  // elevations; the rest exercise the heightAtWorld sampling fallback.
-  markers.setSet('demo_locations', {
-    visible: false,
-    points: [
-      { name: '玉山', lat: 23.47, lon: 120.9575, elev: 3952 },
-      { name: '雪山', lat: 24.3836, lon: 121.2317, elev: 3886 },
-      { name: '大霸尖山', lat: 24.4607, lon: 121.2578 },
-      { name: '南湖大山', lat: 24.362, lon: 121.4383 },
-      { name: '合歡山', lat: 24.1436, lon: 121.2716 },
-      { name: '太魯閣', lat: 24.1735, lon: 121.4906 },
-      { name: '嘉明湖', lat: 23.2907, lon: 121.0325 },
-      { name: '七星山', lat: 25.17, lon: 121.556 },
-    ],
-  })
 
   // real world is the default source — fetch its tiles on startup (not
   // awaited: the engine renders + streams while tiles arrive, exactly like
