@@ -14,6 +14,7 @@
 
 ## 功能
 
+- [ ] **河川圖層覆蓋率不符直覺認知**（2026-07-09）：目前河線只保留縫合後總長 ≥10km 的水系（死支流 ≥2km 才留）、河面只取河寬 ≥20m／面積 ≥1.5萬 m² 的中下游段——與一般認知的「河川範圍」有落差，覆蓋不夠完整。改善方向：(a) 放寬篩選門檻或分 LOD 載入（拉近視角才 fetch 完整網絡，檔案拆 z 級）；(b) 改用水利署官方河川中心線圖資（含河名，可做標註與點選資訊卡）；(c) 河面吃 `water_river_polygons` 更全量（含高灘地/乾涸河床範圍）；(d) 台北都會區來源拓樸破碎（堤防化渠道），考慮該區另源或手工處理。相關參數在 `scripts/bake_layer_elevations.py` 的 rivers / river_surfaces 段
 - [ ] marker sets 接真實資料集（溫泉 / 水庫 / 步道口等，taipei-gis-analytics 有現成 GeoJSON）——API 已就緒：`engine.setMarkerSet(id, {points, color, visible})`
 - [ ] 災害 polygon drape（土石流潛勢 / 淹水潛勢）、即時雨量染色地形（接 data-collectors 資料源）——中長期
 - [ ] Mobile / 窄螢幕版（pulse 有 MobileBottomSheet 模式可抄）
