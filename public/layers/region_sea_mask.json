@@ -1,0 +1,14 @@
+{
+  "bbox": {
+    "minLon": 119.90691,
+    "maxLon": 122.1275,
+    "minLat": 21.7756,
+    "maxLat": 25.4203
+  },
+  "size": {
+    "w": 1024,
+    "h": 1835
+  },
+  "png": "/layers/region_sea_mask.png",
+  "note": "row 0 = north, col 0 = west; L: sea=255 land=0 (main island only)"
+}

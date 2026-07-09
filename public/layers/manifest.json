@@ -41,6 +41,14 @@
       "rowLabel": "水庫 Reservoirs",
       "url": "/layers/reservoirs.json",
       "visible": false
+    },
+    {
+      "id": "region",
+      "kind": "area",
+      "label": "Region",
+      "rowLabel": "周邊 Region",
+      "url": "/layers/region_coast.json",
+      "visible": false
     }
   ]
 }
