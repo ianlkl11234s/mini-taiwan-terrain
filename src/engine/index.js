@@ -113,15 +113,20 @@ export const DEFAULT_PARAMS = {
   railVisible: false,
   railWidth: 2,
   railOpacity: 0.9,
-  // rivers: manifest-driven deferred draped layer (public/layers/rivers.json),
-  // one shared water-blue swatch. riversSurfaceOpacity drives the companion
-  // river-surface sheet (public/layers/river_surfaces.json) under the same
-  // toggle — 0 = sheet off, lines only.
+  // rivers: the river layer's BODY is a physics-derived flow-accumulation tint
+  // painted into the terrain shader (terrain.js uRiverTex, whole-island bake
+  // public/layers/river_sim.png — the retired vector centerlines are gone). ONE
+  // toggle (riversVisible) brings up the sim tint + the companion water-surface
+  // sheet (public/layers/river_surfaces.json, riversSurfaceOpacity) + the
+  // river-name sprites (public/layers/rivers.json → labels, riverNames).
+  // riversColor feeds BOTH the sim tint (uRiverSimColor) and the surfaces.
   riversVisible: false,
-  riversWidth: 1.4,
-  riversOpacity: 0.85,
   riversColor: '#3d86c6',
   riversSurfaceOpacity: 0.5,
+  riverNames: true, // river-name labels (0/1 toggle in the Layers panel)
+  // 河川濃度: density of the physics river tint (uRiverSimOpacity). The whole-
+  // island bake PNG is fetched once, on the first switch-on (see loadRiverSim).
+  riverSimOpacity: 0.75,
   // reservoirs: deferred water-surface area layer (public/layers/reservoirs.json
   // + live Supabase storage ratios). ratio is a percent slider — default 100
   // shows each basin at its live level; touching it overrides all basins.
@@ -211,6 +216,11 @@ const REBUILD_KEYS = new Set([
 // rebuild only when a DEM world is active (detailBias needs none: scene.tickView
 // re-targets the LOD next frame and the chunk rings re-stream incrementally)
 const REAL_REBUILD_KEYS = new Set(['demExaggeration', 'chunkRes', 'outerChunkRes'])
+
+// P2: minDistance now lets the camera dolly right up to a hillside (see
+// scene.js) — clear the ground by this many world units so it never digs
+// into the mesh at the closest zoom
+const CAMERA_GROUND_MARGIN = 0.06
 
 // Data-layer manifest (public/layers/manifest.json): one small fetch at
 // startup describing every deferred GIS overlay (id/url/default style) — NOT
@@ -686,13 +696,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
   }
 
-  // rivers: same deferred pattern as rail (draped polylines, per-vertex baked
-  // elevation) PLUS the companion triangulated water-surface sheet. Both JSON
-  // are fetched in PARALLEL on the first switch-on; the line data drives the
-  // main flow while the surface fetch is best-effort (a 404/network miss just
-  // leaves the lines, resolving to null instead of rejecting the pair). The
-  // layer only builds its meshes once setData/setSurfaceData have run, avoiding
-  // the empty-geometry-then-fill trap.
+  // rivers: rivers.json now carries only the river-NAME labels (the vector
+  // centerlines are retired — the river body is the sim tint, loadRiverSim).
+  // rivers.json (labels) + river_surfaces.json (the triangulated water-surface
+  // sheet) are fetched in PARALLEL on the first switch-on; the surface fetch is
+  // best-effort (a 404/network miss just leaves the labels, resolving to null
+  // instead of rejecting the pair). The layer only builds its surface mesh once
+  // setSurfaceData has run, avoiding the empty-geometry-then-fill trap.
   let riversFetch = { loading: false, loaded: false }
   async function loadRiversData() {
     if (riversFetch.loading || riversFetch.loaded) return
@@ -712,7 +722,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       ])
       if (!linesRes.ok) throw new Error(`rivers.json ${linesRes.status}`)
       const linesData = await linesRes.json()
-      layers.get('rivers').setData(linesData.lines.map((l) => l.points))
+      layers.get('rivers').setLabels(linesData.labels || [])
       if (surfData) layers.get('rivers').setSurfaceData(surfData.polygons)
       riversFetch.loaded = true
       layers.get('rivers').update(layerCtx())
@@ -723,6 +733,67 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       invalidate()
       emit('layers')
     }
+  }
+
+  // river SIM: the whole-island physics-derived river body, painted straight
+  // into the terrain shader from a flow-accumulation bake. The PNG (grayscale
+  // intensity) + JSON meta (geographic bounds) are fetched once, on the first
+  // rivers switch-on. Race guard: uRiverTex/uRiverBounds are only wired up AFTER
+  // the texture has finished decoding, and the opacity uniform stays 0 until
+  // then — so a half-loaded texture is never sampled.
+  let riverSimTex = null
+  let riverSimMeta = null
+  const riverSimFetch = { loading: false, loaded: false }
+  function applyRiverSimBounds() {
+    if (!riverSimTex || !riverSimMeta || !heightField) return
+    const b = riverSimMeta.bbox
+    const nw = heightField.projection.lonLatToWorld(b.minLon, b.maxLat) // west / north
+    const se = heightField.projection.lonLatToWorld(b.maxLon, b.minLat) // east / south
+    terrain.mapUniforms.uRiverBounds.value.set(nw.x, nw.z, se.x, se.z)
+    terrain.mapUniforms.uRiverTex.value = riverSimTex
+  }
+  async function loadRiverSim() {
+    if (riverSimFetch.loading || riverSimFetch.loaded) return
+    riverSimFetch.loading = true
+    try {
+      const metaRes = await fetch(await manifestUrl('river_sim', '/layers/river_sim.json'))
+      if (!metaRes.ok) throw new Error(`river_sim.json ${metaRes.status}`)
+      riverSimMeta = await metaRes.json()
+      const pngUrl = riverSimMeta.png ?? '/layers/river_sim.png'
+      const tex = await new Promise((resolve, reject) =>
+        new THREE.TextureLoader().load(pngUrl, resolve, undefined, reject)
+      )
+      // intensity data, not color: no sRGB decode, linear filter, no mipmaps.
+      // flipY false so image row 0 (north) reads at UV v=0, matching the bake's
+      // row-0-is-north convention (see the shader's UV math).
+      tex.flipY = false
+      tex.colorSpace = THREE.NoColorSpace
+      tex.minFilter = THREE.LinearFilter
+      tex.magFilter = THREE.LinearFilter
+      tex.generateMipmaps = false
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping
+      tex.needsUpdate = true
+      riverSimTex = tex
+      riverSimFetch.loaded = true
+    } catch (err) {
+      console.warn('[layers] river sim fetch failed', err)
+    } finally {
+      riverSimFetch.loading = false
+      applyRiverSim() // now that the texture (or its failure) has landed
+    }
+  }
+  // Set the shader uniforms from the rivers toggle / 河川濃度. Kicks the deferred
+  // fetch on the first rivers switch-on; keeps the opacity uniform at 0 (branch
+  // skipped in the shader) until the texture is bound — so the layer is truly
+  // zero-cost while off.
+  function applyRiverSim() {
+    const on = !!params.riversVisible
+    if (on && !riverSimFetch.loaded && !riverSimFetch.loading) loadRiverSim()
+    const active = on && riverSimFetch.loaded
+    if (active) applyRiverSimBounds()
+    terrain.mapUniforms.uRiverSimColor.value.set(params.riversColor)
+    terrain.mapUniforms.uRiverSimOpacity.value = active ? params.riverSimOpacity : 0
+    invalidate()
   }
 
   // reservoirs: fetch the baked basin polygons + dam markers, then the LIVE
@@ -966,15 +1037,25 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     },
     railWidth: () => layers.get('rail').update(layerCtx()),
     railOpacity: () => layers.get('rail').update(layerCtx()),
-    // rivers: first switch-on triggers the deferred fetch (same as rail)
+    // rivers: ONE toggle brings up the whole layer — the river-name labels +
+    // water-surface sheet (deferred fetch) and the physics river-body tint
+    // (deferred PNG fetch, via applyRiverSim). Same fail-quiet deferred pattern
+    // as rail; the sim uniform stays 0 until its texture lands (zero-cost off).
     riversVisible: (v) => {
       if (v) loadRiversData()
       layers.get('rivers').update(layerCtx())
+      applyRiverSim()
     },
-    riversWidth: () => layers.get('rivers').update(layerCtx()),
-    riversOpacity: () => layers.get('rivers').update(layerCtx()),
-    riversColor: () => layers.get('rivers').update(layerCtx()),
+    // 顏色 feeds BOTH the sim tint (uRiverSimColor) and the surface sheet
+    riversColor: () => {
+      layers.get('rivers').update(layerCtx())
+      applyRiverSim()
+    },
     riversSurfaceOpacity: () => layers.get('rivers').update(layerCtx()),
+    riverNames: () => layers.get('rivers').update(layerCtx()),
+    // 河川濃度: the physics river-body tint density (uRiverSimOpacity). Re-runs
+    // applyRiverSim, which no-ops the uniform until the texture has landed.
+    riverSimOpacity: () => applyRiverSim(),
     // reservoirs: first switch-on fetches basins + live storage ratios; the
     // ratio slider drives a global manual override across every water surface
     reservoirsVisible: (v) => {
@@ -1181,6 +1262,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       keyPan.tick(dt) // arrow/WASD velocity, applied before damping + clamp
       controls.update()
       stage.clampPan() // free navigation only — tours / fly-tos manage their own path
+      // anti-penetration: floor the camera to the ground sample right below it
+      // + a small margin, so dollying/panning close to a slope can't dig into
+      // the mesh. Cheap XZ-only check (no ray march) — good enough since the
+      // camera moves continuously and this runs every frame.
+      if (terrain.sample) {
+        const minY = terrain.sample(camera.position.x, camera.position.z) + CAMERA_GROUND_MARGIN
+        if (camera.position.y < minY) camera.position.y = minY
+      }
     } else {
       keyPan.reset() // no residual glide fighting an active tour/fly-to
     }
@@ -1453,23 +1542,6 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     },
   }
   engine.debug.engine = engine
-
-  // demo marker set proving the API end-to-end (the 8 preset coordinates,
-  // default hidden — the debug GUI toggles it). 玉山/雪山 carry baked summit
-  // elevations; the rest exercise the heightAtWorld sampling fallback.
-  pointLayer.setSet('demo_locations', {
-    visible: false,
-    points: [
-      { name: '玉山', lat: 23.47, lon: 120.9575, elev: 3952 },
-      { name: '雪山', lat: 24.3836, lon: 121.2317, elev: 3886 },
-      { name: '大霸尖山', lat: 24.4607, lon: 121.2578 },
-      { name: '南湖大山', lat: 24.362, lon: 121.4383 },
-      { name: '合歡山', lat: 24.1436, lon: 121.2716 },
-      { name: '太魯閣', lat: 24.1735, lon: 121.4906 },
-      { name: '嘉明湖', lat: 23.2907, lon: 121.0325 },
-      { name: '七星山', lat: 25.17, lon: 121.556 },
-    ],
-  })
 
   // real world is the default source — fetch its tiles on startup (not
   // awaited: the engine renders + streams while tiles arrive, exactly like

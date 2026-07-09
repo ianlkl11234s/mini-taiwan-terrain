@@ -38,6 +38,9 @@ import BORDERS from './data/counties_internal_borders.json'
 
 function createPolylineLayer(config, params) {
   const { id, label, rowLabel, mode, liftBase, paramMap, styleSchema } = config
+  // widthScale: a fixed multiplier on the width param so several sub-layers can
+  // share ONE width slider at different thicknesses (rivers major/mid/minor).
+  const widthScale = config.widthScale ?? 1
   const flat = mode === 'flat'
   // draped layers may start empty and be fed data later (see setData) — the
   // deferred manifest-driven layers (rail) register before their JSON has
@@ -49,7 +52,7 @@ function createPolylineLayer(config, params) {
 
   const material = new LineMaterial({
     color: new THREE.Color(paramMap.color ? params[paramMap.color] : 0xffffff),
-    linewidth: params[paramMap.width], // px
+    linewidth: params[paramMap.width] * widthScale, // px
     transparent: true,
     opacity: params[paramMap.opacity],
     fog: true, // sinks into the white fog wall like the terrain does
@@ -163,7 +166,7 @@ function createPolylineLayer(config, params) {
 
   function applyStyle() {
     if (paramMap.color) material.color.set(params[paramMap.color]) // else: fixed white, vertexColors carries the real color
-    material.linewidth = params[paramMap.width]
+    material.linewidth = params[paramMap.width] * widthScale
     material.opacity = params[paramMap.opacity]
   }
 
@@ -488,31 +491,178 @@ function createRiverSurface(params) {
   }
 }
 
-// Rivers: manifest-driven deferred layer (see index.js) — registers empty and is
-// fed data via setData()/setSurfaceData() the first time it is switched on. ONE
-// toggle drives both the draped river LINE (public/layers/rivers.json, a shared
-// user-tintable water-blue swatch) and the translucent river SURFACE sheet
-// (public/layers/river_surfaces.json). The two live in one group so a single
-// visibility gate and the shared color swatch cover both; the surface adds its
-// own "Surface opacity" slider (0 = surface off, lines only).
-export function createRiversLayer(params) {
-  const base = createPolylineLayer(
-    {
-      id: 'rivers',
-      label: 'Rivers',
-      rowLabel: '河川 Rivers',
-      mode: 'draped',
-      polylines: [],
-      liftBase: 0.05,
-      paramMap: { visible: 'riversVisible', color: 'riversColor', width: 'riversWidth', opacity: 'riversOpacity' },
-      styleSchema: POLYLINE_STYLE(6),
-    },
-    params
-  )
-  const surface = createRiverSurface(params)
+// River-name labels: canvas-text sprites (deep-blue ink on a paper chip) draped
+// on the river network. Same crowd-control language as the station markers —
+// only the MAX_RIVER_LABELS nearest-to-camera names show, each with a
+// view-distance fade — so the name field never crowds at island scale. Gated by
+// BOTH the rivers toggle and the dedicated "河名 Names" toggle (riverNames).
+// Sprites are built lazily (only the names that actually surface pay for a
+// canvas), like markers.js, and are sizeAttenuation:false → constant screen size.
+const MAX_RIVER_LABELS = 10
+const RIVER_LABEL_PX = 22 // tag height in screen pixels
+const RIVER_LABEL_INK = '#0f4c81'
+const RIVER_LABEL_PAPER = 'rgba(247, 251, 254, 0.94)'
+const RIVER_LABEL_BORDER = 'rgba(20, 66, 112, 0.35)'
+const RIVER_LABEL_LIFT = 0.16 // world units above the baked river elevation
+// view-distance fade in ABSOLUTE world units (not fogScale-scaled): names are
+// full-opacity up close and gone by the time the camera dollies out to island
+// scale, so the field self-clears on zoom-out. Ranking is by proximity to the
+// pan target (the look-at point), NOT the camera — at a tilted view the camera
+// is nearest the foreground, so camera-ranking would surface labels behind the
+// look direction instead of the ones the user is looking at.
+const RIVER_LABEL_FADE_START = 46 // <= this camera distance → fully opaque
+const RIVER_LABEL_FADE_END = 88 // >= this → hidden
+
+function riverTagTexture(name) {
+  const S = 3 // supersample for crisp CJK text
+  const h = RIVER_LABEL_PX * S
+  const padX = 7 * S
+  const font = `600 ${12.5 * S}px "PingFang TC", "Heiti TC", ui-sans-serif, sans-serif`
+  const probe = document.createElement('canvas').getContext('2d')
+  probe.font = font
+  const w = Math.ceil(probe.measureText(name).width + padX * 2)
+  const c = document.createElement('canvas')
+  c.width = w
+  c.height = h
+  const ctx = c.getContext('2d')
+  ctx.fillStyle = RIVER_LABEL_PAPER
+  ctx.fillRect(0, 0, w, h)
+  ctx.strokeStyle = RIVER_LABEL_BORDER
+  ctx.lineWidth = S
+  ctx.strokeRect(S / 2, S / 2, w - S, h - S)
+  ctx.font = font
+  ctx.fillStyle = RIVER_LABEL_INK
+  ctx.textBaseline = 'middle'
+  ctx.fillText(name, padX, h / 2 + S * 0.5)
+  const tex = new THREE.CanvasTexture(c)
+  tex.anisotropy = 4
+  tex.colorSpace = THREE.SRGBColorSpace
+  return { tex, aspect: w / h }
+}
+
+function createRiverLabels(params) {
   const group = new THREE.Group()
-  group.add(base.object3d)
+  group.visible = false
+  let defs = [] // {name, type, lon, lat, elev, _x?, _z?}
+  let sprites = [] // parallel to defs, lazily materialized
+  let hf = null
+  let labelAcc = 0
+  const _p = new THREE.Vector3()
+
+  const gate = () => params.source === 'real' && !!hf && params.riversVisible && !!params.riverNames
+  const labelY = (d) => metersToWorldY(hf, d.elev, params.demExaggeration) + RIVER_LABEL_LIFT
+
+  function project() {
+    if (!hf) return
+    for (const d of defs) {
+      if (d._x === undefined) {
+        const w = hf.projection.lonLatToWorld(d.lon, d.lat)
+        d._x = w.x
+        d._z = w.z
+      }
+    }
+  }
+
+  function ensureSprite(i) {
+    let s = sprites[i]
+    if (s) return s
+    const d = defs[i]
+    const { tex, aspect } = riverTagTexture(d.name)
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, opacity: 1, depthTest: false, sizeAttenuation: false, fog: false })
+    s = new THREE.Sprite(mat)
+    s.renderOrder = 6 // above the marker tags (5)
+    s.userData.aspect = aspect
+    s.visible = false
+    if (d._x !== undefined) s.position.set(d._x, labelY(d), d._z)
+    group.add(s)
+    sprites[i] = s
+    return s
+  }
+
+  return {
+    object3d: group,
+
+    // race trap: reset sprites when fresh labels land; positions/canvases are
+    // (re)materialized lazily once the world exists (see project/ensureSprite).
+    setData(newDefs) {
+      for (const s of sprites) {
+        if (!s) continue
+        s.material.map.dispose()
+        s.material.dispose()
+        group.remove(s)
+      }
+      defs = (newDefs || []).map((d) => ({ ...d }))
+      sprites = new Array(defs.length).fill(null)
+    },
+    setHeightField(field) {
+      hf = field
+    },
+    update() {
+      if (hf) project()
+      group.visible = gate()
+    },
+    // per-frame crowd control: rank by camera distance, reveal the nearest
+    // MAX_RIVER_LABELS, fade each by distance to the (scaled) fog wall. Throttled
+    // like markers.js so ranking/canvas work isn't every frame.
+    tickView(ctx) {
+      if (!gate()) {
+        group.visible = false
+        return
+      }
+      group.visible = true
+      labelAcc += ctx.dt
+      if (labelAcc < 0.2) return
+      labelAcc = 0
+      project()
+      const camera = ctx.camera
+      const k = (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * RIVER_LABEL_PX) / window.innerHeight
+      const cx = ctx.labelCenter ? ctx.labelCenter.x : camera.position.x
+      const cz = ctx.labelCenter ? ctx.labelCenter.z : camera.position.z
+      const span = RIVER_LABEL_FADE_END - RIVER_LABEL_FADE_START
+      // rank by horizontal proximity to the look-at point → the names nearest
+      // the centre of the view win the MAX_RIVER_LABELS slots
+      const order = defs
+        .map((d, i) => ({ i, d2: (d._x - cx) * (d._x - cx) + (d._z - cz) * (d._z - cz) }))
+        .sort((a, b) => a.d2 - b.d2)
+      order.forEach(({ i }, rank) => {
+        const d = defs[i]
+        const camDist = _p.set(d._x, labelY(d), d._z).distanceTo(camera.position)
+        const fade = Math.max(0, Math.min(1, (RIVER_LABEL_FADE_END - camDist) / span))
+        if (rank < MAX_RIVER_LABELS && fade > 0.02) {
+          const s = ensureSprite(i)
+          s.position.set(d._x, labelY(d), d._z) // tracks the vertical datum/scale
+          s.material.opacity = fade
+          s.scale.set(k * s.userData.aspect, k, 1)
+          s.visible = true
+        } else if (sprites[i]) {
+          sprites[i].visible = false
+        }
+      })
+    },
+    dispose() {
+      for (const s of sprites) {
+        if (!s) continue
+        s.material.map.dispose()
+        s.material.dispose()
+      }
+    },
+  }
+}
+
+// Rivers: the river layer's BODY is the physics-derived flow-accumulation tint
+// painted straight into the terrain shader (terrain.js uRiverTex, wired in
+// index.js) — the old vector centerlines are retired. ONE toggle (riversVisible)
+// brings the whole group up together: the sim tint (河川濃度 → uRiverSimOpacity),
+// the translucent river SURFACE sheet (public/layers/river_surfaces.json) and
+// the river-NAME sprites (public/layers/rivers.json → labels). All share the
+// water-blue swatch + one visibility gate. The sim itself lives shader-side (see
+// index.js applyRiverSim), so this layer object owns only the surface + labels.
+export function createRiversLayer(params) {
+  const surface = createRiverSurface(params)
+  const labels = createRiverLabels(params)
+  const group = new THREE.Group()
   group.add(surface.object3d)
+  group.add(labels.object3d)
 
   return {
     id: 'rivers',
@@ -521,38 +671,58 @@ export function createRiversLayer(params) {
     rowLabel: '河川 Rivers',
     object3d: group,
     visibleParam: 'riversVisible',
-    paramMap: { ...base.paramMap, surfaceOpacity: 'riversSurfaceOpacity' },
-
-    build(ctx) {
-      base.build(ctx)
+    paramMap: {
+      visible: 'riversVisible',
+      color: 'riversColor', // feeds BOTH the sim tint (uRiverSimColor) and the surfaces
+      surfaceOpacity: 'riversSurfaceOpacity',
+      names: 'riverNames',
+      // physics-derived river tint (terrain.js uRiverTex, wired in index.js) —
+      // the layer's main visual; 河川濃度 drives uRiverSimOpacity.
+      simOpacity: 'riverSimOpacity',
     },
 
+    build() {},
+
     update(ctx) {
-      base.update(ctx)
       surface.setHeightField(ctx.heightField)
       surface.update()
+      labels.setHeightField(ctx.heightField)
+      labels.update()
     },
 
     tickView(ctx) {
-      base.tickView(ctx)
       surface.tickView(ctx.fogScale)
+      labels.tickView(ctx)
     },
 
-    // deferred data: river lines (draped polylines) and river surfaces
-    // (triangulated sheet) land separately from their two parallel fetches.
-    setData(polylines) {
-      base.setData(polylines)
-    },
+    // deferred data: the surface sheet + name labels each land from their own
+    // fetch (see index.js loadRiversData). The river BODY is the sim texture,
+    // fetched + wired separately (loadRiverSim).
     setSurfaceData(surfacePolys) {
       surface.setData(surfacePolys)
     },
+    setLabels(labelDefs) {
+      labels.setData(labelDefs)
+    },
 
     describe() {
-      const d = base.describe()
       return {
-        ...d,
+        id: 'rivers',
+        kind: 'line',
+        label: 'Rivers',
+        rowLabel: '河川 Rivers',
+        count: 0,
+        visible: params.riversVisible,
         styleSchema: {
-          ...d.styleSchema,
+          // 河川濃度 — the physics river tint density (uRiverSimOpacity)
+          simOpacity: {
+            type: 'slider',
+            label: '河川濃度 Intensity',
+            min: 0,
+            max: 1,
+            step: 0.02,
+            format: (v) => v.toFixed(2),
+          },
           surfaceOpacity: {
             type: 'slider',
             label: '水面透明度 Surface opacity',
@@ -561,14 +731,30 @@ export function createRiversLayer(params) {
             step: 0.02,
             format: (v) => v.toFixed(2),
           },
+          color: { type: 'color', label: '顏色 Color' },
+          // rendered as a 0/1 slider — the Layers panel has no toggle control for
+          // styleSchema entries (只有 color 與 slider)，用 0/1 當開關並顯示 開/關
+          names: {
+            type: 'slider',
+            label: '河名 Names',
+            min: 0,
+            max: 1,
+            step: 1,
+            format: (v) => (v > 0.5 ? '開 ON' : '關 OFF'),
+          },
         },
-        style: { ...d.style, surfaceOpacity: params.riversSurfaceOpacity },
+        style: {
+          simOpacity: params.riverSimOpacity,
+          surfaceOpacity: params.riversSurfaceOpacity,
+          color: params.riversColor,
+          names: params.riverNames ? 1 : 0,
+        },
       }
     },
 
     dispose() {
-      base.dispose()
       surface.dispose()
+      labels.dispose()
     },
   }
 }

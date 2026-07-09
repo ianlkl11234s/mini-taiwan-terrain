@@ -62,8 +62,11 @@ export function createStage(params, container) {
   scene.fog = new THREE.Fog(new THREE.Color(params.fogColor), params.fogNear, params.fogFar)
 
   // far plane covers the whole-island view (P2): max dolly 1000 + a scaled fog
-  // wall; near stays 0.5 (ratio 6000 — comfortably inside 24-bit depth)
-  const camera = new THREE.PerspectiveCamera(params.fov, window.innerWidth / window.innerHeight, 0.5, 3000)
+  // wall; near drops to 0.02 (was 0.5) so a hillside close-up (minDistance
+  // 0.25, see below) doesn't clip into the terrain — ratio 150000, still
+  // comfortably inside 24-bit depth since fog + streaming radius keep
+  // anything near the 3000 far plane from ever rendering opaque
+  const camera = new THREE.PerspectiveCamera(params.fov, window.innerWidth / window.innerHeight, 0.02, 3000)
   camera.position.set(0, 18, 19)
 
   // MapControls: left drag = pan across the terrain, right drag = rotate,
@@ -75,7 +78,10 @@ export function createStage(params, container) {
   controls.enableDamping = true
   controls.dampingFactor = 0.06
   controls.maxPolarAngle = Math.PI * 0.49
-  controls.minDistance = 2
+  // 0.25 (was 2) — close enough to hug a hillside; index.js's tick() clamps
+  // camera height to the ground sample so dollying this close never digs
+  // into the terrain
+  controls.minDistance = 0.25
   controls.maxDistance = 1000
   controls.update()
 

@@ -24,8 +24,15 @@
       "rowLabel": "河川 Rivers",
       "url": "/layers/rivers.json",
       "surfaceUrl": "/layers/river_surfaces.json",
-      "visible": false,
-      "style": { "width": 1.4, "opacity": 0.85 }
+      "visible": false
+    },
+    {
+      "id": "river_sim",
+      "kind": "raster",
+      "label": "River Sim",
+      "url": "/layers/river_sim.json",
+      "png": "/layers/river_sim.png",
+      "visible": false
     },
     {
       "id": "reservoirs",

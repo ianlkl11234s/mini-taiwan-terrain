@@ -38,17 +38,18 @@ THSR_NAMES_SRC = GIS_ROOT / "taipei-gis-analytics/output/report/0123_ichef_used/
 
 # --- hydrology sources (mini-taiwan-pulse, all WGS84) --------------------------
 RIVERS_SRC = GIS_ROOT / "mini-taiwan-pulse/public/geo/water_rivers.geojson"
+# WRA river-channel polygons — the ONLY source of river_name / river_type; used
+# purely as a spatial-join lookup to tag the (attribute-less) centerline chains.
+RIVER_NAMES_SRC = GIS_ROOT / "taipei-gis-analytics/data/processed/water_resources/river_infrastructure_wra/river_polygons_wra.geojson"
 RIVER_SURFACES_SRC = GIS_ROOT / "mini-taiwan-pulse/public/geo/water_river_polygons.geojson"
 RESERVOIRS_SRC = GIS_ROOT / "mini-taiwan-pulse/public/geo/water_reservoirs.geojson"
 DAMS_SRC = GIS_ROOT / "mini-taiwan-pulse/public/geo/water_dams.geojson"
 
-# Rivers: the source has NO usable attributes (river_name/river_type all empty)
+# Rivers: the centerline source (water_rivers.geojson) has NO usable attributes
 # and every one of its 2015 "features" is a whole stream network already
 # dissolved into thousands of short, disconnected parts (68,696 parts / 513k
-# vertices total, median part = 4 points) — rendering them directly (or
-# filtering short parts individually, as this script used to) draws a dashed
-# scribble instead of a river. The fix is stitch-then-filter, done GLOBALLY
-# across all 2015 features (some rivers are split across feature boundaries):
+# vertices total, median part = 4 points) — rendering them directly draws a
+# dashed scribble instead of a river. Pipeline:
 #   1. endpoint snap  — round every part endpoint to RIVER_SNAP_PREC_DEG
 #      (~11 m) and merge parts end-to-end through degree-2 nodes into maximal
 #      chains; degree>=3 nodes are real confluences and stay as chain breaks
@@ -57,18 +58,55 @@ DAMS_SRC = GIS_ROOT / "mini-taiwan-pulse/public/geo/water_dams.geojson"
 #   2. T-junction snap — many tributary mouths don't land on a mainstem
 #      *vertex* (so step 1 can't see them); for each chain endpoint still
 #      dangling after step 1, snap it onto the nearest vertex of any OTHER
-#      chain within RIVER_TJUNCTION_TOL_M and record the connection. A chain
-#      "attached" (connected on both ends, natively or via this snap) is a
-#      trunk link and is always kept; the rest are dead-end stubs, dropped
-#      below RIVER_STUB_MIN_KM.
-#   3. component filter — group chains into connected river systems (union of
-#      steps 1+2) and drop whole systems below RIVER_MIN_LEN_KM.
-# Kept chains are Douglas-Peucker simplified before elevation is baked.
+#      chain within RIVER_TJUNCTION_TOL_M and record the connection.
+#   3. SPATIAL JOIN — the centerlines carry no names, so tag every chain by a
+#      point-in-polygon majority vote against the WRA river-channel polygons
+#      (river_polygons_wra.geojson: 13,262 MultiPolygons carrying river_name +
+#      river_type "1"=trunk … "5"=finest; river_type "" is a fishing harbour and
+#      is EXCLUDED). Each chain samples every RIVER_JOIN_SAMPLE_EVERY-th vertex,
+#      queries an STRtree with a small dwithin tolerance (centerline vs mapped
+#      channel are different sources, so allow a near-miss), and takes the most
+#      common (name, type). Chains that join nothing are type 6 (no-name creek).
+#   4. KEEP RULE + BUCKETS — a chain is kept if it joined a WRA reach (any
+#      type 1-5) OR it belongs to a connected river SYSTEM at least
+#      RIVER_SYSTEM_MIN_KM long (the coverage rule that keeps unnamed
+#      tributaries of the big basins; isolated stubs are dropped). Kept chains
+#      are DP-simplified (the thin minor bucket at a coarser tolerance) and
+#      split into three buckets by grade (major 1-2 / mid 3-4 / minor 5+6) for
+#      per-width rendering.
+#   5. LABELS — for every named river, pool its kept chains and drop 1-2 name
+#      anchors at percentile positions along the pooled cloud's principal axis
+#      (2 at 40%/70% when the river's total kept length exceeds
+#      RIVER_LONG_RIVER_KM, else 1 at the midpoint), gated by a
+#      RIVER_LABEL_MIN_KM floor so only rivers worth naming get a tag.
 RIVER_SNAP_PREC_DEG = 1e-4  # ~11 m endpoint-snap grid (step 1)
 RIVER_TJUNCTION_TOL_M = 20.0  # tributary-mouth-to-mainstem snap radius (step 2)
-RIVER_MIN_LEN_KM = 10.0  # drop connected river systems shorter than this (step 3)
-RIVER_STUB_MIN_KM = 2.0  # drop dead-end stub chains shorter than this (step 2 classification)
 RIVER_TOL_DEG = 0.0006  # ~60 m simplification tolerance
+RIVER_JOIN_SAMPLE_EVERY = 8  # sample every Nth chain vertex for the point-in-polygon join
+RIVER_JOIN_MAX_SAMPLES = 40  # ...capped per chain so long trunks don't dominate the query
+RIVER_JOIN_TOL_DEG = 0.00025  # ~28 m dwithin radius (centerline vs mapped channel offset)
+# The WRA channel polygons cover only officially-managed reaches — most of the
+# denser headwater network in the centerline source has no polygon (verified:
+# median distance from a >=3 km chain midpoint to the nearest WRA polygon is
+# ~1.7 km, so the ~25% join hit rate is a real coverage gap, NOT an offset/tol
+# bug — the matched chains sit right on the polygons). So coverage is a UNION of
+# two keep rules: (a) any chain that joined a WRA reach (named + graded), and
+# (b) any chain in a connected river SYSTEM at least RIVER_SYSTEM_MIN_KM long
+# (the old behaviour — keeps unnamed tributaries feeding the big basins). This
+# is a superset of the old output plus the newly-graded/named trunks.
+RIVER_JOIN_FALLBACK_TOL_DEG = 0.0012  # ~133 m — second, wider look for chains RIVER_JOIN_TOL_DEG missed entirely
+# Wide/braided reaches (a tidal estuary's channel meanders across a mapped
+# floodplain far broader than a normal single-channel offset) sit farther from
+# their WRA polygon than RIVER_JOIN_TOL_DEG allows, so a handful of genuinely
+# major rivers (verified: 淡水河, 烏溪) matched too little length to clear
+# RIVER_LABEL_MIN_KM and lost their name label entirely. Fixed with a SECOND
+# pass at this wider tolerance, run ONLY on chains that scored zero votes in
+# the first pass — an already-matched chain is never re-voted, so this can only
+# recover names on orphans, never override/corrupt an existing match.
+RIVER_SYSTEM_MIN_KM = 10.0  # keep chains whose connected system reaches this length
+RIVER_MINOR_TOL_DEG = 0.0009  # ~90 m: coarser simplification for the minor bucket (thin creeks)
+RIVER_LABEL_MIN_KM = 10.0  # only name rivers whose total kept length reaches this (~200 labels)
+RIVER_LONG_RIVER_KM = 30.0  # ...and give the long ones two anchors (40% / 70%) instead of one
 
 # Reservoirs: keep polygons that are either sizeable OR carry an id / dam match
 # (so every live-data reservoir survives regardless of area). Douglas-Peucker
@@ -464,6 +502,115 @@ def _tjunction_snap(chains, node_degree, tol_m, grid_deg=0.0003):
     return uf, attached, {"checked": checked, "snapped": snapped}
 
 
+def _river_anchor_points(segs, fracs):
+    """Label anchors for one named river. Its centerline is fragmented into many
+    disconnected chains (broken at every confluence), so "the longest chain" is
+    just a small piece — placing on it drops labels on random upstream stubs.
+    Instead pool EVERY vertex of all the river's chains, project onto the pooled
+    cloud's principal (down-valley) axis, and pick the actual on-river vertex at
+    each requested percentile — so anchors spread along the river's real extent
+    and always land on the line."""
+    pts = [p for s in segs for p in s]
+    if len(pts) < 2:
+        p = pts[0]
+        return [[p[0], p[1]] for _ in fracs]
+    to_m, (ux, uy), (cx, cy) = _main_axis(pts)
+    proj = sorted((((x := to_m(p))[0] - cx) * ux + (x[1] - cy) * uy, p) for p in pts)
+    n = len(proj)
+    return [[proj[min(n - 1, max(0, int(n * f)))][1][0], proj[min(n - 1, max(0, int(n * f)))][1][1]] for f in fracs]
+
+
+def _tag_chains_with_names(chains):
+    """Spatial-join every chain to the WRA river-channel polygons: sample a few
+    vertices per chain, point-in(near)-polygon them through an STRtree with a
+    small dwithin tolerance, and majority-vote the (name, type). Writes
+    c["name"] (str|None) and c["type"] (1..6; 6 = joined nothing) in place.
+    Returns join stats."""
+    import numpy as np
+    import shapely
+    from shapely import STRtree
+    from shapely.geometry import shape
+
+    data = json.loads(RIVER_NAMES_SRC.read_text())
+    geoms = []
+    metas = []  # parallel to geoms: (name|None, type_int)
+    skipped_empty = 0
+    for ft in data["features"]:
+        pr = ft["properties"]
+        rt = pr.get("river_type", "")
+        if rt == "":  # fishing harbour — never a river name
+            skipped_empty += 1
+            continue
+        try:
+            t = int(rt)
+        except (TypeError, ValueError):
+            continue
+        geoms.append(shape(ft["geometry"]))
+        metas.append((pr.get("river_name") or None, t))
+    data = None  # free the 168 MB payload before the query pass
+    tree = STRtree(geoms)
+
+    xs, ys, owners = [], [], []
+    for ci, c in enumerate(chains):
+        pts = c["points"]
+        n = len(pts)
+        idxs = list(range(0, n, RIVER_JOIN_SAMPLE_EVERY))
+        if idxs[-1] != n - 1:
+            idxs.append(n - 1)
+        if len(idxs) > RIVER_JOIN_MAX_SAMPLES:
+            sel = np.linspace(0, len(idxs) - 1, RIVER_JOIN_MAX_SAMPLES).round().astype(int)
+            idxs = [idxs[k] for k in sorted(set(int(s) for s in sel))]
+        for i in idxs:
+            xs.append(pts[i][0])
+            ys.append(pts[i][1])
+            owners.append(ci)
+
+    pts_geom = shapely.points(np.asarray(xs), np.asarray(ys))
+    owners = np.asarray(owners)
+
+    def _vote(sample_mask, tol):
+        q = tree.query(pts_geom[sample_mask], predicate="dwithin", distance=tol)
+        v = [defaultdict(int) for _ in chains]
+        owners_sub = owners[sample_mask]
+        for k in range(q.shape[1]):
+            v[int(owners_sub[q[0, k]])][metas[q[1, k]]] += 1
+        return v
+
+    votes = _vote(np.ones(len(xs), dtype=bool), RIVER_JOIN_TOL_DEG)
+
+    # fallback pass (see RIVER_JOIN_FALLBACK_TOL_DEG) — only chains still
+    # voteless after the tight pass get a second, wider look
+    orphan_chain = np.array([not v for v in votes])
+    fallback_matched = 0
+    if orphan_chain.any():
+        votes_fb = _vote(orphan_chain[owners], RIVER_JOIN_FALLBACK_TOL_DEG)
+        for ci in range(len(chains)):
+            if orphan_chain[ci] and votes_fb[ci]:
+                votes[ci] = votes_fb[ci]
+                fallback_matched += 1
+
+    matched = named = 0
+    for ci, c in enumerate(chains):
+        if votes[ci]:
+            name, t = max(votes[ci].items(), key=lambda kv: kv[1])[0]
+            c["name"] = name
+            c["type"] = t
+            matched += 1
+            if name is not None:
+                named += 1
+        else:
+            c["name"] = None
+            c["type"] = 6
+    return {
+        "polysUsed": len(geoms),
+        "polysSkippedEmpty": skipped_empty,
+        "samplePoints": len(xs),
+        "chainsMatched": matched,
+        "chainsNamed": named,
+        "fallbackMatched": fallback_matched,
+    }
+
+
 def bake_rivers(cache):
     data = json.loads(RIVERS_SRC.read_text())
     feats = data["features"]
@@ -483,59 +630,108 @@ def bake_rivers(cache):
 
     # step 1: endpoint-snap stitch into maximal chains
     chains, node_degree = _stitch_river_chains(parts_raw, RIVER_SNAP_PREC_DEG)
-    for c in chains:
-        c["len_km"] = _line_len_km(c["points"])
 
-    # step 2: T-junction snap (closes tributary-mouth-onto-mainstem gaps) +
-    # attached/trunk classification
-    uf, attached, tj_stats = _tjunction_snap(chains, node_degree, RIVER_TJUNCTION_TOL_M)
-    for idx, c in enumerate(chains):
+    # step 2: T-junction snap (closes tributary-mouth-onto-mainstem gaps)
+    uf, _attached, tj_stats = _tjunction_snap(chains, node_degree, RIVER_TJUNCTION_TOL_M)
+    for c in chains:
         c["len_km"] = _line_len_km(c["points"])  # endpoints may have moved
-        c["is_trunk"] = attached[idx][0] and attached[idx][1]
 
-    # step 3: group into connected river systems, drop short systems, then
-    # drop dead-end stub chains (non-trunk chains shorter than the stub floor)
+    # connected-system totals (union of stitch + T-junction links) — the
+    # coverage keep rule below drops isolated stubs but keeps tributaries that
+    # feed a real river system.
     comp_len = defaultdict(float)
-    comp_chains = defaultdict(list)
     for c in chains:
-        root = uf.find(c["start"])
-        comp_len[root] += c["len_km"]
-        comp_chains[root].append(c)
-    kept_roots = [r for r, l in comp_len.items() if l >= RIVER_MIN_LEN_KM]
+        comp_len[uf.find(c["start"])] += c["len_km"]
 
-    lines_out = []
-    simplified_vertex_total = 0
-    kept_chain_count = 0
-    for root in kept_roots:
-        for c in comp_chains[root]:
-            if not (c["is_trunk"] or c["len_km"] >= RIVER_STUB_MIN_KM):
-                continue
-            simp = dp_simplify(c["points"], RIVER_TOL_DEG)
-            if len(simp) < 2:
-                continue
-            kept_chain_count += 1
-            simplified_vertex_total += len(simp)
-            pts = [[round(lon, 5), round(lat, 5), cache.elevation(lon, lat)] for lon, lat in simp]
-            lines_out.append({"points": pts})
+    # step 3: spatial join — tag every chain with a river name + grade
+    join_stats = _tag_chains_with_names(chains)
 
+    # step 4: keep rule = matched-to-WRA OR in a large system. The vector river
+    # LINES are retired (the river body is now the physics flow-accumulation
+    # tint, scripts/bake_flow_accum.py → public/layers/river_sim.png), so this
+    # step no longer emits buckets or bakes per-vertex elevation — it only
+    # DP-simplifies the survivors to pool each named river's geometry for the
+    # label anchors (step 5). Elevation is sampled solely at the ~200 anchors.
+    kept_by_type = defaultdict(int)
+    kept_chains_named = defaultdict(list)  # name -> [simplified pts,...] for labels
+    kept_matched = kept_system = 0
+    kept_total = kept_vertices = 0
+    for c in chains:
+        is_matched = c["type"] != 6
+        in_system = comp_len[uf.find(c["start"])] >= RIVER_SYSTEM_MIN_KM
+        if not (is_matched or in_system):
+            continue
+        # thin unnamed creeks get a coarser tolerance; named trunks stay crisp
+        tol = RIVER_MINOR_TOL_DEG if c["type"] >= 5 else RIVER_TOL_DEG
+        simp = dp_simplify(c["points"], tol)
+        if len(simp) < 2:
+            continue
+        kept_total += 1
+        kept_vertices += len(simp)
+        kept_by_type[c["type"]] += 1
+        if is_matched:
+            kept_matched += 1
+        else:
+            kept_system += 1
+        if c["name"]:
+            kept_chains_named[c["name"]].append(simp)
+
+    # step 5: name labels — one anchor per named river (two for the long ones),
+    # placed by pooling ALL of that river's kept chains and picking on-line
+    # points along the pooled cloud's principal axis (see _river_anchor_points
+    # — the centerline is fragmented at every confluence, so any single chain
+    # is too short to anchor on).
+    labels = []
+    chain_type = {}
+    for c in chains:
+        if c["name"]:
+            chain_type.setdefault(c["name"], c["type"])
+    for name, segs in kept_chains_named.items():
+        total_km = sum(_line_len_km(s) for s in segs)
+        if total_km < RIVER_LABEL_MIN_KM:
+            continue
+        fracs = [0.4, 0.7] if total_km >= RIVER_LONG_RIVER_KM else [0.5]
+        for lon, lat in _river_anchor_points(segs, fracs):
+            labels.append(
+                {
+                    "name": name,
+                    "type": chain_type.get(name, 5),
+                    "lon": round(lon, 5),
+                    "lat": round(lat, 5),
+                    "elev": cache.elevation(lon, lat),
+                }
+            )
+
+    total_chains = len(chains)
     meta = {
         "featuresTotal": len(feats),
         "partsRaw": len(parts_raw),
         "chainsStitched": len(chains),
         "tjunctionChecked": tj_stats["checked"],
         "tjunctionSnapped": tj_stats["snapped"],
-        "componentsTotal": len(comp_len),
-        "componentsKept": len(kept_roots),
-        "chainsKept": kept_chain_count,
+        "joinPolysUsed": join_stats["polysUsed"],
+        "joinPolysSkippedEmpty": join_stats["polysSkippedEmpty"],
+        "joinSamplePoints": join_stats["samplePoints"],
+        "chainsMatched": join_stats["chainsMatched"],
+        "chainsNamed": join_stats["chainsNamed"],
+        "joinFallbackMatched": join_stats["fallbackMatched"],
+        "joinHitRatePct": round(100.0 * join_stats["chainsMatched"] / total_chains, 1) if total_chains else 0,
+        "keptByType": {str(k): kept_by_type[k] for k in sorted(kept_by_type)},
+        "keptMatched": kept_matched,
+        "keptSystemOnly": kept_system,
+        "chainsKept": kept_total,
         "vertexRaw": raw_vertex_total,
-        "vertexSimplified": simplified_vertex_total,
+        "vertexSimplified": kept_vertices,
+        "labelCount": len(labels),
         "snapPrecDeg": RIVER_SNAP_PREC_DEG,
         "tjunctionTolM": RIVER_TJUNCTION_TOL_M,
-        "minLenKm": RIVER_MIN_LEN_KM,
-        "stubMinKm": RIVER_STUB_MIN_KM,
+        "joinTolDeg": RIVER_JOIN_TOL_DEG,
+        "joinFallbackTolDeg": RIVER_JOIN_FALLBACK_TOL_DEG,
+        "systemMinKm": RIVER_SYSTEM_MIN_KM,
+        "labelMinKm": RIVER_LABEL_MIN_KM,
         "tolDeg": RIVER_TOL_DEG,
     }
-    return lines_out, meta
+    return labels, meta
 
 
 # ---------------------------------------------------------------- reservoirs
@@ -922,8 +1118,11 @@ def main():
 
     # ---- rivers ----
     river_cache = TileCache()
-    river_lines, river_meta = bake_rivers(river_cache)
-    rivers_out = {"meta": {"generated": generated, **river_meta, "tileFallback": river_cache.hits}, "lines": river_lines}
+    river_labels, river_meta = bake_rivers(river_cache)
+    rivers_out = {
+        "meta": {"generated": generated, **river_meta, "tileFallback": river_cache.hits},
+        "labels": river_labels,
+    }
     (OUT_DIR / "rivers.json").write_text(json.dumps(rivers_out, ensure_ascii=False, separators=(",", ":")))
 
     # ---- reservoirs ----
@@ -945,12 +1144,17 @@ def main():
     }
     (OUT_DIR / "river_surfaces.json").write_text(json.dumps(rsurf_out, ensure_ascii=False, separators=(",", ":")))
 
-    print(f"rivers.json      : {river_meta['partsRaw']} raw parts -> stitched into {river_meta['chainsStitched']} chains "
-          f"(T-junction snap {river_meta['tjunctionSnapped']}/{river_meta['tjunctionChecked']} dangling ends closed)")
-    print(f"                   componentsKept {river_meta['componentsKept']}/{river_meta['componentsTotal']} "
-          f"(>= {RIVER_MIN_LEN_KM} km), chainsKept {river_meta['chainsKept']}, "
-          f"vertices {river_meta['vertexRaw']} -> {river_meta['vertexSimplified']} (tol {RIVER_TOL_DEG}°, "
-          f"stub floor {RIVER_STUB_MIN_KM} km)")
+    print(f"rivers.json      : {river_meta['partsRaw']} raw parts -> {river_meta['chainsStitched']} chains "
+          f"(T-junction snap {river_meta['tjunctionSnapped']}/{river_meta['tjunctionChecked']} closed)")
+    print(f"                   join: {river_meta['chainsMatched']}/{river_meta['chainsStitched']} chains matched "
+          f"({river_meta['joinHitRatePct']}% hit, {river_meta['joinFallbackMatched']} via fallback tol, "
+          f"{river_meta['chainsNamed']} named) "
+          f"against {river_meta['joinPolysUsed']} WRA polys ({river_meta['joinPolysSkippedEmpty']} harbours skipped)")
+    print(f"                   keptByType {river_meta['keptByType']} (labels-only output — vector lines retired)")
+    print(f"                   chainsKept {river_meta['chainsKept']} ({river_meta['keptMatched']} matched + "
+          f"{river_meta['keptSystemOnly']} system), vertices {river_meta['vertexRaw']} -> "
+          f"{river_meta['vertexSimplified']}, labels {river_meta['labelCount']} "
+          f"(system floor {RIVER_SYSTEM_MIN_KM} km, label floor {RIVER_LABEL_MIN_KM} km)")
     print(f"reservoirs.json  : kept {res_meta['reservoirsKept']}/{res_meta['featuresTotal']} basins, "
           f"{res_meta['matchedDamHeight']} matched dam heights, {res_meta['damMarkers']} dam markers, "
           f"fullElev {res_meta['fullElevRange'][0]}–{res_meta['fullElevRange'][1]} m, "

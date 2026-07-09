@@ -41,6 +41,16 @@ export class Terrain {
       uScanBlur: { value: params.scanBlur },
       uScanDispH: { value: params.scanDispHeight },
       uScanDispW: { value: params.scanDispFalloff },
+      // physics-derived river simulation (regional pilot). uRiverTex holds a
+      // flow-accumulation intensity bake (scripts/pilot_flow_accum.py); it tints
+      // valley floors blue where water physically accumulates, glued to the
+      // thalweg by construction. uRiverBounds is the bake's world-XZ footprint
+      // (minX,minZ,maxX,maxZ); uRiverSimOpacity 0 = layer off (branch skipped,
+      // texture never sampled — no cost). Same water-blue as the vector rivers.
+      uRiverTex: { value: null },
+      uRiverBounds: { value: new THREE.Vector4(0, 0, 0, 0) },
+      uRiverSimOpacity: { value: 0 },
+      uRiverSimColor: { value: new THREE.Color(params.riversColor) },
     }
     this.rebuildRamp(params)
     this.material.onBeforeCompile = (shader) => {
@@ -92,7 +102,11 @@ uniform float uScanR;
 uniform vec2 uScanCenter;
 uniform vec3 uScanColor;
 uniform float uScanWidth;
-uniform float uScanBlur;`
+uniform float uScanBlur;
+uniform sampler2D uRiverTex;
+uniform vec4 uRiverBounds;
+uniform float uRiverSimOpacity;
+uniform vec3 uRiverSimColor;`
         )
         .replace(
           '#include <color_fragment>',
@@ -109,6 +123,23 @@ uniform float uScanBlur;`
   // keep the lighting/AO shading from the base surface but let the gradient own the color
   float luma = dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722));
   diffuseColor.rgb = mix(diffuseColor.rgb, ramp * clamp(luma * 2.4, 0.2, 1.4), uTint);
+
+  // --- physics-derived river tint: sample the flow-accumulation bake in the
+  // pilot footprint and paint valley floors blue. Gated by uRiverSimOpacity
+  // (0 → branch skipped, uRiverTex never sampled) and by the world-XZ bounds;
+  // smoothstep soft-edges weak upstream flow, and the bake's own edge fade
+  // means the pilot border dissolves rather than showing a hard rectangle.
+  if (uRiverSimOpacity > 0.0) {
+    vec2 rmin = uRiverBounds.xy;
+    vec2 rmax = uRiverBounds.zw;
+    if (vWorldPos.x >= rmin.x && vWorldPos.x <= rmax.x && vWorldPos.z >= rmin.y && vWorldPos.z <= rmax.y) {
+      vec2 ruv = vec2((vWorldPos.x - rmin.x) / max(rmax.x - rmin.x, 1e-4),
+                      (vWorldPos.z - rmin.y) / max(rmax.y - rmin.y, 1e-4));
+      float rInt = texture2D(uRiverTex, ruv).r;
+      float rw = smoothstep(0.02, 0.20, rInt) * uRiverSimOpacity;
+      diffuseColor.rgb = mix(diffuseColor.rgb, uRiverSimColor, clamp(rw, 0.0, 0.95));
+    }
+  }
 
   // --- contour lines: minor every interval, heavy line every 5th
   float ch = vWorldPos.y / uContourInterval;
