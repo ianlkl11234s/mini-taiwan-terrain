@@ -4,6 +4,8 @@ import { LayerManager } from './layers.js'
 import { createCoastlineLayer, createCountiesLayer, createRailLayer, createRiversLayer } from './polyline.js'
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
+import { createTyphoonLayer } from './typhoon.js'
+import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
@@ -134,6 +136,34 @@ export const DEFAULT_PARAMS = {
   reservoirsRatio: 100,
   reservoirsOpacity: 0.55,
   reservoirsColor: '#2f8fd0',
+  // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
+  // S Japan, S Korea, SE China) as flat strokes over a sea-coloured plane —
+  // geographic context beyond the Taiwan DEM footprint (src/engine/region.js).
+  // Deferred: public/layers/region_coast.json fetched on first switch-on.
+  regionVisible: false,
+  regionSeaColor: '#c2e0ff', // light blue sea (user default, RGB 194 224 255)
+  regionSeaOpacity: 1.0,
+  regionLineColor: '#303030', // dark-grey coastline (user default, RGB 48 48 48)
+  regionLineWidth: 1.3,
+  regionLineOpacity: 0.9,
+  // typhoon: a purely procedural vortex cloud sheet high above the terrain
+  // (src/engine/typhoon.js) — no data, animated entirely in the fragment shader.
+  // The eye defaults to just off the SE coast so the rainbands sweep the island;
+  // best viewed from the zoomed-out island view. Toggling it on keeps the render
+  // loop non-idle (isAnimating) so the swirl animates.
+  typhoonVisible: false,
+  typhoonOpacity: 0.95,
+  typhoonLon: 122.6,
+  typhoonLat: 23.0,
+  typhoonRadiusKm: 320,
+  typhoonSpin: 0.11,
+  typhoonEyeSize: 0.06,
+  typhoonHeight: 30, // vertical relief of the cloud mesh (world units; eyewall towers)
+  typhoonDensity: 1.0, // cloud fill/density boost (1 = raw; higher fills band gaps, thicker)
+  // light storm-grey: reads on the default white sky (3D shading gives it form).
+  // For the satellite look, set a dark/ocean-blue fogColor + a near-white cloud
+  // (e.g. fogColor '#16324f', typhoonColor '#eef2f7') — white cloud needs a dark sky
+  typhoonColor: '#c8d2df',
 
   // HUD
   hud: true,
@@ -343,11 +373,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // registration order = draw / update order (coastline → counties → rail →
   // rivers → reservoirs → markers → stations → labels)
   for (const layer of [
+    createRegionLayer(params),
     createCoastlineLayer(params),
     createCountiesLayer(params),
     createRailLayer(params),
     createRiversLayer(params),
     reservoirsLayer,
+    createTyphoonLayer(params),
     pointLayer,
     stationsLayer,
     labelsLayer,
@@ -693,6 +725,57 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       railFetch.loading = false
       invalidate()
       emit('layers') // refresh the panel's point count now that data (or the failure) landed
+    }
+  }
+
+  // region: deferred neighbouring-coastline data (public/layers/region_coast.json)
+  // fetched once on first switch-on, exactly like rail. The sea plane shows even
+  // before the lines land; a fetch failure just leaves the plane + a warn.
+  let regionFetch = { loading: false, loaded: false }
+  async function loadRegionData() {
+    if (regionFetch.loading || regionFetch.loaded) return
+    regionFetch.loading = true
+    try {
+      // coastlines + land/sea mask in parallel; the mask is best-effort (a miss
+      // just leaves the sea plane hidden, coastlines still draw)
+      const [linesRes, maskMeta] = await Promise.all([
+        fetch(await manifestUrl('region', '/layers/region_coast.json')),
+        fetch('/layers/region_sea_mask.json')
+          .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`region_sea_mask.json ${r.status}`))))
+          .catch((e) => {
+            console.warn('[layers]', e.message || e)
+            return null
+          }),
+      ])
+      if (!linesRes.ok) throw new Error(`region_coast.json ${linesRes.status}`)
+      const data = await linesRes.json()
+      layers.get('region').setData(data.lines)
+      if (maskMeta) {
+        const tex = await new Promise((resolve) =>
+          new THREE.TextureLoader().load(maskMeta.png ?? '/layers/region_sea_mask.png', resolve, undefined, () => resolve(null))
+        )
+        if (tex) {
+          // intensity data, not colour (see loadRiverSim): no sRGB, linear, no
+          // mipmaps; flipY false so row 0 (north) reads at uv v=0; ClampToEdge so
+          // the ocean beyond Taiwan samples the mask's sea border
+          tex.flipY = false
+          tex.colorSpace = THREE.NoColorSpace
+          tex.minFilter = THREE.LinearFilter
+          tex.magFilter = THREE.LinearFilter
+          tex.generateMipmaps = false
+          tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping
+          tex.needsUpdate = true
+          layers.get('region').setMask(tex, maskMeta.bbox)
+        }
+      }
+      regionFetch.loaded = true
+      layers.get('region').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] region fetch failed', err)
+    } finally {
+      regionFetch.loading = false
+      invalidate()
+      emit('layers')
     }
   }
 
@@ -1065,6 +1148,29 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     reservoirsRatio: (v) => reservoirsLayer.setManualRatio(v / 100),
     reservoirsOpacity: () => reservoirsLayer.update(layerCtx()),
     reservoirsColor: () => reservoirsLayer.update(layerCtx()),
+    // region: first switch-on fetches the neighbouring coastlines (deferred);
+    // the sea plane + style params re-run the layer's update
+    regionVisible: (v) => {
+      if (v) loadRegionData()
+      layers.get('region').update(layerCtx())
+    },
+    regionSeaColor: () => layers.get('region').update(layerCtx()),
+    regionSeaOpacity: () => layers.get('region').update(layerCtx()),
+    regionLineColor: () => layers.get('region').update(layerCtx()),
+    regionLineWidth: () => layers.get('region').update(layerCtx()),
+    regionLineOpacity: () => layers.get('region').update(layerCtx()),
+    // typhoon: procedural vortex cloud sheet — every param just re-runs the
+    // layer's update (visibility gate + place/scale + shader-uniform style)
+    typhoonVisible: () => layers.get('typhoon').update(layerCtx()),
+    typhoonOpacity: () => layers.get('typhoon').update(layerCtx()),
+    typhoonRadiusKm: () => layers.get('typhoon').update(layerCtx()),
+    typhoonSpin: () => layers.get('typhoon').update(layerCtx()),
+    typhoonEyeSize: () => layers.get('typhoon').update(layerCtx()),
+    typhoonHeight: () => layers.get('typhoon').update(layerCtx()),
+    typhoonDensity: () => layers.get('typhoon').update(layerCtx()),
+    typhoonLon: () => layers.get('typhoon').update(layerCtx()),
+    typhoonLat: () => layers.get('typhoon').update(layerCtx()),
+    typhoonColor: () => layers.get('typhoon').update(layerCtx()),
     // look
     exposure: (v) => (stage.exposureFx.uniforms.get('exposure').value = v),
     contrast: (v) => (stage.contrastFx.uniforms.get('contrast').value = v),
@@ -1169,6 +1275,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function isAnimating() {
     if (params.source !== 'real' || !heightField) return true
     return (
+      params.typhoonVisible || // procedural storm swirls every frame while visible
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||
