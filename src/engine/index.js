@@ -367,6 +367,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
 
   const layers = new LayerManager(scene)
   const pointLayer = createPointLayer(params) // marker sets — imperative set API preserved
+  // display labels for the station marker systems (see stationsLayer pickRows
+  // below) — the baked stations.json carries only the bare system id
+  const STATION_SYSTEM_LABELS = {
+    tra: '台鐵 TRA',
+    trtc: '台北捷運 TRTC',
+    krtc: '高雄捷運 KRTC',
+    klrt: '高雄輕軌 KLRT',
+    tmrt: '台中捷運 TMRT',
+    thsr: '台灣高鐵 THSR',
+    aklrt: '安坑輕軌 AKLRT',
+  }
   // stations: a second marker-set collection, grouped one set per transit
   // system (see loadStationsData below). onActivate fires once, on the
   // panel's first toggle-on, and fetches public/layers/stations.json.
@@ -375,6 +386,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     label: 'Stations',
     rowLabel: '車站 Stations',
     onActivate: () => loadStationsData(),
+    // click-to-inspect (see layers.pickAll / index.js pointerup handler)
+    pickRows: (pt, setId) => [
+      ['站名 Name', pt.name || '—'],
+      ['系統 System', STATION_SYSTEM_LABELS[setId] ?? setId.toUpperCase()],
+    ],
   })
   // trail signs: a third marker-set collection (one set — 'signs' — 3,407
   // points), same deferred onActivate pattern as stations. Unlike stations,
@@ -393,9 +409,48 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     onActivate: () => loadTrailSignsData(),
     showLabels: false,
     dotRadius: 0.05,
+    // click-to-inspect (see layers.pickAll / index.js pointerup handler)
+    pickRows: (pt) => [
+      ['名稱 Name', pt.name || '—'],
+      ['分署 Department', pt.dept || '—'],
+    ],
   })
   const labelsLayer = createLabelsLayer(params)
   const reservoirsLayer = createReservoirLayer(params)
+  // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
+  // decided — layer modules stay presentation-agnostic, layers.js just carries
+  // whatever meta.group/subgroup it's registered with through to describe(),
+  // and Layers.jsx renders purely off that. Adding a new overlay to an
+  // existing theme is one entry here, no Layers.jsx edit. Anything left out
+  // falls back to LayerManager's UNGROUPED ("其他 Other") bucket instead of
+  // disappearing from the panel — every registered layer below has a home so
+  // that bucket stays empty in normal use.
+  const GROUP_BASE = { id: 'base', label: '底圖 Base', order: 0 }
+  const GROUP_MOVE = { id: 'move', label: '交通 Move', order: 1 }
+  const GROUP_WATER = { id: 'water', label: '水文 Water', order: 2 }
+  const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 3 }
+  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 4 }
+  const LAYER_GROUPS = {
+    region: { group: GROUP_BASE },
+    coastline: { group: GROUP_BASE },
+    counties: { group: GROUP_BASE },
+    // generic marker-set scaffold (setMarkerSet/removeMarkerSet/listMarkerSets
+    // — a console/scripting escape hatch, not a themed dataset: no default
+    // sets are ever registered from the UI, so it never carries real data in
+    // normal use). Not tied to any theme (transport/water/outdoor); parked
+    // under Base as a generic overlay utility rather than left in "其他".
+    markers: { group: GROUP_BASE },
+    rail: { group: GROUP_MOVE },
+    stations: { group: GROUP_MOVE },
+    rivers: { group: GROUP_WATER },
+    reservoirs: { group: GROUP_WATER },
+    trails: { group: GROUP_OUTDOOR },
+    trail_signs: { group: GROUP_OUTDOOR },
+    // peak spot-elevation / place-name labels (labels.js) — cartography tied
+    // to the same mountain/hiking context as trails, so it sits alongside them
+    labels: { group: GROUP_OUTDOOR },
+    typhoon: { group: GROUP_FX },
+  }
   // registration order = draw / update order (coastline → counties → rail →
   // trails → rivers → reservoirs → markers → stations → trail signs → labels)
   for (const layer of [
@@ -412,7 +467,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     trailSignsLayer,
     labelsLayer,
   ]) {
-    layers.register(layer, layerCtx())
+    layers.register(layer, layerCtx(), LAYER_GROUPS[layer.id])
   }
   const regenerateLabels = () => labelsLayer.update(layerCtx())
   // param keys that map to a layer's visibility/style — a setParams touching any
@@ -690,6 +745,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function regenerateTerrain() {
     if (rebuildPending) return
     invalidate()
+    clearPick() // a rebuild can move/replace baked geometry — drop any pinned popup rather than leave it at a stale position
     rebuildPending = true
     emit('loading', { active: true, message: 'generating terrain…' })
     // let the indicator paint before the synchronous rebuild blocks the thread
@@ -757,8 +813,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
 
   // trails: same deferred fetch-once pattern as rail (baked polylines, no
-  // per-line official colors — see polyline.js createTrailsLayer). setData
-  // takes no lineColors arg so the single trailsColor swatch drives the style.
+  // per-line official colors — see polyline.js createTrailsLayer). setData's
+  // 2nd arg (lineColors) is null — the single trailsColor swatch drives the
+  // style — but the 3rd arg carries one {name,county,lengthKm,ascentM} per
+  // trail (parallel to the points arrays) for the click-to-inspect popup
+  // (polyline.js pick(), gated on config.pickRows).
   let trailsFetch = { loading: false, loaded: false }
   async function loadTrailsData() {
     if (trailsFetch.loading || trailsFetch.loaded) return
@@ -767,7 +826,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       const res = await fetch(await manifestUrl('trails', '/layers/trails.json'))
       if (!res.ok) throw new Error(`trails.json ${res.status}`)
       const data = await res.json()
-      layers.get('trails').setData(data.lines.map((l) => l.points))
+      layers.get('trails').setData(
+        data.lines.map((l) => l.points),
+        null,
+        data.lines.map((l) => ({ name: l.name, county: l.county, lengthKm: l.lengthKm, ascentM: l.ascentM }))
+      )
       trailsFetch.loaded = true
       layers.get('trails').update(layerCtx())
     } catch (err) {
@@ -1295,7 +1358,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       else HANDLERS[k]?.(params[k])
     }
     if (rebuild) regenerateTerrain()
-    if (keys.some((k) => LAYER_KEYS.has(k))) emit('layers') // dynamic panel refresh
+    if (keys.some((k) => LAYER_KEYS.has(k))) {
+      emit('layers') // dynamic panel refresh
+      if (activePick) closePickIfLayerHidden(activePick.layerId) // e.g. trailsVisible:false while its popup is open
+    }
     invalidate() // any settings change must repaint, even from a frozen idle frame
   }
 
@@ -1314,6 +1380,63 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     mouse.set(nx, ny)
   }
   window.addEventListener('pointermove', onPointerMove)
+
+  // ---------------------------------------------------------------- layer pick (click popup)
+  // Click-only feature picking (never hover — an on-demand render app can't
+  // afford a per-frame raycast). pointerdown/up are measured for drag
+  // distance so an OrbitControls orbit/pan never fires a pick; only a
+  // pointerdown that STARTED on the canvas (not a UI panel) is a candidate.
+  // A hit walks the LayerManager's registered layers via layers.pickAll (see
+  // layers.js for the raycaster conventions — camera/params.Line2/pickPx) and
+  // opens the React popup card; a miss (empty-canvas click) closes it.
+  const pickRaycaster = new THREE.Raycaster()
+  pickRaycaster.params.Line2 = { threshold: 10 } // px, added to the line's own linewidth (draped lines render 0.5–6px wide — too thin to click as-is)
+  const _pickNdc = new THREE.Vector2()
+  const PICK_DRAG_TOLERANCE_PX = 5 // pointerdown→up movement above this reads as a camera drag, not a click
+  let pickDownPos = null
+  let pickDownOnCanvas = false
+  let activePick = null // { title, rows, worldPos, layerId } | null — the popup's current content
+
+  function clearPick() {
+    if (!activePick) return
+    activePick = null
+    emit('pick', null)
+    invalidate()
+  }
+  // closes the popup if it belongs to a layer that just got hidden (toggle
+  // off in the Layers panel, "ALL OFF", or a theme master switch) — checked
+  // generically off describe().visible so it works for both param-backed
+  // layers (setLayerVisible/setParams) and marker-set layers (setLayerSet)
+  function closePickIfLayerHidden(id) {
+    if (!activePick || !id || activePick.layerId !== id) return
+    const layer = layers.get(id)
+    if (!layer || !layer.describe().visible) clearPick()
+  }
+  function onPickPointerDown(e) {
+    pickDownOnCanvas = e.target === stage.renderer.domElement
+    pickDownPos = { x: e.clientX, y: e.clientY }
+  }
+  function onPickPointerUp(e) {
+    if (!pickDownOnCanvas || !pickDownPos) return
+    const dx = e.clientX - pickDownPos.x
+    const dy = e.clientY - pickDownPos.y
+    pickDownPos = null
+    if (Math.hypot(dx, dy) > PICK_DRAG_TOLERANCE_PX) return // camera drag, not a click
+    _pickNdc.set((e.clientX / window.innerWidth) * 2 - 1, -((e.clientY / window.innerHeight) * 2 - 1))
+    pickRaycaster.setFromCamera(_pickNdc, camera) // also sets pickRaycaster.camera (used by Line2 + markers.pick)
+    pickRaycaster.pickPx = { x: e.clientX, y: e.clientY } // markers.js pick(): screen-space hit test for tiny instanced dots
+    const hit = layers.pickAll(pickRaycaster)
+    if (hit) {
+      activePick = { title: hit.title, rows: hit.rows, worldPos: hit.worldPos.clone(), layerId: hit.layerId }
+      emit('pick', { title: hit.title, rows: hit.rows, layerId: hit.layerId })
+    } else {
+      activePick = null
+      emit('pick', null)
+    }
+    invalidate()
+  }
+  window.addEventListener('pointerdown', onPickPointerDown)
+  window.addEventListener('pointerup', onPickPointerUp)
 
   // ---------------------------------------------------------------- stats
 
@@ -1378,6 +1501,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       dt,
       reticle: project(cone.getFocusPoint(), w, h),
       poiScreens: pois.map((p) => project(p.top, w, h)),
+      // layer-pick popup screen anchor (see 'layer pick' section above) — a
+      // cheap re-project each frame, exactly like reticle/poiScreens, so the
+      // React card tracks the world position as the camera moves/idles
+      pick: activePick ? project(activePick.worldPos, w, h) : null,
       selected: selectedPoi,
       az: THREE.MathUtils.radToDeg(_sph.theta),
       el: 90 - THREE.MathUtils.radToDeg(_sph.phi),
@@ -1577,6 +1704,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     layer.update?.(layerCtx()) // builds now if the world exists
     invalidate()
     emit('layers') // set list/visibility changed → refresh the panel
+    closePickIfLayerHidden(layerId) // e.g. the popup's station system just got toggled off
   }
 
   const engine = {
@@ -1661,11 +1789,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     setLayerVisible(id, v) {
       const layer = layers.get(id)
       if (!layer) return
+      // param-backed layers route through setParams (which already closes a
+      // matching popup — see LAYER_KEYS check above); the marker-set branch
+      // below has no bulk visibility of its own (setVisible only triggers the
+      // one-shot onActivate fetch) but checks too, for symmetry
       if (layer.visibleParam) setParams({ [layer.visibleParam]: v })
       else {
         layer.setVisible?.(v)
         emit('layers')
         invalidate()
+        closePickIfLayerHidden(id)
       }
     },
     setLayerStyle(id, patch) {
@@ -1681,11 +1814,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
         invalidate()
       }
     },
+    // layer-pick popup: X button / any other explicit close (see LayerPickCard.jsx)
+    clearPick() {
+      clearPick()
+    },
     dispose() {
       disposed = true
       cancelAnimationFrame(rafId)
       window.removeEventListener('pointermove', onPointerMove)
       window.removeEventListener('resize', onResize)
+      window.removeEventListener('pointerdown', onPickPointerDown)
+      window.removeEventListener('pointerup', onPickPointerUp)
       keyPan.dispose()
       controls.dispose()
       stage.renderer.dispose()

@@ -49,6 +49,12 @@ function createPolylineLayer(config, params) {
   // paramMap.color swatch — official rail-line colors, not user-tintable.
   let polylines = config.polylines ?? []
   let lineColors = config.lineColors ?? null
+  // pick support (draped only, opt-in via config.pickRows — see trails below):
+  // one metadata object per polyline (parallel to `polylines`), fed alongside
+  // it via setData's 3rd arg. segLine maps a baked SEGMENT index back to its
+  // source polyline index — the merged LineSegmentsGeometry has no other way
+  // to recover "which trail was this" once everything is one draw call.
+  let lineMeta = config.lineMeta ?? null
 
   const material = new LineMaterial({
     color: new THREE.Color(paramMap.color ? params[paramMap.color] : 0xffffff),
@@ -78,6 +84,7 @@ function createPolylineLayer(config, params) {
   let seg = null
   let elev = null
   let col = null
+  let segLine = null // Int32Array, one entry per segment → source polyline index (pick only)
   let nSeg = 0
   let geomInit = false
   let lastVScale = NaN
@@ -87,6 +94,7 @@ function createPolylineLayer(config, params) {
     seg = new Float32Array(nSeg * 6)
     elev = new Float32Array(nSeg * 2)
     col = lineColors ? new Float32Array(nSeg * 6) : null
+    segLine = lineMeta ? new Int32Array(nSeg) : null
     const c = new THREE.Color()
     let s = 0
     for (let li = 0; li < polylines.length; li++) {
@@ -109,6 +117,7 @@ function createPolylineLayer(config, params) {
           col[s * 6 + 4] = c.g
           col[s * 6 + 5] = c.b
         }
+        if (segLine) segLine[s] = li
         s++
       }
     }
@@ -227,13 +236,18 @@ function createPolylineLayer(config, params) {
     // draped only: (re)supply the polylines once deferred data has fetched —
     // resets the baked buffers so the next update()/ensureBuilt rebakes from
     // scratch. Vertex colors (one hex per polyline) rebake alongside.
-    setData(newPolylines, newLineColors = null) {
+    // newLineMeta (opt-in — see config.pickRows): one metadata object per
+    // polyline, parallel to newPolylines, kept for pick()'s segment→line
+    // lookup; layers that don't pick (rail, counties) never pass it.
+    setData(newPolylines, newLineColors = null, newLineMeta = null) {
       polylines = newPolylines ?? []
       lineColors = newLineColors
+      lineMeta = newLineMeta
       pointCount = computePointCount()
       seg = null
       elev = null
       col = null
+      segLine = null
       nSeg = 0
       geomInit = false
       lastVScale = NaN
@@ -244,6 +258,29 @@ function createPolylineLayer(config, params) {
       object3d.geometry.dispose()
       object3d.geometry = new LineSegmentsGeometry()
     },
+
+    // click-to-inspect (draped only, opt-in — see config.pickRows/pickTitle on
+    // trails below). Reuses LineSegments2's own screen-space raycast (the
+    // engine pre-sets raycaster.params.Line2.threshold once, in index.js) —
+    // faceIndex on a hit is the segment index into the merged geometry, which
+    // segLine maps back to the source polyline for its metadata row.
+    ...(config.pickRows
+      ? {
+          pick(raycaster) {
+            if (!object3d.visible || !nSeg) return null
+            const hits = raycaster.intersectObject(object3d, false)
+            if (!hits.length) return null
+            const li = segLine ? segLine[hits[0].faceIndex] : -1
+            const meta = lineMeta && li >= 0 ? lineMeta[li] : null
+            if (!meta) return null
+            return {
+              title: config.pickTitle ? config.pickTitle(meta) : meta.name,
+              rows: config.pickRows(meta),
+              worldPos: hits[0].point.clone(),
+            }
+          },
+        }
+      : {}),
 
     describe() {
       return {
@@ -359,6 +396,15 @@ export function createTrailsLayer(params) {
       liftBase: 0.05,
       paramMap: { visible: 'trailsVisible', color: 'trailsColor', width: 'trailsWidth', opacity: 'trailsOpacity' },
       styleSchema: POLYLINE_STYLE(6),
+      // click-to-inspect (see index.js loadTrailsData, which feeds the 3rd
+      // setData arg with one {name,county,lengthKm,ascentM} per trail)
+      pickTitle: (meta) => meta.name,
+      pickRows: (meta) => [
+        ['步道 Trail', meta.name || '—'],
+        ['縣市 County', meta.county || '—'],
+        ['長度 Length', `${meta.lengthKm.toFixed(2)} km`],
+        ['爬升 Ascent', `${meta.ascentM} m`],
+      ],
     },
     params
   )

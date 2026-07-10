@@ -5,6 +5,7 @@ import IconRailSidebar from './components/IconRailSidebar.jsx'
 import TitleBlock from './components/TitleBlock.jsx'
 import Telemetry from './components/Telemetry.jsx'
 import PoiTags from './components/PoiTags.jsx'
+import LayerPickCard from './components/LayerPickCard.jsx'
 
 // React shell (R2)：engine mount 容器 + 全部 overlay。引擎只透過 facade
 // （createEngine / setParams / 事件）互動，src/engine/ 內部一概不碰。
@@ -62,6 +63,7 @@ export default function App() {
           </div>
           <TitleBlock engine={engine} />
           <IconRailSidebar engine={engine} />
+          <LayerPickCard engine={engine} />
         </>
       )}
       <div

@@ -27,6 +27,16 @@ import { metersToWorldY, drapeAt } from './geo.js'
 const MAX_LABELS = 8
 const DOT_R = 0.14 // world units at fogScale 1 (~4–5 px on screen)
 const TAG_PX = 22 // tag height in screen pixels
+// click-to-inspect hit radius, in CSS px (see pick() below). Deliberately a
+// FIXED screen-space value, not a world-unit one scaled off dotRadius: dense
+// point sets (3,407 trail signs, ~13–90 m apart — bake_trails.py) sit close
+// enough in world units that a generous world-space tolerance would make
+// neighbouring points ambiguous, or even swallow clicks meant for the trail
+// LINE running alongside them. A small, constant pixel radius stays roughly
+// matched to the dot's own ~4–5 px apparent size (which itself already holds
+// steady across zoom via the fogScale-scaled dotRadius) regardless of how
+// close together the underlying points are in world space.
+const PICK_PX = 14
 // tag palette leans darker/opaquer than the DOM peak tags: sprites live in the
 // 3D frame, so the ACES tone map + grain wash them out a little
 const INK = '#0d0f11'
@@ -73,6 +83,8 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } =
   const _dotGeo = new THREE.CircleGeometry(1, 24).rotateX(-Math.PI / 2)
   const _m = new THREE.Matrix4()
   const _p = new THREE.Vector3()
+  const _pickWorld = new THREE.Vector3()
+  const _pickProj = new THREE.Vector3()
 
   function pointY(pt) {
     // baked elev → exact placement; otherwise live-drape (unstreamed tiles read
@@ -265,6 +277,41 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } =
     setFogScale(v) {
       fogScale = v
     },
+    // click-to-inspect (opt-in — see createPointLayer's pickTitle/pickRows).
+    // No InstancedMesh raycast here: the dots are ~4–5 px on screen (DOT_R
+    // comment above), far too small to hit reliably via true ray-triangle
+    // intersection. Instead project every visible point with the raycaster's
+    // own camera (set by Raycaster.setFromCamera) and compare to the click's
+    // screen pixel (raycaster.pickPx, stashed by index.js) — see PICK_PX.
+    pick(raycaster, { pickTitle, pickRows } = {}) {
+      if (!group.visible) return null
+      const camera = raycaster.camera
+      const clickPx = raycaster.pickPx
+      if (!camera || !clickPx) return null
+      const w = window.innerWidth
+      const h = window.innerHeight
+      let best = null
+      for (const [setId, entry] of sets) {
+        if (!entry.def.visible || !entry.dots) continue
+        for (const pt of entry.def.points) {
+          if (pt._x === undefined) continue
+          _pickWorld.set(pt._x, pointY(pt) + 0.02, pt._z)
+          _pickProj.copy(_pickWorld).project(camera)
+          if (_pickProj.z < -1 || _pickProj.z > 1) continue // behind camera / clipped
+          const sx = (_pickProj.x * 0.5 + 0.5) * w
+          const sy = (-_pickProj.y * 0.5 + 0.5) * h
+          const d = Math.hypot(sx - clickPx.x, sy - clickPx.y)
+          if (d < PICK_PX && (!best || d < best.d)) best = { d, pt, setId }
+        }
+      }
+      if (!best) return null
+      const { pt, setId } = best
+      return {
+        title: (pickTitle ? pickTitle(pt, setId) : pt.name) ?? '',
+        rows: pickRows ? pickRows(pt, setId) : [['Name', pt.name ?? '']],
+        worldPos: new THREE.Vector3(pt._x, pointY(pt) + 0.02, pt._z),
+      }
+    },
   }
 }
 
@@ -292,7 +339,10 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } =
 // same visual language as stations otherwise. dotRadius lets that dense set
 // use a smaller mark than the default DOT_R so it doesn't read as a solid
 // tube that swallows the thinner trail line drawn at the same positions.
-export function createPointLayer(params, { id = 'markers', label = 'Markers', rowLabel, onActivate, dotRadius, showLabels } = {}) {
+export function createPointLayer(
+  params,
+  { id = 'markers', label = 'Markers', rowLabel, onActivate, dotRadius, showLabels, pickTitle, pickRows } = {}
+) {
   const markers = createMarkers(params, { dotRadius, showLabels })
   let activated = false
   return {
@@ -323,6 +373,9 @@ export function createPointLayer(params, { id = 'markers', label = 'Markers', ro
       })
     },
     setStyle() {}, // per-set only
+    // click-to-inspect: opt-in via pickRows (stations/trail signs pass one;
+    // the generic 'markers' demo layer doesn't, so it stays unclickable).
+    ...(pickRows ? { pick: (raycaster) => markers.pick(raycaster, { pickTitle, pickRows }) } : {}),
     describe() {
       const sets = markers.listSets()
       return {

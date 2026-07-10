@@ -13,6 +13,7 @@ const ICON_PATHS = {
   x: ['M18 6 6 18', 'm6 6 12 12'],
   play: ['m7 4 13 8-13 8V4z'],
   stop: ['M6 6h12v12H6z'],
+  chevronDown: ['m6 9 6 6 6-6'],
 }
 
 export function Icon({ name, size = 20, color = 'currentColor', strokeWidth = 1.7 }) {
