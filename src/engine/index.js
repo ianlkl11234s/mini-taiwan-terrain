@@ -9,7 +9,7 @@ import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
-import { makeProjection, HeightField, TAIWAN_BBOX } from './geo.js'
+import { makeProjection, HeightField, TAIWAN_BBOX, worldYScale, metersToWorldY } from './geo.js'
 import { ChunkManager } from './chunks.js'
 import { findRealPeaks } from './peaks.js'
 import { createStage, LOD_MIN, LOD_MAX } from './scene.js'
@@ -677,10 +677,30 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
     selectedPoi = i
     emit('selection', { index: i, poi: p })
+
+    // p.h can be a stale throttled-refresh cache (poiAcc block below /
+    // computePois) baked in before this peak's DEM tile finished streaming —
+    // heightAtWorld() reports a phantom "0 m" for a not-yet-resident tile
+    // (geo.js heightAtWorld), which used to fly the camera underground until
+    // the next POI refresh caught up (peaks.js:34,42-48). Re-sample live at
+    // click time instead of trusting the cache.
+    let h = terrain.sample(p.x, p.z)
+    if (params.source === 'real' && heightField) {
+      const scale = worldYScale(heightField, params.demExaggeration)
+      const missY = (0 - heightField.datumM) * scale // heightAtWorld's tile-miss signature
+      if (Math.abs(h - missY) < 1e-6 && Number.isFinite(p.elevM)) {
+        // still not streamed even now — trust the peaks catalogue elevation
+        // (peaks.js elevM) rather than the phantom sea-level sample: better
+        // to fly high over the mountain than to clip into it
+        h = metersToWorldY(heightField, p.elevM, params.demExaggeration)
+      }
+    }
+    h = Math.max(h, p.h) // never settle lower than whatever the cached POI already had
+
     const dir = new THREE.Vector3(p.x, 0, p.z).normalize()
     motion.flyTo(
-      new THREE.Vector3(p.x + dir.x * 6.5, p.h + 4.2, p.z + dir.z * 6.5),
-      new THREE.Vector3(p.x, p.h + 0.6, p.z)
+      new THREE.Vector3(p.x + dir.x * 6.5, h + 4.2, p.z + dir.z * 6.5),
+      new THREE.Vector3(p.x, h + 0.6, p.z)
     )
   }
 
@@ -1579,10 +1599,18 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       // anti-penetration: floor the camera to the ground sample right below it
       // + a small margin, so dollying/panning close to a slope can't dig into
       // the mesh. Cheap XZ-only check (no ray march) — good enough since the
-      // camera moves continuously and this runs every frame.
+      // camera moves continuously and this runs every frame. Also floors
+      // controls.target: a flyTo (e.g. selectPoi) that ends with a bad target
+      // altitude — pos and target are set once at flyTo() time, not touched
+      // again until here — gets caught the very first free-nav frame after
+      // the tween ends (motion.tick() starts returning false again). This
+      // block only runs outside tour/fly-to (guarded by `!motion.tick(dt)`
+      // above), so it never fights Tour's self-managed path.
       if (terrain.sample) {
         const minY = terrain.sample(camera.position.x, camera.position.z) + CAMERA_GROUND_MARGIN
         if (camera.position.y < minY) camera.position.y = minY
+        const minTy = terrain.sample(controls.target.x, controls.target.z) + CAMERA_GROUND_MARGIN
+        if (controls.target.y < minTy) controls.target.y = minTy
       }
     } else {
       keyPan.reset() // no residual glide fighting an active tour/fly-to
