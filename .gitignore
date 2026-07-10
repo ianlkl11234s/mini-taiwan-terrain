@@ -2,7 +2,7 @@ node_modules/
 dist/
 .DS_Store
 public/tiles
-verify/
+/verify/
 
 .env
 __pycache__/

@@ -60,7 +60,7 @@ function tagTexture(name) {
   return { tex, aspect: w / h }
 }
 
-export function createMarkers(params) {
+export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } = {}) {
   const group = new THREE.Group() // master: visible only in real mode with a world
   group.visible = false
   const sets = new Map() // id → entry
@@ -85,7 +85,7 @@ export function createMarkers(params) {
   // (re)compute world positions + instance matrices for one set
   function layout(entry) {
     if (!heightField || !entry.dots) return
-    const r = DOT_R * fogScale
+    const r = dotRadius * fogScale
     entry.def.points.forEach((pt, i) => {
       if (pt._x === undefined) {
         const w = heightField.projection.lonLatToWorld(pt.lon, pt.lat)
@@ -239,6 +239,7 @@ export function createMarkers(params) {
         builtFog = fogScale
         for (const entry of sets.values()) layout(entry)
       }
+      if (!showLabels) return // dots-only set (e.g. trail signs) — skip the ranking/sprite work entirely
       if (!doLabels) return
       // constant-pixel tag scale (sizeAttenuation:false → NDC-ish units)
       const k = (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * TAG_PX) / window.innerHeight
@@ -280,8 +281,19 @@ export function createMarkers(params) {
 // "NO MARKER SETS" list — that toggle is what the user clicks to trigger the
 // fetch. If onActivate's promise rejects, activation resets so the row
 // reverts to a toggle the user can retry.
-export function createPointLayer(params, { id = 'markers', label = 'Markers', rowLabel, onActivate } = {}) {
-  const markers = createMarkers(params)
+//
+// Third use (trail signs): `dotRadius`/`showLabels` tune a set collection
+// whose points are much denser than stations (waypoints every ~13-90 m along
+// a route, sometimes literally the SAME coordinates as the trail LINE's own
+// baked vertices — see polyline.js createTrailsLayer). Per-point name tags
+// there would repeat one trail's name across every waypoint that ranks in
+// the nearest-MAX_LABELS window (a wall of duplicate tags), so
+// showLabels:false skips the tag ranking/sprite work entirely — dots only,
+// same visual language as stations otherwise. dotRadius lets that dense set
+// use a smaller mark than the default DOT_R so it doesn't read as a solid
+// tube that swallows the thinner trail line drawn at the same positions.
+export function createPointLayer(params, { id = 'markers', label = 'Markers', rowLabel, onActivate, dotRadius, showLabels } = {}) {
+  const markers = createMarkers(params, { dotRadius, showLabels })
   let activated = false
   return {
     id,
