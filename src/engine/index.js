@@ -1184,7 +1184,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     invalidate()
     const { x, z } = heightField.projection.lonLatToWorld(lon, lat)
     _flyOffset.subVectors(camera.position, controls.target) // keep the current view offset
-    const target = new THREE.Vector3(x, controls.target.y, z)
+    // resample ground height AT THE DESTINATION — reusing controls.target.y
+    // (the departure altitude) stranded the camera over blank sea/tiles when
+    // flying between very different elevations (e.g. 玉山 → 澎湖). If the
+    // destination tile hasn't streamed yet terrain.sample() reports 0, which
+    // is a safe underestimate: the anti-penetration floor in tick() (index.js
+    // ~1609-1613) only ever raises target.y/camera.y, never lowers it.
+    const y = terrain.sample ? terrain.sample(x, z) : controls.target.y
+    const target = new THREE.Vector3(x, y, z)
     motion.flyTo(target.clone().add(_flyOffset), target)
     emit('params') // refresh the SECTOR location name
     return true
