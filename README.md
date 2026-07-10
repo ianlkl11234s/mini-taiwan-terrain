@@ -114,7 +114,11 @@ npm run build   # 靜態產物在 dist/
 
 ## 部署
 
-`npm run build` 產出 `dist/` 靜態網站，經 GitHub Actions（`.github/workflows/deploy.yml`）部署到 **GitHub Pages**。地形圖磚另外託管於 tile server（透過 `VITE_TILE_BASE` 指定，例如 Cloudflare R2）；`wrangler.jsonc` 為 Cloudflare 部署的備選設定。
+`npm run build` 產出 `dist/` 靜態網站，部署於 **Zeabur**；build 時以環境變數 `VITE_TILE_BASE=https://tiles.itsmigu.com` 指向圖磚 CDN。
+
+地形圖磚（~292 MB, z10–13）託管於 **Cloudflare R2**（Custom Domain `tiles.itsmigu.com`，CORS 開放 GET/HEAD），走 Cloudflare CDN、egress 免費。改圖磚後重新同步到 R2；改 `VITE_TILE_BASE` 後需 Zeabur redeploy（build-time 變數）。
+
+> repo 內另有 `.github/workflows/deploy.yml`（GitHub Pages）與 `wrangler.jsonc`（Cloudflare）作為備選；目前線上以 **Zeabur** 為準（Pages workflow 未注入 `VITE_TILE_BASE`，其產物不含圖磚）。
 
 ## 授權與致謝
 
