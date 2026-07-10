@@ -1,14 +1,14 @@
 {
   "bbox": {
-    "minLon": 119.2,
-    "maxLon": 122.1275,
-    "minLat": 21.7756,
-    "maxLat": 25.4203
+    "minLon": 117.8,
+    "maxLon": 123.5,
+    "minLat": 21.5,
+    "maxLat": 26.5
   },
   "size": {
-    "w": 1350,
-    "h": 1835
+    "w": 2630,
+    "h": 2526
   },
   "png": "/layers/region_sea_mask.png",
-  "note": "row 0 = north, col 0 = west; L: sea=255 land=0; DEM-derived from 本島+澎湖 20m DTM mosaic 有效像素=陸（gdalbuildvrt+gdalwarp nearest）; 內陸孤立 nodata（雲遮等）用 binary_fill_holes 補為陸; 綠島/龜山島不在任一來源 DTM 範圍內，nodata 仍判為海"
+  "note": "row 0 = north, col 0 = west; L: sea=255 land=0; DEM-derived from 本島+澎湖+金門 20m DTM mosaic 有效像素=陸（gdalbuildvrt+gdalwarp nearest）OR GEBCO_2025 bathymetry grid elevation>0（gdalwarp bilinear，450m 粗解析度，補馬祖/福建沿岸無 NLSC 級 DTM 覆蓋的區域）; 內陸孤立 nodata（雲遮等）用 binary_fill_holes 補為陸; 綠島/龜山島不在任一 DTM 範圍內且 GEBCO 在該點非正值，仍判為海"
 }
