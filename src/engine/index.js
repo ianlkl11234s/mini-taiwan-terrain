@@ -101,6 +101,9 @@ export const DEFAULT_PARAMS = {
   bathymetryVisible: false,
   bathyDeepColor: '#0b1f36',
   bathyShallowColor: '#4a90c2',
+  // very pale green coastal band (~0 to -15~-25 m) between bathyShallowColor
+  // and the 0 m shoreline handoff — see terrain.js rebuildRamp
+  bathyCoastColor: '#d8e8cf',
   slopeTint: 0.5,
   contourInterval: 0.11,
   contourOpacity: 1,
@@ -1430,6 +1433,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     gradMid2Pos: () => terrain.rebuildRamp(params),
     bathyDeepColor: () => terrain.rebuildRamp(params),
     bathyShallowColor: () => terrain.rebuildRamp(params),
+    bathyCoastColor: () => terrain.rebuildRamp(params),
     // bathymetry: shading-only switch — terrain.js rebakes nothing (same
     // tiles, same chunk geometry always carries real GEBCO depth). Flips the
     // ramp canvas + uHeightRange/uSeaLevelY/uSeaSplit uniforms and nudges the

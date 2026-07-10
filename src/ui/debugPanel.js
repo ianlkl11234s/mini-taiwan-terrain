@@ -117,6 +117,7 @@ export function createDebugPanel(engine, hud2) {
   fMap.add(params, 'bathymetryVisible').name('bathymetry').onChange(set('bathymetryVisible'))
   fMap.addColor(params, 'bathyDeepColor').name('bathy: deep').onChange(set('bathyDeepColor'))
   fMap.addColor(params, 'bathyShallowColor').name('bathy: shallow').onChange(set('bathyShallowColor'))
+  fMap.addColor(params, 'bathyCoastColor').name('bathy: coast').onChange(set('bathyCoastColor'))
   fMap.add(params, 'slopeTint', 0, 1, 0.02).name('slope brown').onChange(set('slopeTint'))
   fMap.add(params, 'contourInterval', 0.04, 0.6, 0.01).name('contour interval').onChange(set('contourInterval'))
   fMap.add(params, 'contourOpacity', 0, 1, 0.02).name('contour opacity').onChange(set('contourOpacity'))

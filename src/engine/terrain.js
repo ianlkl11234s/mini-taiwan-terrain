@@ -687,6 +687,12 @@ if (uScanT >= 0.0) {
       const toRamp = (t) => SEA_RAMP_SPLIT + t * (1 - SEA_RAMP_SPLIT)
       grad.addColorStop(0, params.bathyDeepColor)
       grad.addColorStop(SEA_RAMP_SPLIT * 0.55, params.bathyShallowColor)
+      // coastal band: the fragment shader's depthT = (-depth/7000)^0.4 remap
+      // means rampT 0.9×SEA_RAMP_SPLIT is only ~-22 m (solve depthT=0.1) — a
+      // deliberately narrow sliver right next to the 0 m pin below, so this
+      // pale-green stop reads as a coastline ring, not a wash over the whole
+      // bathyShallowColor band further out to sea.
+      grad.addColorStop(SEA_RAMP_SPLIT * 0.9, params.bathyCoastColor)
       grad.addColorStop(SEA_RAMP_SPLIT, params.gradLow) // 0 m pin — shoreline hands off to the land ramp's own start color, so the seam is seamless
       grad.addColorStop(toRamp(THREE.MathUtils.clamp(params.gradMid1Pos, 0.01, 0.98)), params.gradMid1)
       grad.addColorStop(toRamp(THREE.MathUtils.clamp(params.gradMid2Pos, 0.02, 0.99)), params.gradMid2)

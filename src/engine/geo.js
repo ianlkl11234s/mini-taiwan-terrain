@@ -95,7 +95,7 @@ export class HeightField {
   constructor(projection, { maxTiles = 300 } = {}) {
     this.projection = projection
     this.zoom = projection.zoom
-    this.maxTiles = maxTiles // ~300 × 256² × 4B ≈ 75 MB ceiling
+    this.maxTiles = maxTiles // ~300 × 256² × 4B ≈ 75 MB ceiling; initial floor — see setMaxTiles
     // key "tx,ty" → { data: Float32Array | null, mean } — null = open sea (0 m).
     // Map insertion order doubles as the LRU order; ensureTiles re-inserts to touch.
     this.tiles = new Map()
@@ -227,10 +227,26 @@ export class HeightField {
     this.tiles.set(k, { data, mean })
     this._mtx = NaN
     this._mtile = null
+    this._evictToCap()
+  }
+
+  _evictToCap() {
     while (this.tiles.size > this.maxTiles) {
       this.tiles.delete(this.tiles.keys().next().value)
       this.stats.evicted++
     }
+  }
+
+  // Dynamic cap: chunks.js recomputes this from the actual desired chunk
+  // count every ~200ms recompute tick (view distance/fogFar/zoom all fold
+  // into that number already) and pushes it here — a fixed 300-tile cap was
+  // sized for the original streaming radius and started evicting tiles out
+  // from under still-visible chunks once View distance ~2.5× pushed the
+  // desired set past it (eviction/re-fetch thrash). Raising the cap never
+  // evicts; only shrinking it does.
+  setMaxTiles(n) {
+    this.maxTiles = n
+    this._evictToCap()
   }
 
   // Freeze the vertical datum off whatever is cached right now (the initial
