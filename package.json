@@ -9,7 +9,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mapbox/vector-tile": "^3.0.0",
     "lil-gui": "^0.20.0",
+    "pbf": "^5.1.2",
+    "pmtiles": "^4.4.1",
     "postprocessing": "^6.36.4",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

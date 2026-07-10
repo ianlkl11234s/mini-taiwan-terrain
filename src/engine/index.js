@@ -7,6 +7,7 @@ import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
+import { createOsmRoadsLayer } from './vectortiles.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
 import { makeProjection, HeightField, TAIWAN_BBOX, worldYScale, metersToWorldY } from './geo.js'
@@ -128,6 +129,16 @@ export const DEFAULT_PARAMS = {
   railVisible: false,
   railWidth: 2,
   railOpacity: 0.9,
+  // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
+  // — NOT a manifest-driven JSON fetch like rail/trails; the manager
+  // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
+  // osm_road_drive.pmtiles archive as the camera pans, only once switched on.
+  // Phase 1: one shared color/width for the whole road network (class-based
+  // style buckets are Phase 2).
+  osmRoadsVisible: false,
+  osmRoadsWidth: 1.5,
+  osmRoadsOpacity: 0.85,
+  osmRoadsColor: '#3a3a3a',
   // trails: manifest-driven deferred layer (public/layers/trails.json, fetched
   // on first trailsVisible:true), same fail-quiet pattern as rail. Every trail
   // shares one baked color (see polyline.js createTrailsLayer) so — unlike
@@ -397,6 +408,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       toFeet: toFeetFn,
       labelCenter: params.source === 'real' ? { x: controls.target.x, z: controls.target.z } : undefined,
       spots: stage.lodZoom >= 12, // P2: no spot elevations in far views
+      lodZoom: stage.lodZoom, // vectortiles.js VectorTileManager derives its MVT zoom from this
     }
   }
 
@@ -452,6 +464,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   })
   const labelsLayer = createLabelsLayer(params)
   const reservoirsLayer = createReservoirLayer(params)
+  const osmRoadsLayer = createOsmRoadsLayer(params, { invalidate })
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
   // whatever meta.group/subgroup it's registered with through to describe(),
@@ -478,6 +491,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     markers: { group: GROUP_BASE },
     rail: { group: GROUP_MOVE },
     stations: { group: GROUP_MOVE },
+    osm_roads: { group: GROUP_MOVE },
     rivers: { group: GROUP_WATER },
     reservoirs: { group: GROUP_WATER },
     // farmland tint + irrigation canals: agriculture, not hydrology — its own
@@ -500,6 +514,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     createCoastlineLayer(params),
     createCountiesLayer(params),
     createRailLayer(params),
+    osmRoadsLayer,
     createTrailsLayer(params),
     createRiversLayer(params),
     reservoirsLayer,
@@ -535,6 +550,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   chunkManager.onChunksChanged = () => {
     stage.shadowNeedsUpdate()
     invalidate() // a chunk appeared/vanished (incl. after DEM tiles finish loading)
+    osmRoadsLayer.markDemDirty() // coalesced redrape — see vectortiles.js VectorTileManager.markDemDirty
   }
 
   const cone = createCone()
@@ -1504,6 +1520,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     },
     railWidth: () => layers.get('rail').update(layerCtx()),
     railOpacity: () => layers.get('rail').update(layerCtx()),
+    // OSM roads: no deferred JSON fetch to kick — the PMTiles manager streams
+    // tiles itself once switched on (see vectortiles.js). update() just
+    // (re)applies the gate/style; the manager's own setEnabled starts/stops
+    // the per-frame tile streaming (layers.get('osm_roads').tickView).
+    osmRoadsVisible: () => layers.get('osm_roads').update(layerCtx()),
+    osmRoadsWidth: () => layers.get('osm_roads').update(layerCtx()),
+    osmRoadsOpacity: () => layers.get('osm_roads').update(layerCtx()),
+    osmRoadsColor: () => layers.get('osm_roads').update(layerCtx()),
     // trails: same deferred-fetch pattern as rail; unlike rail this one has a
     // color param (every trail shares one baked color, no per-line override)
     trailsVisible: (v) => {
