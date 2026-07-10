@@ -26,8 +26,26 @@ URL = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geo
 # window around Taiwan: Luzon(S) → Korea/Japan(N), China coast(W) → Honshu(E)
 BBOX = {"minLon": 116.0, "maxLon": 142.0, "minLat": 12.0, "maxLat": 41.0}
 MARGIN = 0.5              # keep points a touch outside so strokes reach the edge
-DP_TOL = 0.012           # Douglas-Peucker tolerance (degrees, ~1.3 km)
+DP_TOL = 0.012           # Douglas-Peucker tolerance cap (degrees, ~1.3 km) — used
+                         # as-is for big coastlines (China/Japan/Korea mainland)
 MIN_PTS = 2              # drop degenerate sub-lines shorter than this
+
+# A flat 1.3 km tolerance guts small islands: Penghu's outlying islets (a few
+# km across) have most of their own shape *inside* that tolerance, so DP strips
+# them down to a 4-9 point polygon whose long straight chords cut across the
+# real coastline — the "跨島雜散線段" artifact seen up close at those islets.
+# Scale tolerance to each ring's own bbox diagonal instead: big landmasses keep
+# hitting the DP_TOL cap (no size regression there), small islands get a much
+# finer tolerance so their shape survives simplification.
+TOL_FRACTION = 0.015     # tolerance ≈ 1.5% of the ring's bbox diagonal
+TOL_FLOOR = 0.0008       # degrees (~90 m) — avoid keeping every point of tiny dots
+
+
+def ring_tolerance(pts):
+    lons = [p[0] for p in pts]
+    lats = [p[1] for p in pts]
+    diag = math.hypot(max(lons) - min(lons), max(lats) - min(lats))
+    return max(TOL_FLOOR, min(DP_TOL, diag * TOL_FRACTION))
 
 
 def fetch():
@@ -112,7 +130,8 @@ def main():
             for run in clip(part):
                 if len(run) < MIN_PTS:
                     continue
-                simp = simplify([[round(x, 4), round(y, 4)] for x, y in run], DP_TOL)
+                pts = [[round(x, 4), round(y, 4)] for x, y in run]
+                simp = simplify(pts, ring_tolerance(pts))
                 if len(simp) >= MIN_PTS:
                     lines.append(simp)
                     pts_out += len(simp)
