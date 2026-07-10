@@ -91,6 +91,16 @@ export const DEFAULT_PARAMS = {
   gradHigh: '#ffa861',
   gradMid1Pos: 0.35,
   gradMid2Pos: 0.36,
+  // bathymetry: z10-13 tiles always carry real GEBCO depth now (see
+  // docs/BATHYMETRY_DESIGN.md) — this toggle only switches SHADING (ramp +
+  // uHeightRange/uSeaLevelY/uSeaSplit + the region sea plane's opacity, see
+  // terrain.js applyBathymetryShading / index.js's bathymetryVisible HANDLER).
+  // No re-fetch, no chunk rebuild. Default off keeps land rendering
+  // bit-identical to before; open ocean now shows subtle (white-shaded)
+  // seafloor relief since depth is baked into the mesh itself.
+  bathymetryVisible: false,
+  bathyDeepColor: '#0b1f36',
+  bathyShallowColor: '#4a90c2',
   slopeTint: 0.5,
   contourInterval: 0.11,
   contourOpacity: 1,
@@ -150,6 +160,10 @@ export const DEFAULT_PARAMS = {
   // Deferred: public/layers/region_coast.json fetched on first switch-on.
   regionVisible: false,
   regionSeaColor: '#c2e0ff', // light blue sea (user default, RGB 194 224 255)
+  // opaque by default so bathymetry-off matches the app's pre-bathymetry
+  // look; the bathymetryVisible HANDLER drops this to 0.5 while seafloor
+  // shading is on, so the semi-transparent plane reveals the relief beneath
+  // it (see docs/BATHYMETRY_DESIGN.md §2.5).
   regionSeaOpacity: 1.0,
   regionLineColor: '#303030', // dark-grey coastline (user default, RGB 48 48 48)
   regionLineWidth: 1.3,
@@ -1258,6 +1272,19 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     gradHigh: () => terrain.rebuildRamp(params),
     gradMid1Pos: () => terrain.rebuildRamp(params),
     gradMid2Pos: () => terrain.rebuildRamp(params),
+    bathyDeepColor: () => terrain.rebuildRamp(params),
+    bathyShallowColor: () => terrain.rebuildRamp(params),
+    // bathymetry: shading-only switch — terrain.js rebakes nothing (same
+    // tiles, same chunk geometry always carries real GEBCO depth). Flips the
+    // ramp canvas + uHeightRange/uSeaLevelY/uSeaSplit uniforms and nudges the
+    // region sea-plane's opacity so it hides (off) or reveals (on) the
+    // seafloor relief beyond the coastline. No chunk rebuild, no re-fetch.
+    bathymetryVisible: (v) => {
+      terrain.applyBathymetryShading(params)
+      params.regionSeaOpacity = v ? 0.5 : 1.0
+      layers.get('region').update(layerCtx())
+      emit('layers') // refresh the Region panel's opacity slider to the new value
+    },
     peakLimit: () => regenerateHud(),
     peakMinElev: () => regenerateHud(),
     peakRadiusKm: () => regenerateHud(),

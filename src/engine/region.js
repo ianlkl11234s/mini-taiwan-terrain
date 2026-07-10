@@ -23,12 +23,16 @@ import { metersToWorldY, zFightLift } from './geo.js'
 // Mercator inflation up north — fine for a context map).
 
 const SEA_SIZE = 12000 // world units — covers the whole region from the origin
-// Sea plane height: a few metres above sea, only to clear the 0 m DEM ocean
-// (NODATA→0) so the near sea reads blue instead of white. Land is NOT excluded
-// by height — low plains would flood / z-fight — it is cut out by a land/sea
-// MASK (region_sea_mask.png, from the exact Taiwan coastline ring) the plane
-// samples as an alphaMap: mask sea=255 → drawn, land=0 → alphaTest discards it.
-const SEA_PLANE_M = 3.0
+// Sea plane height: sits AT sea level (0 m). Previously offset a few metres up
+// to clear the 0 m DEM "sea" (NODATA→0) so the near sea read blue instead of
+// white; now that real GEBCO bathymetry is baked into the mesh (see
+// docs/BATHYMETRY_DESIGN.md), the terrain itself dips below 0 m, so hugging
+// the true sea level reads as a proper water surface instead of a floating
+// slab. Land is NOT excluded by height — low plains would flood / z-fight —
+// it is cut out by a land/sea MASK (region_sea_mask.png, from the exact
+// Taiwan coastline ring) the plane samples as an alphaMap: mask sea=255 →
+// drawn, land=0 → alphaTest discards it.
+const SEA_PLANE_M = 0
 // Both offsets below are additional anti-z-fight LIFTS on top of SEA_PLANE_M
 // (world units, fogScale-scaled per geo.zFightLift — same helper water.js and
 // polyline.js use). This is the piece the fixed 3 m elevation offset above was
@@ -52,14 +56,17 @@ export function createRegionLayer(params) {
     depthWrite: false,
     fog: true,
     alphaTest: 0.5, // mask land (0) is discarded; the alphaMap is set by setMask
-    // the DEM renders the ocean (elevation 0) as a flat white "sea" mesh a few
-    // metres below this plane; at far/grazing views the two are near-coplanar and
-    // z-fight into horizontal streaks. polygonOffset pulls the plane's depth
-    // toward the camera so it wins cleanly (land is still cut out by the mask, so
-    // this never paints over terrain).
+    // at far/grazing views this plane and the terrain's own (now bathymetric,
+    // no longer flat) "sea" mesh can still read as near-coplanar right at the
+    // coastline and z-fight into horizontal streaks. polygonOffset pulls the
+    // plane's depth toward the camera so it wins cleanly (land is still cut
+    // out by the mask, so this never paints over terrain). Relaxed from -4 to
+    // -1 now that the real seafloor actually dips below 0 m instead of
+    // sitting flat at the same depth as this plane — less separation is
+    // needed to avoid the fight.
     polygonOffset: true,
-    polygonOffsetFactor: -4,
-    polygonOffsetUnits: -4,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1,
   })
   const seaGeo = new THREE.PlaneGeometry(SEA_SIZE, SEA_SIZE, 1, 1)
   seaGeo.rotateX(-Math.PI / 2) // lie flat, normal +Y

@@ -24,7 +24,12 @@ export const TAIWAN_BBOX = { minLon: 119.2, maxLon: 122.1, minLat: 21.8, maxLat:
 // Fixed island-wide elevation range: the hypsometric ramp and vertex tint must
 // normalize against ONE range or chunks built at different times would color
 // differently (a visible seam). Sea level → Yushan.
-const TAIWAN_MIN_M = 0
+// GEBCO 2025 bathymetry (baked into the tiles alongside the NLSC land DTM —
+// see docs/BATHYMETRY_DESIGN.md §1): the Taiwan bbox bottoms out ~-6788 m
+// (measured). -7000 gives a safety margin so bilinear resampling across tile
+// borders can never dip below the encoded floor (avoids the hn<0 →
+// pow(negative) NaN case terrain.js used to clamp against — see addChunk).
+const TAIWAN_SEA_MIN_M = -7000
 const TAIWAN_MAX_M = 3952
 
 const lonToTileX = (lon, n) => Math.floor(((lon + 180) / 360) * n)
@@ -96,7 +101,11 @@ export class HeightField {
     this.tiles = new Map()
     this.pending = new Map() // key → in-flight fetch promise (dedupes requests)
     this.datumM = 0 // vertical datum (meters), frozen once at initial load
-    this.minM = TAIWAN_MIN_M
+    // fixed island-wide range for hypsometric tint/ramp normalization — always
+    // spans the full sea-floor-to-summit domain now that tiles always carry
+    // real GEBCO depth (terrain.js's bathymetry toggle switches SHADING only,
+    // never this; see terrain.js applyBathymetryShading)
+    this.minM = TAIWAN_SEA_MIN_M
     this.maxM = TAIWAN_MAX_M
     this.stats = { fetched: 0, sea: 0, hit: 0, miss: 0, evicted: 0 }
     const n = 2 ** this.zoom
