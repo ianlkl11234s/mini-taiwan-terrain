@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js'
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
-import { metersToWorldY } from './geo.js'
+import { metersToWorldY, zFightLift } from './geo.js'
 
 // Regional context layer: the neighbouring coastlines (Taiwan's outlying islands,
 // N Philippines, the Ryukyus, S Japan, S Korea, SE China) as flat sea-level
@@ -29,7 +29,16 @@ const SEA_SIZE = 12000 // world units — covers the whole region from the origi
 // MASK (region_sea_mask.png, from the exact Taiwan coastline ring) the plane
 // samples as an alphaMap: mask sea=255 → drawn, land=0 → alphaTest discards it.
 const SEA_PLANE_M = 3.0
-const LINE_LIFT = 0.03 // coastlines float a hair above the sea plane
+// Both offsets below are additional anti-z-fight LIFTS on top of SEA_PLANE_M
+// (world units, fogScale-scaled per geo.zFightLift — same helper water.js and
+// polyline.js use). This is the piece the fixed 3 m elevation offset above was
+// missing: at far/grazing views the depth buffer loses precision, so a lift
+// that stays constant regardless of camera distance eventually falls below it
+// and the sea plane streaks through the DEM's flat 0 m "sea" mesh. Scaling
+// linearly with fogScale (like every other overlay layer) keeps it clear of
+// that floor while staying sub-pixel up close, so the near view is unchanged.
+const SEA_LIFT_BASE = 0.06 // matches water.js's reservoir-sheet magnitude — same DEM "sea" mesh it fights
+const LINE_LIFT_BASE = 0.03 // coastlines float a hair above the sea plane's own lift
 
 export function createRegionLayer(params) {
   const group = new THREE.Group()
@@ -79,6 +88,8 @@ export function createRegionLayer(params) {
   let maskBbox = null // {minLon,maxLon,minLat,maxLat} of the land/sea mask
   let maskReady = false
   let uvSet = false // sea-plane UVs mapped to the mask (needs the projection)
+  let seaLift = SEA_LIFT_BASE
+  let lineLift = LINE_LIFT_BASE
 
   function gate() {
     return params.source === 'real' && !!hf && params.regionVisible
@@ -129,8 +140,8 @@ export function createRegionLayer(params) {
   function placeVertical() {
     if (!hf) return
     const y = metersToWorldY(hf, SEA_PLANE_M, params.demExaggeration)
-    sea.position.y = y
-    lines.position.y = y + LINE_LIFT
+    sea.position.y = y + seaLift
+    lines.position.y = y + seaLift + lineLift
   }
 
   function applyStyle() {
@@ -187,6 +198,19 @@ export function createRegionLayer(params) {
       sea.visible = show && maskReady
       lines.visible = show && built
       group.visible = show
+    },
+
+    // per-frame (from the tick, alongside the other fogScale consumers — see
+    // water.js / polyline.js): recompute the anti-z-fight lifts as the camera
+    // dollies out so they stay above the depth-buffer precision floor at the
+    // far/grazing views this layer is meant for.
+    tickView(ctx) {
+      const nextSea = zFightLift(SEA_LIFT_BASE, ctx.fogScale)
+      const nextLine = zFightLift(LINE_LIFT_BASE, ctx.fogScale)
+      if (nextSea === seaLift && nextLine === lineLift) return
+      seaLift = nextSea
+      lineLift = nextLine
+      placeVertical()
     },
 
     // deferred land/sea mask: sea=255 / land=0, sampled as the sea plane's
