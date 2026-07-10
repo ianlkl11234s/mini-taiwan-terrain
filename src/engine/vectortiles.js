@@ -1,45 +1,60 @@
 import * as THREE from 'three'
 import { PMTiles } from 'pmtiles'
-import { VectorTile } from '@mapbox/vector-tile'
+import { VectorTile, classifyRings } from '@mapbox/vector-tile'
 import { PbfReader } from 'pbf'
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js'
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 import { makeProjection, metersToWorldY, zFightLift } from './geo.js'
 
-// ⑥ PMTiles vector-tile subsystem, Phase 1 (docs/VECTOR_TILES_DESIGN.md). A
-// parallel streaming manager modeled on chunks.js's desired-set/LRU/build-
-// budget recipe, but standing OUTSIDE the terrain ChunkManager (different
-// zoom range, different mesh type, different lifecycle) — see design §0.
+// ⑥ PMTiles vector-tile subsystem (docs/VECTOR_TILES_DESIGN.md). A parallel
+// streaming manager modeled on chunks.js's desired-set/LRU/build-budget
+// recipe, but standing OUTSIDE the terrain ChunkManager (different zoom
+// range, different mesh type, different lifecycle) — see design §0.
 //
 // Pipeline per tile: PMTiles#getZxy (Range-fetch + auto gzip-decompress —
 // confirmed by reading pmtiles' own getZxyAttempt: it always calls
 // this.decompress(bytes, header.tileCompression) before resolving, so the
 // ArrayBuffer handed back here is ALREADY inflated; no manual gunzip needed)
-// → VectorTile(PbfReader) → per-LineString-feature loadGeometry() (extent
-// 4096, tile-pixel space, origin top-left, y increases toward the tile's
-// SOUTH edge — the SAME direction world Z increases in this engine's
-// coordinate system per geo.js's "+Z south (matches XYZ tile y)", so no
-// explicit axis flip is needed to place a LINE vertex; a flip only matters
-// for polygon winding, which is a Phase 3 (面) concern) → world xz via
-// linear interpolation across the tile's four corners (design §3: a single
-// small MVT tile's Mercator nonlinearity is sub-meter, cheaper than a
-// per-vertex trig round trip) → vertex elevation via heightField.heightAtWorld
-// (gated behind heightField.ensureTiles(footprint) so a build never bakes a
-// too-early 0 m/sea-level guess — the "未載 DEM 區不沉海" lesson from
-// BATHYMETRY/chunks work) → metersToWorldY.
+// → VectorTile(PbfReader) → per-feature loadGeometry() (extent 4096,
+// tile-pixel space, origin top-left, y increases toward the tile's SOUTH
+// edge — the SAME direction world Z increases in this engine's coordinate
+// system per geo.js's "+Z south (matches XYZ tile y)", so no explicit axis
+// flip is needed to place a vertex, for LINEs or POLYGONs alike — see the
+// Phase 3 section below for what the winding trap actually is, since it is
+// NOT a position/axis-flip issue) → world xz via linear interpolation
+// across the tile's four corners (design §3: a single small MVT tile's
+// Mercator nonlinearity is sub-meter, cheaper than a per-vertex trig round
+// trip) → vertex elevation via heightField.heightAtWorld (gated behind
+// heightField.ensureTiles(footprint) so a build never bakes a too-early 0 m/
+// sea-level guess — the "未載 DEM 區不沉海" lesson from BATHYMETRY/chunks
+// work) → metersToWorldY.
+//
+// Two concrete managers share ONE generic VectorTileManager below via
+// composition (constructor-injected per-geometry-kind hooks), not copy-
+// pasted per-kind classes: createOsmRoadsLayer (Phase 1/2, LINE geometry,
+// up to 3 width-class bucket meshes per tile) and createFtwFieldsLayer
+// (Phase 3, POLYGON geometry, 1 fill mesh per tile). Every "meshKeys"-keyed
+// bucket a tile actually has data for gets its own materialized mesh
+// ("先空後填" — a bucket with no data just never gets a mesh); everything
+// else (fetch/decode dispatch, DEM-gated draping, the recompute/LRU/queue
+// desired-set logic, redrape-on-exaggeration-change, pick dispatch, dispose)
+// is 100% shared in the base class.
 
-const RECOMPUTE_INTERVAL = 0.3 // a bit coarser than chunks.js's terrain 0.2 — road geometry changes less
+const RECOMPUTE_INTERVAL = 0.3 // a bit coarser than chunks.js's terrain 0.2 — road/field geometry changes less
 const MAX_FETCH_GROUPS = 4 // concurrent tile fetch+decode+drape jobs
 const MAX_BUILDS_PER_TICK = 2 // per design §3 — mirrors chunks.js
 const BUILD_BUDGET_MS = 12
 const UNLOAD_FACTOR = 1.3
-const MIN_VZ_FALLBACK = 6 // used until the archive header resolves (design confirms 6-14 for osm_road_drive)
+const MIN_VZ_FALLBACK = 6 // used until the archive header resolves (design confirms 6-14 for osm_road_drive; ftw_fields_2025 is 5-14)
 const MAX_VZ_FALLBACK = 14
 const HARD_TILE_CAP = 150 // defensive ceiling on one recompute's desired set, independent of the ~30-60 design target
 const LINESTRING_TYPE = 2 // VectorTileFeature.types[2] === 'LineString'
+const POLYGON_TYPE = 3 // VectorTileFeature.types[3] === 'Polygon'
 
 const keyOf = (vz, tx, ty) => vz + '/' + tx + '/' + ty
+
+// ==================================================================== roads (Phase 1/2)
 
 // §4 — highway class → width bucket + baked vertex color. Every LineString
 // feature's `properties.highway` tag looks itself up here; anything unlisted
@@ -125,6 +140,318 @@ function roadPickResult(feat, worldPos) {
   return { title: name, rows, worldPos }
 }
 
+// per-tile road decode: walks every LineString feature, bucketing by highway
+// class as it goes. bucketXZ/bucketRGB/bucketFeat are parallel, per-bucket
+// flat arrays (segment pairs / baked vertex colors / feature-index-per-
+// segment). `features` holds one {name,ref,highway,lanes} record per
+// LineString (not per segment) — bucketFeat stores the INDEX into it, so
+// pick() can map a raycast faceIndex all the way back to OSM tags. Returns
+// null (→ tile treated as "empty") if the tile has no LineString features
+// this layer cares about.
+function decodeRoadLayer(layer, { proj, center, hf }) {
+  const features = []
+  const bucketXZ = { major: [], mid: [], minor: [] }
+  const bucketRGB = { major: [], mid: [], minor: [] }
+  const bucketFeat = { major: [], mid: [], minor: [] }
+  for (let i = 0; i < layer.length; i++) {
+    const feature = layer.feature(i)
+    if (feature.type !== LINESTRING_TYPE) continue
+    const props = feature.properties || {}
+    const style = classifyRoad(props.highway)
+    const rgb = roadRGB(style.color)
+    const featIdx = features.length
+    features.push({ name: props.name, ref: props.ref, highway: props.highway, lanes: props.lanes })
+    const extent = feature.extent
+    const s = proj.tileWorldSize / extent
+    const parts = feature.loadGeometry()
+    const xzArr = bucketXZ[style.bucket]
+    const rgbArr = bucketRGB[style.bucket]
+    const featArr = bucketFeat[style.bucket]
+    for (const part of parts) {
+      for (let j = 0; j < part.length - 1; j++) {
+        const p0 = part[j]
+        const p1 = part[j + 1]
+        xzArr.push(
+          center.x + (p0.x - extent / 2) * s,
+          center.z + (p0.y - extent / 2) * s,
+          center.x + (p1.x - extent / 2) * s,
+          center.z + (p1.y - extent / 2) * s
+        )
+        rgbArr.push(rgb.r, rgb.g, rgb.b, rgb.r, rgb.g, rgb.b)
+        featArr.push(featIdx)
+      }
+    }
+  }
+
+  const buckets = {}
+  let any = false
+  for (const id of BUCKET_ORDER) {
+    const xz = bucketXZ[id]
+    const nSeg = xz.length / 4
+    if (!nSeg) continue // "先空後填" — a bucket a tile has none of just gets no mesh, never an empty one
+    any = true
+    const seg = new Float32Array(nSeg * 6)
+    const elev = new Float32Array(nSeg * 2)
+    for (let s = 0; s < nSeg; s++) {
+      const x0 = xz[s * 4]
+      const z0 = xz[s * 4 + 1]
+      const x1 = xz[s * 4 + 2]
+      const z1 = xz[s * 4 + 3]
+      seg[s * 6] = x0
+      seg[s * 6 + 2] = z0
+      seg[s * 6 + 3] = x1
+      seg[s * 6 + 5] = z1
+      elev[s * 2] = hf ? hf.heightAtWorld(x0, z0) : 0
+      elev[s * 2 + 1] = hf ? hf.heightAtWorld(x1, z1) : 0
+    }
+    buckets[id] = {
+      seg,
+      elev,
+      col: new Float32Array(bucketRGB[id]),
+      segFeature: new Int32Array(bucketFeat[id]),
+      nSeg,
+    }
+  }
+  return any ? { buckets, features } : null
+}
+
+// materialize one road bucket: apply the current vertical scale (a tile must
+// land already-scaled; redrape only revisits this on a later change), then
+// build the fat-line geometry/mesh. `material` is the bucket's shared
+// LineMaterial (one per bucket across every tile, not per tile — see
+// createOsmRoadsLayer).
+function buildRoadMesh(material, bd, hf, exaggeration) {
+  if (hf) {
+    for (let s = 0; s < bd.nSeg; s++) {
+      bd.seg[s * 6 + 1] = metersToWorldY(hf, bd.elev[s * 2], exaggeration)
+      bd.seg[s * 6 + 4] = metersToWorldY(hf, bd.elev[s * 2 + 1], exaggeration)
+    }
+  }
+  const geo = new LineSegmentsGeometry()
+  geo.setPositions(bd.seg)
+  geo.setColors(bd.col)
+  const mesh = new LineSegments2(geo, material)
+  // §5 pick: stash this mesh's own segment→feature lookup directly on the
+  // THREE object so pick() needs no separate mesh→tile reverse index.
+  mesh.userData.segFeature = bd.segFeature
+  return mesh
+}
+
+// in-place y rewrite for a live road bucket — no geometry rebuild, matching
+// polyline.js applyVertical (design §3/§6). Runs on an exaggeration change or
+// a DEM-coverage dirty flag, never per-frame.
+function redrapeRoadBucket(bd, mesh, heightField, exaggeration) {
+  for (let s = 0; s < bd.nSeg; s++) {
+    const x0 = bd.seg[s * 6]
+    const z0 = bd.seg[s * 6 + 2]
+    const x1 = bd.seg[s * 6 + 3]
+    const z1 = bd.seg[s * 6 + 5]
+    bd.elev[s * 2] = heightField.heightAtWorld(x0, z0)
+    bd.elev[s * 2 + 1] = heightField.heightAtWorld(x1, z1)
+    bd.seg[s * 6 + 1] = metersToWorldY(heightField, bd.elev[s * 2], exaggeration)
+    bd.seg[s * 6 + 4] = metersToWorldY(heightField, bd.elev[s * 2 + 1], exaggeration)
+  }
+  mesh.geometry.attributes.instanceStart.data.needsUpdate = true
+  mesh.geometry.computeBoundingBox()
+  mesh.geometry.computeBoundingSphere()
+}
+
+function resolveRoadHit(hit) {
+  const segFeature = hit.object.userData.segFeature
+  const features = hit.object.userData.features
+  if (!segFeature || !features) return null
+  const feat = features[segFeature[hit.faceIndex]]
+  if (!feat) return null
+  return roadPickResult(feat, hit.point.clone())
+}
+
+// width/opacity stay valid as GLOBAL multipliers under bucketing (design §7
+// Phase 2) — width is scaled by each bucket's fixed BUCKET_WIDTH_RATIO,
+// opacity applies uniformly. Color is not a param here: it's baked
+// per-class into vertexColors (see ROAD_STYLE), same as rail's official
+// per-line colors in polyline.js.
+function applyRoadStyle(materials, { width, opacity } = {}) {
+  for (const id of BUCKET_ORDER) {
+    const mat = materials[id]
+    if (width !== undefined) mat.linewidth = width * BUCKET_WIDTH_RATIO[id]
+    if (opacity !== undefined) mat.opacity = opacity
+  }
+}
+
+// ==================================================================== fields (Phase 3)
+
+// §3/§7 Phase 3 — farmland parcel polygons. THE WINDING TRAP, verified against
+// the actual library internals (see scripts/test_polygon_winding.mjs, which
+// runs this exact reasoning as a standalone node script before any of this
+// touched real tile data):
+//
+//   1. feature.loadGeometry() hands back a FLAT list of rings for a Polygon/
+//      MultiPolygon feature — no exterior/hole grouping. A naive "ring[0] =
+//      contour, every other ring = a hole" assumption silently corrupts the
+//      mesh the moment a feature has more than one exterior ring (a
+//      MultiPolygon — plausible for a tile-clipped or genuinely multi-part
+//      parcel): a disjoint second part gets treated as a "hole" of the
+//      first, which either drops it (Earcut can't bridge to a hole outside
+//      the contour's bounds) or produces garbage triangles.
+//   2. The fix is `@mapbox/vector-tile`'s own EXPORTED classifyRings(rings)
+//      helper (the same one it uses internally for toGeoJSON) — it groups
+//      rings into polygons by comparing each ring's signed-area SIGN against
+//      the first ring's (same sign = a new exterior/polygon-part, opposite
+//      sign = a hole of the current one). This is sign-RELATIVE: it needs no
+//      knowledge of MVT's absolute CW/CCW convention.
+//   3. Once rings are correctly grouped, THREE.ShapeUtils.triangulateShape
+//      (-> Earcut.triangulate) is itself winding-AGNOSTIC: Earcut's
+//      linkedList() re-derives each ring's traversal direction from that
+//      ring's OWN signed-area sign, independently for the contour and for
+//      each hole (see node_modules/three/src/extras/Earcut.js). So no manual
+//      y-flip or winding-reversal step is needed before calling it — test 2
+//      in the unit test proves this by feeding a hole with the SAME winding
+//      as its contour and confirming it still subtracts correctly.
+//
+// Net effect: the only real production code this trap requires is the
+// classifyRings() call below — NOT a manual axis flip (positions map the
+// same y-down-tile → +Z-south way lines already do, per this file's header
+// comment) and NOT a manual winding reversal.
+const FIELDS_MESH_KEYS = ['fill']
+const FTW_FILL_COLOR = '#c9b063'
+// lower than OSM_ROADS_LIFT_BASE (0.05) and polyline.js's RIVER_SURFACE_LIFT_BASE
+// (0.04) — fields sit closer to the terrain skin than roads/rivers so the
+// semi-transparent fill never visually buries a road/rail line drawn on top
+const FTW_FIELDS_LIFT_BASE = 0.02
+// must draw BEFORE roads/rail/trails, whose LineSegments2/Line2 meshes carry
+// no explicit renderOrder (default 0) — a negative value here guarantees the
+// fill composites underneath them regardless of camera angle, satisfying
+// design §7 Phase 3's "terrain < ftw < draped lines < labels" draw order
+// without having to touch any other layer's code
+const FTW_FIELDS_RENDER_ORDER = -1
+
+// per-tile field decode: walks every Polygon feature, classifies its rings
+// into polygon parts (exterior + holes) via classifyRings, triangulates each
+// part, and concatenates every part's vertices/triangles into ONE shared
+// position/index buffer for the whole tile (one draw call per tile, same
+// "merge everything into one BufferGeometry" pattern as polyline.js's river
+// surfaces). faceFeature carries one feature-index entry PER TRIANGLE
+// (parallel to roads' per-segment segFeature) so pick() can map a raycast
+// faceIndex back to {field_id, area_ha, confidence_mean}. Returns null (→
+// tile treated as "empty") if the tile contributes no triangles.
+function decodeFieldLayer(layer, { proj, center, hf }) {
+  const features = []
+  const pos = []
+  const elev = []
+  const idx = []
+  const faceFeature = []
+  for (let i = 0; i < layer.length; i++) {
+    const feature = layer.feature(i)
+    if (feature.type !== POLYGON_TYPE) continue
+    const rings = feature.loadGeometry()
+    const polygons = classifyRings(rings) // [[ext, hole, hole...], [ext2, ...], ...] — see comment block above
+    if (!polygons.length) continue
+    const props = feature.properties || {}
+    const extent = feature.extent
+    const s = proj.tileWorldSize / extent
+    const toVec2 = (ring) =>
+      ring.map((p) => new THREE.Vector2(center.x + (p.x - extent / 2) * s, center.z + (p.y - extent / 2) * s))
+    const featIdx = features.length
+    let usedThisFeature = false
+    for (const group of polygons) {
+      const contour = toVec2(group[0])
+      if (contour.length < 3) continue
+      const holes = group.slice(1).map(toVec2)
+      let faces
+      try {
+        faces = THREE.ShapeUtils.triangulateShape(contour, holes)
+      } catch (err) {
+        continue // malformed part (degenerate/self-intersecting ring) — skip it, never crash the whole tile build
+      }
+      if (!faces.length) continue
+      const base = pos.length / 3
+      const flat = [...contour, ...holes.flat()]
+      for (const v of flat) {
+        pos.push(v.x, 0, v.y) // v.y holds world Z (Vector2 reused as (worldX, worldZ), matching water.js/river_surfaces' own convention) — y filled in by buildFieldMesh/redrapeFieldBucket
+        elev.push(hf ? hf.heightAtWorld(v.x, v.y) : 0)
+      }
+      for (const f of faces) {
+        idx.push(base + f[0], base + f[1], base + f[2])
+        faceFeature.push(featIdx)
+      }
+      usedThisFeature = true
+    }
+    if (usedThisFeature) {
+      features.push({ field_id: props.field_id, area_ha: props.area_ha, confidence_mean: props.confidence_mean })
+    }
+  }
+  if (!idx.length) return null
+  return {
+    buckets: {
+      fill: {
+        pos: new Float32Array(pos),
+        elev: new Float32Array(elev),
+        idx, // plain array — BufferGeometry.setIndex auto-picks Uint16/Uint32 (same as polyline.js river surfaces)
+        faceFeature: new Int32Array(faceFeature),
+        nVerts: pos.length / 3,
+      },
+    },
+    features,
+  }
+}
+
+function buildFieldMesh(material, bd, hf, exaggeration) {
+  if (hf) {
+    for (let i = 0; i < bd.nVerts; i++) bd.pos[i * 3 + 1] = metersToWorldY(hf, bd.elev[i], exaggeration)
+  }
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.BufferAttribute(bd.pos, 3))
+  geo.setIndex(bd.idx)
+  const mesh = new THREE.Mesh(geo, material)
+  mesh.userData.faceFeature = bd.faceFeature
+  mesh.renderOrder = FTW_FIELDS_RENDER_ORDER
+  return mesh
+}
+
+function redrapeFieldBucket(bd, mesh, heightField, exaggeration) {
+  const pos = bd.pos
+  for (let i = 0; i < bd.nVerts; i++) {
+    const x = pos[i * 3]
+    const z = pos[i * 3 + 2]
+    bd.elev[i] = heightField.heightAtWorld(x, z)
+    pos[i * 3 + 1] = metersToWorldY(heightField, bd.elev[i], exaggeration)
+  }
+  mesh.geometry.attributes.position.needsUpdate = true
+  mesh.geometry.computeBoundingBox()
+  mesh.geometry.computeBoundingSphere()
+}
+
+const fmtArea = (ha) => (typeof ha === 'number' ? `${ha.toFixed(2)} ha` : '—')
+const fmtConfidence = (c) => (typeof c === 'number' ? c.toFixed(2) : '—')
+
+function fieldPickResult(feat, worldPos) {
+  const title = feat.field_id != null ? `農田 Field ${feat.field_id}` : '農田 Field'
+  const rows = [
+    ['田區 Field ID', feat.field_id != null ? String(feat.field_id) : '—'],
+    ['面積 Area', fmtArea(feat.area_ha)],
+    ['信心 Confidence', fmtConfidence(feat.confidence_mean)],
+  ]
+  return { title, rows, worldPos }
+}
+
+function resolveFieldHit(hit) {
+  const faceFeature = hit.object.userData.faceFeature
+  const features = hit.object.userData.features
+  if (!faceFeature || !features) return null
+  const feat = features[faceFeature[hit.faceIndex]]
+  if (!feat) return null
+  return fieldPickResult(feat, hit.point.clone())
+}
+
+// no color/width param — fill color is a fixed style choice (design §4); only
+// 濃度 (opacity/density) is user-adjustable, same slider-only convention as
+// riverSimOpacity/farmOpacity for the other whole-island tint layers.
+function applyFieldStyle(materials, { opacity } = {}) {
+  if (opacity !== undefined) materials.fill.opacity = opacity
+}
+
+// ==================================================================== shared tile-stream manager
+
 // DEM tile footprint (heightField's own fixed zoom) covering a world-space
 // bbox, with a 1-tile margin for heightAtWorld's cross-border bilinear taps —
 // same shape as index.js's ensureTourDisk/ensureTourTiles helpers, kept local
@@ -144,36 +471,50 @@ function demFootprint(heightField, minX, maxX, minZ, maxZ) {
   return coords
 }
 
+// Generic PMTiles-backed streaming manager (design §0/§3): desired-set
+// recompute + LRU + throttled build pump, shared by BOTH the line (roads)
+// and polygon (fields) overlays via constructor-injected per-geometry-kind
+// hooks instead of two copy-pasted ~500-line classes:
+//   meshKeys        — the full set of possible per-tile bucket ids (roads:
+//                      ['major','mid','minor']; fields: ['fill']). A tile
+//                      only ever materializes a mesh for a key it actually
+//                      has data for ("先空後填").
+//   materials       — {key: THREE.Material}, one shared material PER KEY
+//                      across every tile (not per tile) — bucketing costs at
+//                      most meshKeys.length draw calls per tile, not one per
+//                      distinct feature class.
+//   decodeLayer(layer, {proj, center, hf}) — turns a decoded VectorTile
+//                      layer into { buckets: {key: bucketData}, features }
+//                      or null (tile contributes nothing this layer cares
+//                      about). Owns all elevation sampling (hf.heightAtWorld)
+//                      at fetch time.
+//   buildMesh(key, bucketData, hf, exaggeration) — materializes one bucket's
+//                      THREE object (already vertically scaled).
+//   redrapeBucket(bucketData, mesh, heightField, exaggeration) — in-place y
+//                      rewrite on an exaggeration/DEM-coverage change, no
+//                      geometry rebuild (mirrors polyline.js applyVertical).
+//   resolveHit(hit)  — maps one raycaster hit to a pick() result, or null.
+//   applyStyle(materials, patch) — setStyle()'s per-kind style application.
 export class VectorTileManager {
-  constructor({ url, layerName }) {
+  constructor({ url, layerName, meshKeys, materials, decodeLayer, buildMesh, redrapeBucket, resolveHit, applyStyle }) {
     this.pmtiles = new PMTiles(url)
     this.layerName = layerName
     this.group = new THREE.Group()
-    // §4 — one shared LineMaterial PER WIDTH BUCKET (not per tile, not per
-    // class): every tile's 'major' mesh reuses the same material object, so
-    // bucketing costs at most 3x Phase 1's draw calls (one LineSegments2 per
-    // non-empty bucket per tile), not 3x per distinct highway class. Color
-    // rides in vertexColors (baked per-class, see ROAD_STYLE/roadRGB below) —
-    // material.color stays the neutral white multiplier, same pattern as
-    // polyline.js's rail layer.
-    this.materials = {}
-    for (const id of BUCKET_ORDER) {
-      this.materials[id] = new LineMaterial({
-        color: 0xffffff,
-        vertexColors: true,
-        linewidth: 1.5 * BUCKET_WIDTH_RATIO[id],
-        transparent: true,
-        opacity: 0.85,
-        fog: true,
-      })
-    }
+    this.meshKeys = meshKeys
+    this.materials = materials
+    this._decodeLayer = decodeLayer
+    this._buildMesh = buildMesh
+    this._redrapeBucket = redrapeBucket
+    this._resolveHit = resolveHit
+    this._applyStyleHook = applyStyle
     this.enabled = false
-    this.tiles = new Map() // key -> { meshes: {major?,mid?,minor?}, buckets: {major?,mid?,minor?}, cx, cz } — see _fetchAndDecode/_materialize
+    this.tiles = new Map() // key -> { meshes: {key?:mesh}, buckets: {key?:bucketData}, cx, cz }
     this.queue = [] // [{ vz, tx, ty, k, d2, state }]
     this.queued = new Map()
     this._acc = RECOMPUTE_INTERVAL
     this._lastVz = null
-    this._projCache = new Map() // vz -> projection (anchor frozen for the session — see geo.js "one world")
+    this._projCache = new Map() // vz -> projection, all sharing this._anchor
+    this._anchor = null // { lat, lon } — see update()'s anchor-resolution comment
     this._sourceZoom = { min: MIN_VZ_FALLBACK, max: MAX_VZ_FALLBACK }
     this._headerRequested = false
     this._inFlight = 0
@@ -183,32 +524,28 @@ export class VectorTileManager {
     this.onTilesChanged = null // hook: a build landed — caller invalidates the on-demand renderer
   }
 
+  // only meaningful for LineMaterial buckets (fields' MeshBasicMaterial has no
+  // `resolution` uniform) — the optional-chaining guard makes this a no-op
+  // for non-line managers instead of needing a separate override.
   setLineResolution(res) {
     if (!this._resolutionSet && res) {
-      for (const id of BUCKET_ORDER) this.materials[id].uniforms.resolution.value = res
+      for (const id of this.meshKeys) {
+        if (this.materials[id]?.uniforms?.resolution) this.materials[id].uniforms.resolution.value = res
+      }
       this._resolutionSet = true
     }
   }
 
-  // width/opacity stay valid as GLOBAL multipliers under bucketing (design §7
-  // Phase 2) — width is scaled by each bucket's fixed BUCKET_WIDTH_RATIO,
-  // opacity applies uniformly. Color is no longer a param here: it's baked
-  // per-class into vertexColors (see ROAD_STYLE), same as rail's official
-  // per-line colors in polyline.js.
-  setStyle({ width, opacity } = {}) {
-    for (const id of BUCKET_ORDER) {
-      const mat = this.materials[id]
-      if (width !== undefined) mat.linewidth = width * BUCKET_WIDTH_RATIO[id]
-      if (opacity !== undefined) mat.opacity = opacity
-    }
+  setStyle(patch) {
+    this._applyStyleHook?.(this.materials, patch)
   }
 
   // anti-z-fight lift (design Phase 2 item 4) — a single rigid-body offset on
   // the GROUP, not per-vertex: every live tile mesh is a child of this.group,
-  // so one position.y write lifts the whole road network above the terrain
-  // skin it's baked onto, exactly like polyline.js's draped layers (rail/
+  // so one position.y write lifts the whole network above the terrain skin
+  // it's baked onto, exactly like polyline.js's draped layers (rail/
   // counties/trails all set liftBase ~0.05, scaled by fogScale via
-  // geo.zFightLift — see createOsmRoadsLayer.tickView).
+  // geo.zFightLift).
   setLift(lift) {
     this.group.position.y = lift
   }
@@ -219,7 +556,7 @@ export class VectorTileManager {
       const h = await this.pmtiles.getHeader()
       this._sourceZoom = { min: h.minZoom, max: h.maxZoom }
     } catch (err) {
-      console.warn('[vectortiles] header fetch failed, using fallback zoom range', err)
+      console.warn('[vectortiles]', this.layerName, 'header fetch failed, using fallback zoom range', err)
     }
   }
 
@@ -240,10 +577,10 @@ export class VectorTileManager {
     this._demDirty = true
   }
 
-  // one tile now owns up to 3 bucket meshes (major/mid/minor) instead of 1 —
-  // every removal site below (clear/unload/LRU-evict) walks BUCKET_ORDER.
+  // one tile now owns up to meshKeys.length bucket meshes instead of 1 —
+  // every removal site below (clear/unload/LRU-evict) walks meshKeys.
   _disposeTile(t) {
-    for (const id of BUCKET_ORDER) {
+    for (const id of this.meshKeys) {
       const mesh = t.meshes[id]
       if (!mesh) continue
       this.group.remove(mesh)
@@ -259,6 +596,27 @@ export class VectorTileManager {
     this.queued.clear()
   }
 
+  // ---- anchor bug fix (see docs/VECTOR_TILES_DESIGN.md task brief) --------
+  // The projection anchor MUST be the world's actual frozen anchor —
+  // heightField.projection.lat/lon, immutable for the whole session per
+  // geo.js/index.js's "one world" design (index.js loadRealTerrain: "The
+  // whole session lives in ONE world: the projection is anchored at the
+  // first loaded location ... and never rebuilt") — NEVER the live
+  // params.demLat/demLon opts, which DRIFT as the camera flies elsewhere
+  // (flyToLonLat/applyPreset/the GPS-tracking tick all keep demLat/demLon
+  // updated to "wherever the pan target currently is", not the world's
+  // anchor). The original bug: _proj(vz) cached purely by vz, and update()
+  // reassigned this._anchor from the drifting demLat/demLon on EVERY call
+  // with no cache invalidation. A LOD not yet cached, first requested AFTER
+  // the camera had flown elsewhere, permanently baked in the WRONG (drifted)
+  // anchor — tile requests landing ~176km off, the layer going silently to
+  // 0 tiles. Fix: derive the anchor from the immutable heightField.projection
+  // and only clear the per-vz cache if that anchor ever legitimately changes
+  // (defensive — in practice, within one loaded world, it never does).
+  _resolveAnchor(heightField, demLat, demLon) {
+    return heightField ? { lat: heightField.projection.lat, lon: heightField.projection.lon } : { lat: demLat, lon: demLon }
+  }
+
   _proj(vz) {
     let p = this._projCache.get(vz)
     if (!p) {
@@ -271,11 +629,15 @@ export class VectorTileManager {
 
   // dt: frame delta. opts: { targetX, targetZ, radius, lodZoom, demLat, demLon,
   // exaggeration, heightField } — a fresh snapshot every call (see
-  // vectortiles.js createOsmRoadsLayer.tickView), not a stored closure.
+  // createOsmRoadsLayer/createFtwFieldsLayer's tickView), not a stored closure.
   update(dt, opts) {
     if (!this.enabled) return
     const { targetX, targetZ, radius, lodZoom, demLat, demLon, exaggeration, heightField } = opts
-    this._anchor = { lat: demLat, lon: demLon }
+    const anchor = this._resolveAnchor(heightField, demLat, demLon)
+    if (!this._anchor || anchor.lat !== this._anchor.lat || anchor.lon !== this._anchor.lon) {
+      this._anchor = anchor
+      this._projCache.clear() // stale per-vz projections would no longer match the world's actual anchor
+    }
     this.heightField = heightField
     const vz = THREE.MathUtils.clamp(Math.round(lodZoom) + 1, this._sourceZoom.min, this._sourceZoom.max)
     if (vz !== this._lastVz) {
@@ -436,145 +798,50 @@ export class VectorTileManager {
       }
       if (this.queued.get(e.k) !== e) return // dropped while awaiting DEM tiles
 
-      // §4/§5 — bucket every LineString feature by highway class as we walk
-      // it: bucketXZ/bucketRGB/bucketFeat are parallel, per-bucket flat
-      // arrays (segment pairs / baked vertex colors / feature-index-per-
-      // segment), the same shape as polyline.js's bakeDraped but split three
-      // ways instead of one. `features` holds one {name,ref,highway,lanes}
-      // record per LineString (not per segment) — bucketFeat stores the
-      // INDEX into it, mirroring polyline.js's segLine→lineMeta lookup, so
-      // pick() can map a raycast faceIndex all the way back to OSM tags.
-      const features = []
-      const bucketXZ = { major: [], mid: [], minor: [] }
-      const bucketRGB = { major: [], mid: [], minor: [] }
-      const bucketFeat = { major: [], mid: [], minor: [] }
-      for (let i = 0; i < layer.length; i++) {
-        const feature = layer.feature(i)
-        if (feature.type !== LINESTRING_TYPE) continue
-        const props = feature.properties || {}
-        const style = classifyRoad(props.highway)
-        const rgb = roadRGB(style.color)
-        const featIdx = features.length
-        features.push({ name: props.name, ref: props.ref, highway: props.highway, lanes: props.lanes })
-        const extent = feature.extent
-        const s = proj.tileWorldSize / extent
-        const parts = feature.loadGeometry()
-        const xzArr = bucketXZ[style.bucket]
-        const rgbArr = bucketRGB[style.bucket]
-        const featArr = bucketFeat[style.bucket]
-        for (const part of parts) {
-          for (let j = 0; j < part.length - 1; j++) {
-            const p0 = part[j]
-            const p1 = part[j + 1]
-            xzArr.push(
-              center.x + (p0.x - extent / 2) * s,
-              center.z + (p0.y - extent / 2) * s,
-              center.x + (p1.x - extent / 2) * s,
-              center.z + (p1.y - extent / 2) * s
-            )
-            rgbArr.push(rgb.r, rgb.g, rgb.b, rgb.r, rgb.g, rgb.b)
-            featArr.push(featIdx)
-          }
-        }
-      }
-
-      const buckets = {}
-      let any = false
-      for (const id of BUCKET_ORDER) {
-        const xz = bucketXZ[id]
-        const nSeg = xz.length / 4
-        if (!nSeg) continue // "先空後填" — a bucket a tile has none of just gets no mesh, never an empty one
-        any = true
-        const seg = new Float32Array(nSeg * 6)
-        const elev = new Float32Array(nSeg * 2)
-        for (let s = 0; s < nSeg; s++) {
-          const x0 = xz[s * 4]
-          const z0 = xz[s * 4 + 1]
-          const x1 = xz[s * 4 + 2]
-          const z1 = xz[s * 4 + 3]
-          seg[s * 6] = x0
-          seg[s * 6 + 2] = z0
-          seg[s * 6 + 3] = x1
-          seg[s * 6 + 5] = z1
-          elev[s * 2] = hf ? hf.heightAtWorld(x0, z0) : 0
-          elev[s * 2 + 1] = hf ? hf.heightAtWorld(x1, z1) : 0
-        }
-        buckets[id] = {
-          seg,
-          elev,
-          col: new Float32Array(bucketRGB[id]),
-          segFeature: new Int32Array(bucketFeat[id]),
-          nSeg,
-        }
-      }
-      if (!any) {
+      const decoded = this._decodeLayer(layer, { proj, center, hf })
+      if (!decoded) {
         e.state = 'empty'
         return
       }
-      e.buckets = buckets
-      e.features = features
+      e.buckets = decoded.buckets
+      e.features = decoded.features
       e.cx = center.x
       e.cz = center.z
       e.state = 'ready'
     } catch (err) {
       if (err?.name === 'AbortError') return
-      console.warn('[vectortiles] tile decode failed', e.k, err)
+      console.warn('[vectortiles]', this.layerName, 'tile decode failed', e.k, err)
       if (this.queued.get(e.k) === e) e.state = 'empty'
     }
   }
 
   _materialize(e) {
-    // apply the current vertical scale now (redrape only revisits this on a
-    // later exaggeration/DEM change, so a tile must land already-scaled)
     const hf = this.heightField
     const meshes = {}
-    for (const id of BUCKET_ORDER) {
-      const bd = e.buckets[id]
+    for (const key of this.meshKeys) {
+      const bd = e.buckets[key]
       if (!bd) continue
-      if (hf) {
-        for (let s = 0; s < bd.nSeg; s++) {
-          bd.seg[s * 6 + 1] = metersToWorldY(hf, bd.elev[s * 2], this._lastExaggeration ?? 1)
-          bd.seg[s * 6 + 4] = metersToWorldY(hf, bd.elev[s * 2 + 1], this._lastExaggeration ?? 1)
-        }
-      }
-      const geo = new LineSegmentsGeometry()
-      geo.setPositions(bd.seg)
-      geo.setColors(bd.col)
-      const mesh = new LineSegments2(geo, this.materials[id])
-      // §5 pick: stash this mesh's own segment→feature lookup directly on the
-      // THREE object so pick() needs no separate mesh→tile reverse index.
-      mesh.userData.segFeature = bd.segFeature
+      const mesh = this._buildMesh(key, bd, hf, this._lastExaggeration ?? 1)
+      // §5 pick: stash this tile's own feature list on every bucket mesh so
+      // pick() needs no separate mesh→tile reverse index.
       mesh.userData.features = e.features
       this.group.add(mesh)
-      meshes[id] = mesh
+      meshes[key] = mesh
     }
     this.tiles.set(e.k, { meshes, buckets: e.buckets, cx: e.cx, cz: e.cz })
   }
 
-  // in-place y rewrite for every live tile — no geometry rebuild, matching
-  // polyline.js applyVertical (design §3/§6). Runs on an exaggeration change
-  // or a DEM-coverage dirty flag, never per-frame. Walks every bucket a tile
-  // actually has a mesh for.
+  // in-place y rewrite for every live tile — no geometry rebuild (design
+  // §3/§6). Runs on an exaggeration change or a DEM-coverage dirty flag,
+  // never per-frame. Walks every bucket a tile actually has a mesh for.
   _redrape(heightField, exaggeration) {
     this._lastExaggeration = exaggeration
     for (const t of this.tiles.values()) {
-      for (const id of BUCKET_ORDER) {
-        const bd = t.buckets[id]
-        const mesh = t.meshes[id]
+      for (const key of this.meshKeys) {
+        const bd = t.buckets[key]
+        const mesh = t.meshes[key]
         if (!bd || !mesh) continue
-        for (let s = 0; s < bd.nSeg; s++) {
-          const x0 = bd.seg[s * 6]
-          const z0 = bd.seg[s * 6 + 2]
-          const x1 = bd.seg[s * 6 + 3]
-          const z1 = bd.seg[s * 6 + 5]
-          bd.elev[s * 2] = heightField.heightAtWorld(x0, z0)
-          bd.elev[s * 2 + 1] = heightField.heightAtWorld(x1, z1)
-          bd.seg[s * 6 + 1] = metersToWorldY(heightField, bd.elev[s * 2], exaggeration)
-          bd.seg[s * 6 + 4] = metersToWorldY(heightField, bd.elev[s * 2 + 1], exaggeration)
-        }
-        mesh.geometry.attributes.instanceStart.data.needsUpdate = true
-        mesh.geometry.computeBoundingBox()
-        mesh.geometry.computeBoundingSphere()
+        this._redrapeBucket(bd, mesh, heightField, exaggeration)
       }
     }
   }
@@ -583,23 +850,17 @@ export class VectorTileManager {
   // materialized ("live") tile meshes; queued/pending tiles never enter the
   // scene graph so they can't be hit. intersectObjects sorts hits by distance
   // across every bucket mesh of every live tile in one pass, so the nearest
-  // road under the cursor wins regardless of which bucket it's in.
+  // feature under the cursor wins regardless of which bucket/tile it's in.
   pick(raycaster) {
     if (!this.group.children.length) return null
     const hits = raycaster.intersectObjects(this.group.children, false)
     if (!hits.length) return null
-    const hit = hits[0]
-    const segFeature = hit.object.userData.segFeature
-    const features = hit.object.userData.features
-    if (!segFeature || !features) return null
-    const feat = features[segFeature[hit.faceIndex]]
-    if (!feat) return null
-    return roadPickResult(feat, hit.point.clone())
+    return this._resolveHit(hits[0])
   }
 
   dispose() {
     this._clear()
-    for (const id of BUCKET_ORDER) this.materials[id].dispose()
+    for (const id of this.meshKeys) this.materials[id]?.dispose()
   }
 }
 
@@ -609,6 +870,7 @@ export class VectorTileManager {
 // symlink requirement for this data source.
 const VECTOR_BASE = import.meta.env.VITE_VECTOR_BASE ?? 'https://tiles.itsmigu.com/vector'
 const OSM_ROADS_URL = `${VECTOR_BASE}/osm_road_drive.pmtiles`
+const FTW_FIELDS_URL = `${VECTOR_BASE}/ftw_fields_2025.pmtiles`
 
 const ROADS_STYLE_SCHEMA = {
   width: { type: 'slider', label: '線寬 Width', min: 0.5, max: 4, step: 0.1, format: (v) => v.toFixed(1) },
@@ -626,7 +888,28 @@ const ROADS_STYLE_SCHEMA = {
 // streaming once the panel switches this layer on (gate() below), matching
 // "先空後填" — no tile fetch happens while off.
 export function createOsmRoadsLayer(params, { invalidate } = {}) {
-  const manager = new VectorTileManager({ url: OSM_ROADS_URL, layerName: 'osm_road_drive' })
+  const materials = {}
+  for (const id of BUCKET_ORDER) {
+    materials[id] = new LineMaterial({
+      color: 0xffffff,
+      vertexColors: true,
+      linewidth: 1.5 * BUCKET_WIDTH_RATIO[id],
+      transparent: true,
+      opacity: 0.85,
+      fog: true,
+    })
+  }
+  const manager = new VectorTileManager({
+    url: OSM_ROADS_URL,
+    layerName: 'osm_road_drive',
+    meshKeys: BUCKET_ORDER,
+    materials,
+    decodeLayer: decodeRoadLayer,
+    buildMesh: (key, bd, hf, exaggeration) => buildRoadMesh(materials[key], bd, hf, exaggeration),
+    redrapeBucket: redrapeRoadBucket,
+    resolveHit: resolveRoadHit,
+    applyStyle: applyRoadStyle,
+  })
   manager.setStyle({ width: params.osmRoadsWidth, opacity: params.osmRoadsOpacity })
   manager.onTilesChanged = invalidate // a tile finished building — repaint (on-demand render, design §6)
 
@@ -724,6 +1007,139 @@ export function createOsmRoadsLayer(params, { invalidate } = {}) {
         style: {
           width: params.osmRoadsWidth,
           opacity: params.osmRoadsOpacity,
+        },
+      }
+    },
+
+    dispose() {
+      manager.dispose()
+    },
+  }
+}
+
+const FIELDS_STYLE_SCHEMA = {
+  opacity: { type: 'slider', label: '濃度 Opacity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+}
+
+// LayerManager adapter — Phase 3 (docs/VECTOR_TILES_DESIGN.md §7): triangulated
+// farmland parcel polygons (ftw_fields_2025.pmtiles, layer `fields`), one Mesh
+// per tile (single 'fill' bucket — no width-class buckets like roads, just
+// one translucent fill; see the winding-trap comment block above buildFieldMesh
+// et al.). Click-to-inspect resolves field_id/area_ha/confidence_mean.
+//
+// This is a NEAR-FIELD, per-parcel-clickable companion to farm_sim (the
+// existing whole-island farmland PRESENCE tint painted into the terrain
+// shader, terrain.js uFarmTex/uFarmOpacity): farm_sim is the cheap far-view
+// drape (one shader lookup, always-on-terrain, no picking, no per-parcel
+// boundaries), this is the more expensive per-polygon streamed mesh
+// (individual parcel boundaries, only built for on-screen tiles,
+// click-to-inspect). Both can be on at the same time — describe()'s
+// rowLabel spells out the difference so the Layers panel doesn't read like a
+// duplicate toggle.
+export function createFtwFieldsLayer(params, { invalidate } = {}) {
+  const materials = {
+    fill: new THREE.MeshBasicMaterial({
+      color: new THREE.Color(FTW_FILL_COLOR),
+      transparent: true,
+      opacity: params.ftwFieldsOpacity,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      fog: true,
+    }),
+  }
+  const manager = new VectorTileManager({
+    url: FTW_FIELDS_URL,
+    layerName: 'fields',
+    meshKeys: FIELDS_MESH_KEYS,
+    materials,
+    decodeLayer: decodeFieldLayer,
+    buildMesh: (key, bd, hf, exaggeration) => buildFieldMesh(materials[key], bd, hf, exaggeration),
+    redrapeBucket: redrapeFieldBucket,
+    resolveHit: resolveFieldHit,
+    applyStyle: applyFieldStyle,
+  })
+  manager.onTilesChanged = invalidate
+
+  function gate(ctx) {
+    return params.source === 'real' && !!ctx.heightField && !!params.ftwFieldsVisible
+  }
+
+  return {
+    id: 'ftw_fields',
+    kind: 'area',
+    label: 'Fields (vector)',
+    rowLabel: '農田(向量) Fields',
+    object3d: manager.group,
+    visibleParam: 'ftwFieldsVisible',
+    paramMap: {
+      visible: 'ftwFieldsVisible',
+      opacity: 'ftwFieldsOpacity',
+    },
+
+    build() {},
+
+    update(ctx) {
+      const show = gate(ctx)
+      manager.setStyle({ opacity: params.ftwFieldsOpacity })
+      manager.group.visible = show
+      manager.setEnabled(show)
+    },
+
+    tickView(ctx) {
+      if (!manager.enabled || !ctx.heightField) return
+      manager.setLift(zFightLift(FTW_FIELDS_LIFT_BASE, ctx.fogScale))
+      const cx = ctx.labelCenter ? ctx.labelCenter.x : ctx.camera.position.x
+      const cz = ctx.labelCenter ? ctx.labelCenter.z : ctx.camera.position.z
+      manager.update(ctx.dt, {
+        targetX: cx,
+        targetZ: cz,
+        // same tuned fraction as roads (createOsmRoadsLayer.tickView) — a
+        // starting point, re-measured against real z13/14 field density in
+        // Chianan Plain during verification rather than assumed
+        radius: ctx.params.fogFar * ctx.fogScale * 0.65,
+        lodZoom: ctx.lodZoom ?? 12,
+        demLat: ctx.params.demLat,
+        demLon: ctx.params.demLon,
+        exaggeration: ctx.params.demExaggeration,
+        heightField: ctx.heightField,
+      })
+    },
+
+    setVisible(v) {
+      params.ftwFieldsVisible = v
+      manager.group.visible = v
+      manager.setEnabled(v)
+    },
+
+    setStyle(patch) {
+      for (const k in patch) if (this.paramMap[k]) params[this.paramMap[k]] = patch[k]
+      manager.setStyle({ opacity: params.ftwFieldsOpacity })
+    },
+
+    // click-to-inspect (design §5) — delegates to the manager, which only
+    // ever raycasts against live (materialized) tile meshes.
+    pick(raycaster) {
+      return manager.pick(raycaster)
+    },
+
+    // chunkManager.onChunksChanged hook (index.js) — coalesced redrape, see
+    // VectorTileManager.markDemDirty
+    markDemDirty() {
+      manager.markDemDirty()
+    },
+
+    describe() {
+      return {
+        id: 'ftw_fields',
+        kind: 'area',
+        label: 'Fields (vector)',
+        rowLabel: '農田(向量) Fields — 近景單田可點選；遠景農田分佈請改開「農田 Farmland」(farm_sim) drape',
+        count: manager.tiles.size, // live tile count, not feature count (matches roads' describe convention)
+        visible: params.ftwFieldsVisible,
+        styleSchema: FIELDS_STYLE_SCHEMA,
+        style: {
+          opacity: params.ftwFieldsOpacity,
         },
       }
     },

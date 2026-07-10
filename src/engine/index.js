@@ -7,7 +7,7 @@ import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
-import { createOsmRoadsLayer } from './vectortiles.js'
+import { createOsmRoadsLayer, createFtwFieldsLayer } from './vectortiles.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
 import { makeProjection, HeightField, TAIWAN_BBOX, worldYScale, metersToWorldY } from './geo.js'
@@ -186,6 +186,15 @@ export const DEFAULT_PARAMS = {
   irrigationWidth: 1.5,
   irrigationOpacity: 0.85,
   irrigationColor: '#3d7a9e',
+  // ftw fields: PMTiles-streamed vector-tile POLYGON layer (docs/VECTOR_TILES_DESIGN.md
+  // Phase 3) — same streamed-not-manifest pattern as osmRoadsVisible above, but
+  // triangulated farmland parcels instead of lines (see vectortiles.js
+  // createFtwFieldsLayer). A near-field, per-parcel-clickable companion to the
+  // farmVisible whole-island tint above — NOT a replacement for it (see the
+  // layer's own rowLabel/describe for the distinction). Fill color is fixed
+  // (design §4); 濃度 (opacity) is the only style param.
+  ftwFieldsVisible: false,
+  ftwFieldsOpacity: 0.6,
   // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
   // S Japan, S Korea, SE China) as flat strokes over a sea-coloured plane —
   // geographic context beyond the Taiwan DEM footprint (src/engine/region.js).
@@ -465,6 +474,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const labelsLayer = createLabelsLayer(params)
   const reservoirsLayer = createReservoirLayer(params)
   const osmRoadsLayer = createOsmRoadsLayer(params, { invalidate })
+  const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
   // whatever meta.group/subgroup it's registered with through to describe(),
@@ -498,6 +508,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // theme even though both share the water-adjacent shader-drape/polyline
     // machinery (see loadFarmSim/applyFarmSim and createIrrigationLayer)
     farm_sim: { group: GROUP_AGRI },
+    ftw_fields: { group: GROUP_AGRI },
     irrigation: { group: GROUP_AGRI },
     trails: { group: GROUP_OUTDOOR },
     trail_signs: { group: GROUP_OUTDOOR },
@@ -519,6 +530,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     createRiversLayer(params),
     reservoirsLayer,
     createFarmSimLayer(params),
+    ftwFieldsLayer,
     createIrrigationLayer(params),
     createTyphoonLayer(params),
     pointLayer,
@@ -551,6 +563,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     stage.shadowNeedsUpdate()
     invalidate() // a chunk appeared/vanished (incl. after DEM tiles finish loading)
     osmRoadsLayer.markDemDirty() // coalesced redrape — see vectortiles.js VectorTileManager.markDemDirty
+    ftwFieldsLayer.markDemDirty()
   }
 
   const cone = createCone()
@@ -1581,6 +1594,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     irrigationWidth: () => layers.get('irrigation').update(layerCtx()),
     irrigationOpacity: () => layers.get('irrigation').update(layerCtx()),
     irrigationColor: () => layers.get('irrigation').update(layerCtx()),
+    // ftw fields: no deferred JSON fetch — same PMTiles-streams-itself pattern
+    // as osmRoadsVisible above (see vectortiles.js createFtwFieldsLayer)
+    ftwFieldsVisible: () => ftwFieldsLayer.update(layerCtx()),
+    ftwFieldsOpacity: () => ftwFieldsLayer.update(layerCtx()),
     // region: first switch-on fetches the neighbouring coastlines (deferred);
     // the sea plane + style params re-run the layer's update
     regionVisible: (v) => {
