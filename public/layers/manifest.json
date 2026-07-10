@@ -92,6 +92,22 @@
       "url": "/layers/coastlines_extended.json",
       "visible": false,
       "style": { "width": 2.5, "opacity": 0.85, "color": "#1c1c1c" }
+    },
+    {
+      "id": "train_tracks",
+      "kind": "train-tracks",
+      "label": "Train Tracks",
+      "rowLabel": "台鐵路段比例表 Train Tracks",
+      "url": "/layers/train_tracks.json",
+      "visible": false
+    },
+    {
+      "id": "train_schedule",
+      "kind": "train-schedule",
+      "label": "Trains",
+      "rowLabel": "台鐵列車 Trains",
+      "url": "/layers/train_schedule.json",
+      "visible": false
     }
   ]
 }

@@ -5,6 +5,7 @@ import { createCoastlineLayer, createCountiesLayer, createRailLayer, createTrail
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
+import { createTrainsLayer } from './trains.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
 import { createOsmRoadsLayer, createFtwFieldsLayer } from './vectortiles.js'
@@ -129,6 +130,18 @@ export const DEFAULT_PARAMS = {
   railVisible: false,
   railWidth: 2,
   railOpacity: 0.9,
+  // trains: manifest-driven deferred layer — real TRA (台鐵) timetable (992
+  // trains, scripts/bake_trains.py) animated as light dots gliding along the
+  // rail_lines.json tra polylines using live Asia/Taipei wall-clock time (see
+  // src/engine/trains.js). Default off; toggling it on keeps the render loop
+  // non-idle (isAnimating), same as typhoon, since positions advance every
+  // second even with the camera parked. trainsTimeOffset is a DEBUG-only knob
+  // (lil-gui only, no Layers-panel exposure — see ui/debugPanel.js) that
+  // adds/subtracts seconds from the live clock so a developer can jump to
+  // peak hours (~08:30) or the dead of night (~03:00) without waiting.
+  trainsVisible: false,
+  trainsColor: '#ffcf40',
+  trainsTimeOffset: 0,
   // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
   // — NOT a manifest-driven JSON fetch like rail/trails; the manager
   // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
@@ -500,6 +513,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // under Base as a generic overlay utility rather than left in "其他".
     markers: { group: GROUP_BASE },
     rail: { group: GROUP_MOVE },
+    trains: { group: GROUP_MOVE },
     stations: { group: GROUP_MOVE },
     osm_roads: { group: GROUP_MOVE },
     rivers: { group: GROUP_WATER },
@@ -518,13 +532,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     typhoon: { group: GROUP_FX },
   }
   // registration order = draw / update order (coastline → counties → rail →
-  // trails → rivers → reservoirs → farm sim → irrigation → typhoon →
+  // trains → trails → rivers → reservoirs → farm sim → irrigation → typhoon →
   // markers → stations → trail signs → labels)
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
     createCountiesLayer(params),
     createRailLayer(params),
+    createTrainsLayer(params),
     osmRoadsLayer,
     createTrailsLayer(params),
     createRiversLayer(params),
@@ -932,6 +947,41 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       railFetch.loading = false
       invalidate()
       emit('layers') // refresh the panel's point count now that data (or the failure) landed
+    }
+  }
+
+  // trains: real TRA timetable (see src/engine/trains.js) — needs THREE
+  // sources landed together: train_tracks.json (per-part station ratios),
+  // train_schedule.json (992 trains) and rail_lines.json itself (re-fetched
+  // here, filtered client-side to system=='tra', to get the raw lon/lat/elev
+  // polylines the ratio tables are index-aligned against — see trains.js
+  // header). Same fail-quiet deferred pattern as rail/trails; a partial
+  // failure (any one of the three) drops the whole activation rather than
+  // rendering trains against mismatched/missing track geometry.
+  let trainsFetch = { loading: false, loaded: false }
+  async function loadTrainsData() {
+    if (trainsFetch.loading || trainsFetch.loaded) return
+    trainsFetch.loading = true
+    try {
+      const [tracksRes, scheduleRes, railRes] = await Promise.all([
+        fetch(await manifestUrl('train_tracks', '/layers/train_tracks.json')),
+        fetch(await manifestUrl('train_schedule', '/layers/train_schedule.json')),
+        fetch(await manifestUrl('rail', '/layers/rail_lines.json')),
+      ])
+      if (!tracksRes.ok) throw new Error(`train_tracks.json ${tracksRes.status}`)
+      if (!scheduleRes.ok) throw new Error(`train_schedule.json ${scheduleRes.status}`)
+      if (!railRes.ok) throw new Error(`rail_lines.json ${railRes.status}`)
+      const [tracks, schedule, rail] = await Promise.all([tracksRes.json(), scheduleRes.json(), railRes.json()])
+      const traLines = rail.lines.filter((l) => l.system === 'tra').map((l) => l.points)
+      layers.get('trains').setData({ tracks, schedules: schedule.schedules, traLines })
+      trainsFetch.loaded = true
+      layers.get('trains').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] trains fetch failed', err)
+    } finally {
+      trainsFetch.loading = false
+      invalidate()
+      emit('layers')
     }
   }
 
@@ -1533,6 +1583,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     },
     railWidth: () => layers.get('rail').update(layerCtx()),
     railOpacity: () => layers.get('rail').update(layerCtx()),
+    // trains: first switch-on triggers the deferred fetch (loadTrainsData
+    // no-ops once loaded/in-flight); trainsTimeOffset needs no handler here —
+    // trains.js reads it fresh every tickView, no update()/rebuild required.
+    trainsVisible: (v) => {
+      if (v) loadTrainsData()
+      layers.get('trains').update(layerCtx())
+    },
+    trainsColor: () => layers.get('trains').update(layerCtx()),
     // OSM roads: no deferred JSON fetch to kick — the PMTiles manager streams
     // tiles itself once switched on (see vectortiles.js). update() just
     // (re)applies the gate/style; the manager's own setEnabled starts/stops
@@ -1786,6 +1844,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (params.source !== 'real' || !heightField) return true
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
+      params.trainsVisible || // light dots advance every second along the live wall clock
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||
