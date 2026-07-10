@@ -5,7 +5,7 @@ import { PbfReader } from 'pbf'
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js'
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
-import { makeProjection, metersToWorldY } from './geo.js'
+import { makeProjection, metersToWorldY, zFightLift } from './geo.js'
 
 // ⑥ PMTiles vector-tile subsystem, Phase 1 (docs/VECTOR_TILES_DESIGN.md). A
 // parallel streaming manager modeled on chunks.js's desired-set/LRU/build-
@@ -41,6 +41,90 @@ const LINESTRING_TYPE = 2 // VectorTileFeature.types[2] === 'LineString'
 
 const keyOf = (vz, tx, ty) => vz + '/' + tx + '/' + ty
 
+// §4 — highway class → width bucket + baked vertex color. Every LineString
+// feature's `properties.highway` tag looks itself up here; anything unlisted
+// (unclassified/residential/service/track/footway/living_street/... — the
+// bulk of a drive-network extract by segment count) falls through to
+// DEFAULT_ROAD_STYLE's 'minor' bucket. Palette leans into the paper-
+// cartography language already set by counties (#444) / coastline (#1c1c1c):
+// an orange family for the fast through-roads fading to a muted paper-grey
+// for the residential web, so the busiest routes read first at island scale.
+const ROAD_STYLE = {
+  motorway: { bucket: 'major', color: '#e8722c' },
+  motorway_link: { bucket: 'major', color: '#e8722c' },
+  trunk: { bucket: 'major', color: '#e8722c' },
+  trunk_link: { bucket: 'major', color: '#e8722c' },
+  primary: { bucket: 'mid', color: '#d9a441' },
+  primary_link: { bucket: 'mid', color: '#d9a441' },
+  secondary: { bucket: 'mid', color: '#d9a441' },
+  secondary_link: { bucket: 'mid', color: '#d9a441' },
+  tertiary: { bucket: 'mid', color: '#c9b36a' },
+  tertiary_link: { bucket: 'mid', color: '#c9b36a' },
+}
+const DEFAULT_ROAD_STYLE = { bucket: 'minor', color: '#9c9184' }
+const BUCKET_ORDER = ['major', 'mid', 'minor']
+// per-bucket width RATIO layered on top of the single global osmRoadsWidth
+// slider (design §7 Phase 2: existing width/opacity params stay valid as a
+// GLOBAL multiplier under bucketing) — this table only fixes the three
+// buckets' width PROPORTIONS relative to each other (motorway thick, alley
+// thin); the slider scales all three together.
+const BUCKET_WIDTH_RATIO = { major: 2.2, mid: 1.3, minor: 0.7 }
+const OSM_ROADS_LIFT_BASE = 0.05 // anti-z-fight lift base, matches rail/counties/trails/irrigation's own draped-line convention (geo.zFightLift)
+
+// OSM highway tag → a short bilingual label for the pick popup's 等級 row —
+// a tag missing from this table (rare in a drive-network extract) just shows
+// the raw tag string instead of blowing up.
+const HIGHWAY_LABELS = {
+  motorway: '國道 Motorway',
+  motorway_link: '國道匝道 Motorway Link',
+  trunk: '快速道路 Trunk',
+  trunk_link: '快速道路匝道 Trunk Link',
+  primary: '省道 Primary',
+  primary_link: '省道匝道 Primary Link',
+  secondary: '縣道 Secondary',
+  secondary_link: '縣道匝道 Secondary Link',
+  tertiary: '鄉道 Tertiary',
+  tertiary_link: '鄉道匝道 Tertiary Link',
+  unclassified: '一般道路 Unclassified',
+  residential: '巷弄 Residential',
+  living_street: '生活道路 Living Street',
+  service: '服務道路 Service',
+  track: '產業道路 Track',
+  pedestrian: '行人徒步區 Pedestrian',
+}
+
+function classifyRoad(highway) {
+  return ROAD_STYLE[highway] || DEFAULT_ROAD_STYLE
+}
+
+// hex → {r,g,b} float cache: THREE.Color parsing is wasted work if repeated
+// per segment (a class like 'residential' recurs thousands of times per tile)
+const _roadColorCache = new Map()
+function roadRGB(hex) {
+  let c = _roadColorCache.get(hex)
+  if (!c) {
+    const col = new THREE.Color(hex)
+    c = { r: col.r, g: col.g, b: col.b }
+    _roadColorCache.set(hex, c)
+  }
+  return c
+}
+
+// §5 pick — one feature record (name/ref/highway/lanes) resolves to the
+// popup's title + rows. title and the 名稱 row share the same name||ref||
+// highway-label fallback chain (matches the trails/irrigation pickTitle
+// convention in polyline.js); 車道 only appears when the tag is present.
+function roadPickResult(feat, worldPos) {
+  const highwayLabel = HIGHWAY_LABELS[feat.highway] || feat.highway || '—'
+  const name = feat.name || feat.ref || highwayLabel
+  const rows = [
+    ['名稱 Name', name],
+    ['等級 Highway', highwayLabel],
+  ]
+  if (feat.lanes) rows.push(['車道 Lanes', String(feat.lanes)])
+  return { title: name, rows, worldPos }
+}
+
 // DEM tile footprint (heightField's own fixed zoom) covering a world-space
 // bbox, with a 1-tile margin for heightAtWorld's cross-border bilinear taps —
 // same shape as index.js's ensureTourDisk/ensureTourTiles helpers, kept local
@@ -65,15 +149,26 @@ export class VectorTileManager {
     this.pmtiles = new PMTiles(url)
     this.layerName = layerName
     this.group = new THREE.Group()
-    this.material = new LineMaterial({
-      color: 0xffffff,
-      linewidth: 1.5,
-      transparent: true,
-      opacity: 0.85,
-      fog: true,
-    })
+    // §4 — one shared LineMaterial PER WIDTH BUCKET (not per tile, not per
+    // class): every tile's 'major' mesh reuses the same material object, so
+    // bucketing costs at most 3x Phase 1's draw calls (one LineSegments2 per
+    // non-empty bucket per tile), not 3x per distinct highway class. Color
+    // rides in vertexColors (baked per-class, see ROAD_STYLE/roadRGB below) —
+    // material.color stays the neutral white multiplier, same pattern as
+    // polyline.js's rail layer.
+    this.materials = {}
+    for (const id of BUCKET_ORDER) {
+      this.materials[id] = new LineMaterial({
+        color: 0xffffff,
+        vertexColors: true,
+        linewidth: 1.5 * BUCKET_WIDTH_RATIO[id],
+        transparent: true,
+        opacity: 0.85,
+        fog: true,
+      })
+    }
     this.enabled = false
-    this.tiles = new Map() // key -> { mesh, seg (Float32Array xyz pairs), elev (Float32Array meters pairs), nSeg, cx, cz }
+    this.tiles = new Map() // key -> { meshes: {major?,mid?,minor?}, buckets: {major?,mid?,minor?}, cx, cz } — see _fetchAndDecode/_materialize
     this.queue = [] // [{ vz, tx, ty, k, d2, state }]
     this.queued = new Map()
     this._acc = RECOMPUTE_INTERVAL
@@ -90,15 +185,32 @@ export class VectorTileManager {
 
   setLineResolution(res) {
     if (!this._resolutionSet && res) {
-      this.material.uniforms.resolution.value = res
+      for (const id of BUCKET_ORDER) this.materials[id].uniforms.resolution.value = res
       this._resolutionSet = true
     }
   }
 
-  setStyle({ color, width, opacity } = {}) {
-    if (color !== undefined) this.material.color.set(color)
-    if (width !== undefined) this.material.linewidth = width
-    if (opacity !== undefined) this.material.opacity = opacity
+  // width/opacity stay valid as GLOBAL multipliers under bucketing (design §7
+  // Phase 2) — width is scaled by each bucket's fixed BUCKET_WIDTH_RATIO,
+  // opacity applies uniformly. Color is no longer a param here: it's baked
+  // per-class into vertexColors (see ROAD_STYLE), same as rail's official
+  // per-line colors in polyline.js.
+  setStyle({ width, opacity } = {}) {
+    for (const id of BUCKET_ORDER) {
+      const mat = this.materials[id]
+      if (width !== undefined) mat.linewidth = width * BUCKET_WIDTH_RATIO[id]
+      if (opacity !== undefined) mat.opacity = opacity
+    }
+  }
+
+  // anti-z-fight lift (design Phase 2 item 4) — a single rigid-body offset on
+  // the GROUP, not per-vertex: every live tile mesh is a child of this.group,
+  // so one position.y write lifts the whole road network above the terrain
+  // skin it's baked onto, exactly like polyline.js's draped layers (rail/
+  // counties/trails all set liftBase ~0.05, scaled by fogScale via
+  // geo.zFightLift — see createOsmRoadsLayer.tickView).
+  setLift(lift) {
+    this.group.position.y = lift
   }
 
   async _loadHeader() {
@@ -128,11 +240,19 @@ export class VectorTileManager {
     this._demDirty = true
   }
 
-  _clear() {
-    for (const t of this.tiles.values()) {
-      this.group.remove(t.mesh)
-      t.mesh.geometry.dispose()
+  // one tile now owns up to 3 bucket meshes (major/mid/minor) instead of 1 —
+  // every removal site below (clear/unload/LRU-evict) walks BUCKET_ORDER.
+  _disposeTile(t) {
+    for (const id of BUCKET_ORDER) {
+      const mesh = t.meshes[id]
+      if (!mesh) continue
+      this.group.remove(mesh)
+      mesh.geometry.dispose()
     }
+  }
+
+  _clear() {
+    for (const t of this.tiles.values()) this._disposeTile(t)
     this.tiles.clear()
     for (const e of this.queue) e.abort?.abort()
     this.queue = []
@@ -238,8 +358,7 @@ export class VectorTileManager {
       const ddx = t.cx - cx
       const ddz = t.cz - cz
       if (ddx * ddx + ddz * ddz > rOut2) {
-        this.group.remove(t.mesh)
-        t.mesh.geometry.dispose()
+        this._disposeTile(t)
         this.tiles.delete(k)
       }
     }
@@ -253,8 +372,7 @@ export class VectorTileManager {
       for (const [k] of byDist) {
         if (over-- <= 0) break
         const t = this.tiles.get(k)
-        this.group.remove(t.mesh)
-        t.mesh.geometry.dispose()
+        this._disposeTile(t)
         this.tiles.delete(k)
       }
     }
@@ -318,48 +436,83 @@ export class VectorTileManager {
       }
       if (this.queued.get(e.k) !== e) return // dropped while awaiting DEM tiles
 
-      const xz = [] // flat: x0,z0,x1,z1 per segment (world space, y filled in below)
+      // §4/§5 — bucket every LineString feature by highway class as we walk
+      // it: bucketXZ/bucketRGB/bucketFeat are parallel, per-bucket flat
+      // arrays (segment pairs / baked vertex colors / feature-index-per-
+      // segment), the same shape as polyline.js's bakeDraped but split three
+      // ways instead of one. `features` holds one {name,ref,highway,lanes}
+      // record per LineString (not per segment) — bucketFeat stores the
+      // INDEX into it, mirroring polyline.js's segLine→lineMeta lookup, so
+      // pick() can map a raycast faceIndex all the way back to OSM tags.
+      const features = []
+      const bucketXZ = { major: [], mid: [], minor: [] }
+      const bucketRGB = { major: [], mid: [], minor: [] }
+      const bucketFeat = { major: [], mid: [], minor: [] }
       for (let i = 0; i < layer.length; i++) {
         const feature = layer.feature(i)
         if (feature.type !== LINESTRING_TYPE) continue
+        const props = feature.properties || {}
+        const style = classifyRoad(props.highway)
+        const rgb = roadRGB(style.color)
+        const featIdx = features.length
+        features.push({ name: props.name, ref: props.ref, highway: props.highway, lanes: props.lanes })
         const extent = feature.extent
         const s = proj.tileWorldSize / extent
         const parts = feature.loadGeometry()
+        const xzArr = bucketXZ[style.bucket]
+        const rgbArr = bucketRGB[style.bucket]
+        const featArr = bucketFeat[style.bucket]
         for (const part of parts) {
           for (let j = 0; j < part.length - 1; j++) {
             const p0 = part[j]
             const p1 = part[j + 1]
-            xz.push(
+            xzArr.push(
               center.x + (p0.x - extent / 2) * s,
               center.z + (p0.y - extent / 2) * s,
               center.x + (p1.x - extent / 2) * s,
               center.z + (p1.y - extent / 2) * s
             )
+            rgbArr.push(rgb.r, rgb.g, rgb.b, rgb.r, rgb.g, rgb.b)
+            featArr.push(featIdx)
           }
         }
       }
-      if (!xz.length) {
+
+      const buckets = {}
+      let any = false
+      for (const id of BUCKET_ORDER) {
+        const xz = bucketXZ[id]
+        const nSeg = xz.length / 4
+        if (!nSeg) continue // "先空後填" — a bucket a tile has none of just gets no mesh, never an empty one
+        any = true
+        const seg = new Float32Array(nSeg * 6)
+        const elev = new Float32Array(nSeg * 2)
+        for (let s = 0; s < nSeg; s++) {
+          const x0 = xz[s * 4]
+          const z0 = xz[s * 4 + 1]
+          const x1 = xz[s * 4 + 2]
+          const z1 = xz[s * 4 + 3]
+          seg[s * 6] = x0
+          seg[s * 6 + 2] = z0
+          seg[s * 6 + 3] = x1
+          seg[s * 6 + 5] = z1
+          elev[s * 2] = hf ? hf.heightAtWorld(x0, z0) : 0
+          elev[s * 2 + 1] = hf ? hf.heightAtWorld(x1, z1) : 0
+        }
+        buckets[id] = {
+          seg,
+          elev,
+          col: new Float32Array(bucketRGB[id]),
+          segFeature: new Int32Array(bucketFeat[id]),
+          nSeg,
+        }
+      }
+      if (!any) {
         e.state = 'empty'
         return
       }
-      const nSeg = xz.length / 4
-      const seg = new Float32Array(nSeg * 6)
-      const elev = new Float32Array(nSeg * 2)
-      for (let s = 0; s < nSeg; s++) {
-        const x0 = xz[s * 4]
-        const z0 = xz[s * 4 + 1]
-        const x1 = xz[s * 4 + 2]
-        const z1 = xz[s * 4 + 3]
-        seg[s * 6] = x0
-        seg[s * 6 + 2] = z0
-        seg[s * 6 + 3] = x1
-        seg[s * 6 + 5] = z1
-        elev[s * 2] = hf ? hf.heightAtWorld(x0, z0) : 0
-        elev[s * 2 + 1] = hf ? hf.heightAtWorld(x1, z1) : 0
-      }
-      e.seg = seg
-      e.elev = elev
-      e.nSeg = nSeg
+      e.buckets = buckets
+      e.features = features
       e.cx = center.x
       e.cz = center.z
       e.state = 'ready'
@@ -374,44 +527,79 @@ export class VectorTileManager {
     // apply the current vertical scale now (redrape only revisits this on a
     // later exaggeration/DEM change, so a tile must land already-scaled)
     const hf = this.heightField
-    if (hf) {
-      for (let s = 0; s < e.nSeg; s++) {
-        e.seg[s * 6 + 1] = metersToWorldY(hf, e.elev[s * 2], this._lastExaggeration ?? 1)
-        e.seg[s * 6 + 4] = metersToWorldY(hf, e.elev[s * 2 + 1], this._lastExaggeration ?? 1)
+    const meshes = {}
+    for (const id of BUCKET_ORDER) {
+      const bd = e.buckets[id]
+      if (!bd) continue
+      if (hf) {
+        for (let s = 0; s < bd.nSeg; s++) {
+          bd.seg[s * 6 + 1] = metersToWorldY(hf, bd.elev[s * 2], this._lastExaggeration ?? 1)
+          bd.seg[s * 6 + 4] = metersToWorldY(hf, bd.elev[s * 2 + 1], this._lastExaggeration ?? 1)
+        }
       }
+      const geo = new LineSegmentsGeometry()
+      geo.setPositions(bd.seg)
+      geo.setColors(bd.col)
+      const mesh = new LineSegments2(geo, this.materials[id])
+      // §5 pick: stash this mesh's own segment→feature lookup directly on the
+      // THREE object so pick() needs no separate mesh→tile reverse index.
+      mesh.userData.segFeature = bd.segFeature
+      mesh.userData.features = e.features
+      this.group.add(mesh)
+      meshes[id] = mesh
     }
-    const geo = new LineSegmentsGeometry()
-    geo.setPositions(e.seg)
-    const mesh = new LineSegments2(geo, this.material)
-    this.group.add(mesh)
-    this.tiles.set(e.k, { mesh, seg: e.seg, elev: e.elev, nSeg: e.nSeg, cx: e.cx, cz: e.cz })
+    this.tiles.set(e.k, { meshes, buckets: e.buckets, cx: e.cx, cz: e.cz })
   }
 
   // in-place y rewrite for every live tile — no geometry rebuild, matching
   // polyline.js applyVertical (design §3/§6). Runs on an exaggeration change
-  // or a DEM-coverage dirty flag, never per-frame.
+  // or a DEM-coverage dirty flag, never per-frame. Walks every bucket a tile
+  // actually has a mesh for.
   _redrape(heightField, exaggeration) {
     this._lastExaggeration = exaggeration
     for (const t of this.tiles.values()) {
-      for (let s = 0; s < t.nSeg; s++) {
-        const x0 = t.seg[s * 6]
-        const z0 = t.seg[s * 6 + 2]
-        const x1 = t.seg[s * 6 + 3]
-        const z1 = t.seg[s * 6 + 5]
-        t.elev[s * 2] = heightField.heightAtWorld(x0, z0)
-        t.elev[s * 2 + 1] = heightField.heightAtWorld(x1, z1)
-        t.seg[s * 6 + 1] = metersToWorldY(heightField, t.elev[s * 2], exaggeration)
-        t.seg[s * 6 + 4] = metersToWorldY(heightField, t.elev[s * 2 + 1], exaggeration)
+      for (const id of BUCKET_ORDER) {
+        const bd = t.buckets[id]
+        const mesh = t.meshes[id]
+        if (!bd || !mesh) continue
+        for (let s = 0; s < bd.nSeg; s++) {
+          const x0 = bd.seg[s * 6]
+          const z0 = bd.seg[s * 6 + 2]
+          const x1 = bd.seg[s * 6 + 3]
+          const z1 = bd.seg[s * 6 + 5]
+          bd.elev[s * 2] = heightField.heightAtWorld(x0, z0)
+          bd.elev[s * 2 + 1] = heightField.heightAtWorld(x1, z1)
+          bd.seg[s * 6 + 1] = metersToWorldY(heightField, bd.elev[s * 2], exaggeration)
+          bd.seg[s * 6 + 4] = metersToWorldY(heightField, bd.elev[s * 2 + 1], exaggeration)
+        }
+        mesh.geometry.attributes.instanceStart.data.needsUpdate = true
+        mesh.geometry.computeBoundingBox()
+        mesh.geometry.computeBoundingSphere()
       }
-      t.mesh.geometry.attributes.instanceStart.data.needsUpdate = true
-      t.mesh.geometry.computeBoundingBox()
-      t.mesh.geometry.computeBoundingSphere()
     }
+  }
+
+  // §5 pick — only ever searches this.group.children, i.e. currently
+  // materialized ("live") tile meshes; queued/pending tiles never enter the
+  // scene graph so they can't be hit. intersectObjects sorts hits by distance
+  // across every bucket mesh of every live tile in one pass, so the nearest
+  // road under the cursor wins regardless of which bucket it's in.
+  pick(raycaster) {
+    if (!this.group.children.length) return null
+    const hits = raycaster.intersectObjects(this.group.children, false)
+    if (!hits.length) return null
+    const hit = hits[0]
+    const segFeature = hit.object.userData.segFeature
+    const features = hit.object.userData.features
+    if (!segFeature || !features) return null
+    const feat = features[segFeature[hit.faceIndex]]
+    if (!feat) return null
+    return roadPickResult(feat, hit.point.clone())
   }
 
   dispose() {
     this._clear()
-    this.material.dispose()
+    for (const id of BUCKET_ORDER) this.materials[id].dispose()
   }
 }
 
@@ -425,18 +613,21 @@ const OSM_ROADS_URL = `${VECTOR_BASE}/osm_road_drive.pmtiles`
 const ROADS_STYLE_SCHEMA = {
   width: { type: 'slider', label: '線寬 Width', min: 0.5, max: 4, step: 0.1, format: (v) => v.toFixed(1) },
   opacity: { type: 'slider', label: '不透明度 Opacity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
-  color: { type: 'color', label: '顏色 Color' },
 }
 
 // LayerManager adapter (see layers.js header for the interface contract).
-// Phase 1: single color/width for the whole road network (class-based style
-// buckets are Phase 2) — one shared LineMaterial, one LineSegments2 per tile.
+// Phase 2: highway-class width/color buckets (ROAD_STYLE) + click-to-inspect
+// — up to 3 LineSegments2 per tile (major/mid/minor), color baked into
+// vertexColors so classes sharing a bucket (e.g. motorway/trunk) can still
+// carry distinct hues without extra draw calls. No single color swatch
+// anymore (dropped osmRoadsColor — same pattern as rail's official per-line
+// colors in polyline.js); width/opacity remain global multipliers (§7).
 // Registers with an empty, invisible group; the manager only starts
 // streaming once the panel switches this layer on (gate() below), matching
 // "先空後填" — no tile fetch happens while off.
 export function createOsmRoadsLayer(params, { invalidate } = {}) {
   const manager = new VectorTileManager({ url: OSM_ROADS_URL, layerName: 'osm_road_drive' })
-  manager.setStyle({ color: params.osmRoadsColor, width: params.osmRoadsWidth, opacity: params.osmRoadsOpacity })
+  manager.setStyle({ width: params.osmRoadsWidth, opacity: params.osmRoadsOpacity })
   manager.onTilesChanged = invalidate // a tile finished building — repaint (on-demand render, design §6)
 
   function gate(ctx) {
@@ -454,7 +645,6 @@ export function createOsmRoadsLayer(params, { invalidate } = {}) {
       visible: 'osmRoadsVisible',
       width: 'osmRoadsWidth',
       opacity: 'osmRoadsOpacity',
-      color: 'osmRoadsColor',
     },
 
     build(ctx) {
@@ -464,7 +654,7 @@ export function createOsmRoadsLayer(params, { invalidate } = {}) {
     // style/visibility path (setParams → HANDLERS.osmRoads* → layers.get('osm_roads').update)
     update(ctx) {
       const show = gate(ctx)
-      manager.setStyle({ color: params.osmRoadsColor, width: params.osmRoadsWidth, opacity: params.osmRoadsOpacity })
+      manager.setStyle({ width: params.osmRoadsWidth, opacity: params.osmRoadsOpacity })
       manager.group.visible = show
       manager.setEnabled(show)
     },
@@ -472,9 +662,12 @@ export function createOsmRoadsLayer(params, { invalidate } = {}) {
     // per-frame streaming (desired-set recompute + throttled build pump) —
     // piggybacks on layers.tickAll's existing every-non-idle-frame cadence
     // instead of a new top-level tick() wire, since this manager only needs
-    // to react while its own layer is visible.
+    // to react while its own layer is visible. Also recomputes the anti-
+    // z-fight lift every frame the fog scale can change (matches polyline.js
+    // draped layers' tickView — item 4 of the Phase 2 checklist).
     tickView(ctx) {
       if (!manager.enabled || !ctx.heightField) return
+      manager.setLift(zFightLift(OSM_ROADS_LIFT_BASE, ctx.fogScale))
       const cx = ctx.labelCenter ? ctx.labelCenter.x : ctx.camera.position.x
       const cz = ctx.labelCenter ? ctx.labelCenter.z : ctx.camera.position.z
       manager.update(ctx.dt, {
@@ -503,7 +696,14 @@ export function createOsmRoadsLayer(params, { invalidate } = {}) {
 
     setStyle(patch) {
       for (const k in patch) if (this.paramMap[k]) params[this.paramMap[k]] = patch[k]
-      manager.setStyle({ color: params.osmRoadsColor, width: params.osmRoadsWidth, opacity: params.osmRoadsOpacity })
+      manager.setStyle({ width: params.osmRoadsWidth, opacity: params.osmRoadsOpacity })
+    },
+
+    // click-to-inspect (design §5) — delegates to the manager, which only
+    // ever raycasts against live (materialized) tile meshes. layers.pickAll
+    // already skips this when manager.group.visible is false (see layers.js).
+    pick(raycaster) {
+      return manager.pick(raycaster)
     },
 
     // chunkManager.onChunksChanged hook (index.js) — coalesced redrape, see
@@ -524,7 +724,6 @@ export function createOsmRoadsLayer(params, { invalidate } = {}) {
         style: {
           width: params.osmRoadsWidth,
           opacity: params.osmRoadsOpacity,
-          color: params.osmRoadsColor,
         },
       }
     },

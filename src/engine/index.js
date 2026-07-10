@@ -133,12 +133,12 @@ export const DEFAULT_PARAMS = {
   // — NOT a manifest-driven JSON fetch like rail/trails; the manager
   // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
   // osm_road_drive.pmtiles archive as the camera pans, only once switched on.
-  // Phase 1: one shared color/width for the whole road network (class-based
-  // style buckets are Phase 2).
+  // Phase 2: highway-class width/color buckets baked per-class into
+  // vertexColors (see vectortiles.js ROAD_STYLE) — no single color swatch;
+  // width/opacity stay as global multipliers on top of the buckets.
   osmRoadsVisible: false,
   osmRoadsWidth: 1.5,
   osmRoadsOpacity: 0.85,
-  osmRoadsColor: '#3a3a3a',
   // trails: manifest-driven deferred layer (public/layers/trails.json, fetched
   // on first trailsVisible:true), same fail-quiet pattern as rail. Every trail
   // shares one baked color (see polyline.js createTrailsLayer) so — unlike
@@ -1527,7 +1527,6 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     osmRoadsVisible: () => layers.get('osm_roads').update(layerCtx()),
     osmRoadsWidth: () => layers.get('osm_roads').update(layerCtx()),
     osmRoadsOpacity: () => layers.get('osm_roads').update(layerCtx()),
-    osmRoadsColor: () => layers.get('osm_roads').update(layerCtx()),
     // trails: same deferred-fetch pattern as rail; unlike rail this one has a
     // color param (every trail shares one baked color, no per-line override)
     trailsVisible: (v) => {
