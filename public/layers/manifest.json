@@ -66,6 +66,23 @@
       "rowLabel": "步道路標 Trail Signs",
       "url": "/layers/trail_signs.json",
       "visible": false
+    },
+    {
+      "id": "farm_sim",
+      "kind": "raster",
+      "label": "Farm Sim",
+      "url": "/layers/farm_sim.json",
+      "png": "/layers/farm_sim.png",
+      "visible": false
+    },
+    {
+      "id": "irrigation",
+      "kind": "line",
+      "label": "Irrigation",
+      "rowLabel": "灌溉渠道 Irrigation",
+      "url": "/layers/irrigation.json",
+      "visible": false,
+      "style": { "width": 1.5, "opacity": 0.85 }
     }
   ]
 }

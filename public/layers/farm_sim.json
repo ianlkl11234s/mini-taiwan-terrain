@@ -1,0 +1,23 @@
+{
+  "bbox": {
+    "minLon": 119.1796875,
+    "maxLon": 121.849365234375,
+    "maxLat": 25.400173535155577,
+    "minLat": 21.925529650056394
+  },
+  "size": {
+    "w": 7776,
+    "h": 11052
+  },
+  "zoom": 13,
+  "png": "/layers/farm_sim.png",
+  "params": {
+    "burn": "binary 0/255 (ALL_TOUCHED) — confidence_mean clustered 0.50-0.58, no usable dynamic range after the upstream >=0.5 filter",
+    "out_stride": 2,
+    "source_features": 386829
+  },
+  "stats": {
+    "nonzeroPct": 3.07
+  },
+  "note": "row 0 = north, col 0 = west; grayscale 0/255 = farm field presence; same tile-pixel grid as river_sim.png (bake_flow_accum ZOOM/OUT_STRIDE)"
+}

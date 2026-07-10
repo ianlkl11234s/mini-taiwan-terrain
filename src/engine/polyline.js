@@ -410,6 +410,35 @@ export function createTrailsLayer(params) {
   )
 }
 
+// Irrigation canals: manifest-driven deferred layer (see index.js) — registers
+// empty at startup and is fed real polylines via setData() once
+// public/layers/irrigation.json has been fetched (first time the layer is
+// switched on). The bake's color lives at data.meta.color (ONE value for the
+// whole network, not per-canal) — same single paramMap.color swatch as
+// trails (no lineColors array passed to setData).
+export function createIrrigationLayer(params) {
+  return createPolylineLayer(
+    {
+      id: 'irrigation',
+      label: 'Irrigation',
+      rowLabel: '灌溉渠道 Irrigation',
+      mode: 'draped',
+      polylines: [],
+      liftBase: 0.05,
+      paramMap: { visible: 'irrigationVisible', color: 'irrigationColor', width: 'irrigationWidth', opacity: 'irrigationOpacity' },
+      styleSchema: POLYLINE_STYLE(6),
+      // click-to-inspect (see index.js loadIrrigationData, which feeds the 3rd
+      // setData arg with one {name,office} per canal)
+      pickTitle: (meta) => meta.name,
+      pickRows: (meta) => [
+        ['渠道 Canal', meta.name || '—'],
+        ['管理處 Office', meta.office || '—'],
+      ],
+    },
+    params
+  )
+}
+
 // River water surfaces: a translucent sheet filling the wider downstream/
 // midstream channels (public/layers/river_surfaces.json — the narrow upstream
 // creeks stay as the river LINE). Every baked polygon is triangulated on the

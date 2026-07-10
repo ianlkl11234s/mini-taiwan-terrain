@@ -62,6 +62,18 @@ export class Terrain {
       uRiverBounds: { value: new THREE.Vector4(0, 0, 0, 0) },
       uRiverSimOpacity: { value: 0 },
       uRiverSimColor: { value: new THREE.Color(params.riversColor) },
+      // physics-derived farmland-presence bake (scripts/bake_farm_sim.py) —
+      // same shader-drape pattern as the river sim above: uFarmTex holds a
+      // binary presence mask (scripts/bake_farm_sim.py), uFarmBounds is that
+      // bake's own world-XZ footprint (NOT the same numeric bounds as the
+      // river bake — different source dataset — but the same tile-pixel grid
+      // convention, so the UV math is identical code). uFarmOpacity 0 = layer
+      // off (branch skipped, uFarmTex never sampled — zero cost while hidden).
+      // An INDEPENDENT overlay (agriculture, not hydrology) — own toggle/color.
+      uFarmTex: { value: null },
+      uFarmBounds: { value: new THREE.Vector4(0, 0, 0, 0) },
+      uFarmOpacity: { value: 0 },
+      uFarmColor: { value: new THREE.Color(params.farmColor) },
     }
     this.rebuildRamp(params)
     this.material.onBeforeCompile = (shader) => {
@@ -119,7 +131,11 @@ uniform float uScanBlur;
 uniform sampler2D uRiverTex;
 uniform vec4 uRiverBounds;
 uniform float uRiverSimOpacity;
-uniform vec3 uRiverSimColor;`
+uniform vec3 uRiverSimColor;
+uniform sampler2D uFarmTex;
+uniform vec4 uFarmBounds;
+uniform float uFarmOpacity;
+uniform vec3 uFarmColor;`
         )
         .replace(
           '#include <color_fragment>',
@@ -174,6 +190,24 @@ uniform vec3 uRiverSimColor;`
       float rInt = texture2D(uRiverTex, ruv).r;
       float rw = smoothstep(0.02, 0.20, rInt) * uRiverSimOpacity;
       diffuseColor.rgb = mix(diffuseColor.rgb, uRiverSimColor, clamp(rw, 0.0, 0.95));
+    }
+  }
+
+  // --- farmland-presence tint: sample the binary farm-field bake in its own
+  // footprint and paint the plains green. Gated by uFarmOpacity (0 → branch
+  // skipped, uFarmTex never sampled) and by the world-XZ bounds; the bake is a
+  // hard 0/255 mask but LinearFilter interpolation gives soft texel edges, so
+  // a narrow smoothstep around the mid-point antialiases the field boundary
+  // instead of a hard-edged rectangle grid.
+  if (uFarmOpacity > 0.0) {
+    vec2 fmin = uFarmBounds.xy;
+    vec2 fmax = uFarmBounds.zw;
+    if (vWorldPos.x >= fmin.x && vWorldPos.x <= fmax.x && vWorldPos.z >= fmin.y && vWorldPos.z <= fmax.y) {
+      vec2 fuv = vec2((vWorldPos.x - fmin.x) / max(fmax.x - fmin.x, 1e-4),
+                      (vWorldPos.z - fmin.y) / max(fmax.y - fmin.y, 1e-4));
+      float fInt = texture2D(uFarmTex, fuv).r;
+      float fw = smoothstep(0.3, 0.6, fInt) * uFarmOpacity;
+      diffuseColor.rgb = mix(diffuseColor.rgb, uFarmColor, clamp(fw, 0.0, 0.95));
     }
   }
 

@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import { Terrain } from './terrain.js'
 import { LayerManager } from './layers.js'
-import { createCoastlineLayer, createCountiesLayer, createRailLayer, createTrailsLayer, createRiversLayer } from './polyline.js'
+import { createCoastlineLayer, createCountiesLayer, createRailLayer, createTrailsLayer, createRiversLayer, createIrrigationLayer } from './polyline.js'
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
@@ -154,6 +154,24 @@ export const DEFAULT_PARAMS = {
   reservoirsRatio: 100,
   reservoirsOpacity: 0.55,
   reservoirsColor: '#2f8fd0',
+  // farm: whole-island physics-derived farmland-presence tint painted into
+  // the terrain shader (terrain.js uFarmTex, bake public/layers/farm_sim.png)
+  // — same shader-drape mechanism as the river sim, but an INDEPENDENT layer
+  // (farmland is agriculture, not hydrology — see loadFarmSim/applyFarmSim
+  // below and the farm_sim LayerManager entry). 農田濃度 drives uFarmOpacity;
+  // farmColor drives uFarmColor (Chianan Plain green).
+  farmVisible: false,
+  farmOpacity: 0.7,
+  farmColor: '#7a9e4f',
+  // irrigation: manifest-driven deferred polyline layer (public/layers/irrigation.json,
+  // fetched on first irrigationVisible:true), same deferred pattern as trails.
+  // Every canal shares ONE baked color (data.meta.color — see loadIrrigationData
+  // / polyline.js createIrrigationLayer), so — like trails — there IS a single
+  // color param (not per-line vertexColors like rail).
+  irrigationVisible: false,
+  irrigationWidth: 1.5,
+  irrigationOpacity: 0.85,
+  irrigationColor: '#3d7a9e',
   // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
   // S Japan, S Korea, SE China) as flat strokes over a sea-coloured plane —
   // geographic context beyond the Taiwan DEM footprint (src/engine/region.js).
@@ -442,8 +460,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const GROUP_BASE = { id: 'base', label: '底圖 Base', order: 0 }
   const GROUP_MOVE = { id: 'move', label: '交通 Move', order: 1 }
   const GROUP_WATER = { id: 'water', label: '水文 Water', order: 2 }
-  const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 3 }
-  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 4 }
+  const GROUP_AGRI = { id: 'agri', label: '農業 Agriculture', order: 3 }
+  const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 4 }
+  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 5 }
   const LAYER_GROUPS = {
     region: { group: GROUP_BASE },
     coastline: { group: GROUP_BASE },
@@ -458,6 +477,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     stations: { group: GROUP_MOVE },
     rivers: { group: GROUP_WATER },
     reservoirs: { group: GROUP_WATER },
+    // farmland tint + irrigation canals: agriculture, not hydrology — its own
+    // theme even though both share the water-adjacent shader-drape/polyline
+    // machinery (see loadFarmSim/applyFarmSim and createIrrigationLayer)
+    farm_sim: { group: GROUP_AGRI },
+    irrigation: { group: GROUP_AGRI },
     trails: { group: GROUP_OUTDOOR },
     trail_signs: { group: GROUP_OUTDOOR },
     // peak spot-elevation / place-name labels (labels.js) — cartography tied
@@ -466,7 +490,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     typhoon: { group: GROUP_FX },
   }
   // registration order = draw / update order (coastline → counties → rail →
-  // trails → rivers → reservoirs → markers → stations → trail signs → labels)
+  // trails → rivers → reservoirs → farm sim → irrigation → typhoon →
+  // markers → stations → trail signs → labels)
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
@@ -475,6 +500,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     createTrailsLayer(params),
     createRiversLayer(params),
     reservoirsLayer,
+    createFarmSimLayer(params),
+    createIrrigationLayer(params),
     createTyphoonLayer(params),
     pointLayer,
     stationsLayer,
@@ -876,6 +903,36 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
   }
 
+  // irrigation: same deferred fetch-once pattern as trails (baked polylines).
+  // data.meta.color is ONE color for the whole canal network (not per-canal
+  // like rail's lineColors array) — setData's 2nd arg stays null and the
+  // single irrigationColor swatch drives the style. 3rd arg carries one
+  // {name,office} per canal (parallel to the points arrays) for the
+  // click-to-inspect popup (polyline.js pick(), gated on config.pickRows).
+  let irrigationFetch = { loading: false, loaded: false }
+  async function loadIrrigationData() {
+    if (irrigationFetch.loading || irrigationFetch.loaded) return
+    irrigationFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('irrigation', '/layers/irrigation.json'))
+      if (!res.ok) throw new Error(`irrigation.json ${res.status}`)
+      const data = await res.json()
+      layers.get('irrigation').setData(
+        data.lines.map((l) => l.points),
+        null,
+        data.lines.map((l) => ({ name: l.name, office: l.office }))
+      )
+      irrigationFetch.loaded = true
+      layers.get('irrigation').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] irrigation fetch failed', err)
+    } finally {
+      irrigationFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
   // region: deferred neighbouring-coastline data (public/layers/region_coast.json)
   // fetched once on first switch-on, exactly like rail. The sea plane shows even
   // before the lines land; a fetch failure just leaves the plane + a warn.
@@ -1025,6 +1082,105 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     terrain.mapUniforms.uRiverSimColor.value.set(params.riversColor)
     terrain.mapUniforms.uRiverSimOpacity.value = active ? params.riverSimOpacity : 0
     invalidate()
+  }
+
+  // farm sim: whole-island physics-derived farmland-presence tint, painted
+  // straight into the terrain shader from a binary presence bake — same
+  // texture-load conventions as the river sim above (LinearFilter, no sRGB,
+  // flipY false, row 0 = north). Own bbox (public/layers/farm_sim.json) — NOT
+  // the same numeric bounds as river_sim (different source dataset), but the
+  // same tile-pixel grid convention (z13, out_stride 2), so the UV mapping
+  // code is identical, just parameterized by this bake's own bbox. Race
+  // guard: uFarmTex/uFarmBounds are only wired up AFTER the texture has
+  // finished decoding, and the opacity uniform stays 0 until then.
+  let farmSimTex = null
+  let farmSimMeta = null
+  const farmSimFetch = { loading: false, loaded: false }
+  function applyFarmSimBounds() {
+    if (!farmSimTex || !farmSimMeta || !heightField) return
+    const b = farmSimMeta.bbox
+    const nw = heightField.projection.lonLatToWorld(b.minLon, b.maxLat) // west / north
+    const se = heightField.projection.lonLatToWorld(b.maxLon, b.minLat) // east / south
+    terrain.mapUniforms.uFarmBounds.value.set(nw.x, nw.z, se.x, se.z)
+    terrain.mapUniforms.uFarmTex.value = farmSimTex
+  }
+  async function loadFarmSim() {
+    if (farmSimFetch.loading || farmSimFetch.loaded) return
+    farmSimFetch.loading = true
+    try {
+      const metaRes = await fetch(await manifestUrl('farm_sim', '/layers/farm_sim.json'))
+      if (!metaRes.ok) throw new Error(`farm_sim.json ${metaRes.status}`)
+      farmSimMeta = await metaRes.json()
+      const pngUrl = farmSimMeta.png ?? '/layers/farm_sim.png'
+      const tex = await new Promise((resolve, reject) =>
+        new THREE.TextureLoader().load(pngUrl, resolve, undefined, reject)
+      )
+      // intensity data (binary presence mask), not color: no sRGB decode,
+      // linear filter, no mipmaps; flipY false matches the bake's row-0-is-
+      // north convention (see the shader's UV math)
+      tex.flipY = false
+      tex.colorSpace = THREE.NoColorSpace
+      tex.minFilter = THREE.LinearFilter
+      tex.magFilter = THREE.LinearFilter
+      tex.generateMipmaps = false
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping
+      tex.needsUpdate = true
+      farmSimTex = tex
+      farmSimFetch.loaded = true
+    } catch (err) {
+      console.warn('[layers] farm sim fetch failed', err)
+    } finally {
+      farmSimFetch.loading = false
+      applyFarmSim() // now that the texture (or its failure) has landed
+    }
+  }
+  // Set the shader uniforms from the farmVisible toggle / 農田濃度. Kicks the
+  // deferred fetch on the first farm switch-on; keeps the opacity uniform at
+  // 0 (branch skipped in the shader) until the texture is bound — so the
+  // layer is truly zero-cost while off.
+  function applyFarmSim() {
+    const on = !!params.farmVisible
+    if (on && !farmSimFetch.loaded && !farmSimFetch.loading) loadFarmSim()
+    const active = on && farmSimFetch.loaded
+    if (active) applyFarmSimBounds()
+    terrain.mapUniforms.uFarmColor.value.set(params.farmColor)
+    terrain.mapUniforms.uFarmOpacity.value = active ? params.farmOpacity : 0
+    invalidate()
+  }
+
+  // farm_sim LayerManager entry: unlike rivers (which owns a surface mesh +
+  // name labels alongside the sim tint), the farm layer's ENTIRE visual IS
+  // the terrain-shader tint above — no object3d, no geometry. Registered as
+  // its own INDEPENDENT layer (agriculture, not hydrology) purely so it gets
+  // a row in the Layers panel; paramMap/visibleParam route every control
+  // through setParams → HANDLERS.farmVisible/farmOpacity/farmColor → applyFarmSim().
+  function createFarmSimLayer(params) {
+    return {
+      id: 'farm_sim',
+      kind: 'raster',
+      label: 'Farm Sim',
+      rowLabel: '農田 Farmland',
+      visibleParam: 'farmVisible',
+      paramMap: { visible: 'farmVisible', opacity: 'farmOpacity', color: 'farmColor' },
+      build() {},
+      update() {}, // no-op: applyFarmSim() owns every uniform this layer drives
+      describe() {
+        return {
+          id: 'farm_sim',
+          kind: 'raster',
+          label: 'Farm Sim',
+          rowLabel: '農田 Farmland',
+          count: 0,
+          visible: params.farmVisible,
+          styleSchema: {
+            opacity: { type: 'slider', label: '農田濃度 Intensity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+            color: { type: 'color', label: '顏色 Color' },
+          },
+          style: { opacity: params.farmOpacity, color: params.farmColor },
+        }
+      },
+      dispose() {},
+    }
   }
 
   // reservoirs: fetch the baked basin polygons + dam markers, then the LIVE
@@ -1345,6 +1501,23 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     reservoirsRatio: (v) => reservoirsLayer.setManualRatio(v / 100),
     reservoirsOpacity: () => reservoirsLayer.update(layerCtx()),
     reservoirsColor: () => reservoirsLayer.update(layerCtx()),
+    // farm: whole-island physics-derived farmland tint (terrain.js uFarmTex).
+    // INDEPENDENT of rivers/reservoirs — agriculture, not hydrology. First
+    // switch-on triggers the deferred PNG fetch (applyFarmSim no-ops the
+    // uniform until it lands); style params just re-apply the uniforms.
+    farmVisible: () => applyFarmSim(),
+    farmOpacity: () => applyFarmSim(),
+    farmColor: () => applyFarmSim(),
+    // irrigation: manifest-driven deferred polyline layer, same deferred-fetch
+    // pattern as trails; one shared baked color (no per-line vertexColors —
+    // see loadIrrigationData / polyline.js createIrrigationLayer)
+    irrigationVisible: (v) => {
+      if (v) loadIrrigationData()
+      layers.get('irrigation').update(layerCtx())
+    },
+    irrigationWidth: () => layers.get('irrigation').update(layerCtx()),
+    irrigationOpacity: () => layers.get('irrigation').update(layerCtx()),
+    irrigationColor: () => layers.get('irrigation').update(layerCtx()),
     // region: first switch-on fetches the neighbouring coastlines (deferred);
     // the sea plane + style params re-run the layer's update
     regionVisible: (v) => {
