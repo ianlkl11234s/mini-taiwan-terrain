@@ -83,6 +83,15 @@
       "url": "/layers/irrigation.json",
       "visible": false,
       "style": { "width": 1.5, "opacity": 0.85 }
+    },
+    {
+      "id": "coastlines_extended",
+      "kind": "line",
+      "label": "Coastlines (Extended)",
+      "rowLabel": "海岸線（延伸）Coastlines Extended",
+      "url": "/layers/coastlines_extended.json",
+      "visible": false,
+      "style": { "width": 2.5, "opacity": 0.85, "color": "#1c1c1c" }
     }
   ]
 }

@@ -847,6 +847,36 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     poiAnchor.set(controls.target.x, controls.target.z)
   }
 
+  // coastline's outlying-island rings (Penghu/Kinmen/Matsu/China coast/
+  // Taiwan's own outlying islands — scripts/bake_coastlines.py) are ADDITIVE
+  // to the existing main-island ring, not a separate layer/toggle (see
+  // polyline.js createCoastlineLayer). Deferred fetch, same fail-quiet
+  // pattern as rail/trails below; unlike those, coastline defaults to
+  // visible so this is also kicked once unconditionally right after layer
+  // registration (see the `if (params.coastline)` call below), since
+  // HANDLERS.coastline's own toggle-on path only fires on an explicit
+  // off→on setParams call, which never happens for an already-true default.
+  let coastlineExtFetch = { loading: false, loaded: false }
+  async function loadCoastlineExtendedData() {
+    if (coastlineExtFetch.loading || coastlineExtFetch.loaded) return
+    coastlineExtFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('coastlines_extended', '/layers/coastlines_extended.json'))
+      if (!res.ok) throw new Error(`coastlines_extended.json ${res.status}`)
+      const data = await res.json()
+      layers.get('coastline').setExtraRings(data.rings.map((r) => r.points.map(([lon, lat]) => [lon, lat, 0])))
+      coastlineExtFetch.loaded = true
+      layers.get('coastline').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] coastlines_extended fetch failed', err)
+    } finally {
+      coastlineExtFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+  if (params.coastline) loadCoastlineExtendedData()
+
   // ---------------------------------------------------------------- deferred GIS layers (rail / stations)
   // Both public/layers/*.json are baked offline (scripts/bake_layer_elevations.py)
   // with per-vertex elevation already baked in — no DEM sampling needed here,
@@ -1451,7 +1481,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // overlay layers: visibility toggle just flips the group; style/geometry
     // params re-run the layer's full update (lazy build + vertical + material)
     labels: (v) => labelsLayer.setVisible(v),
-    coastline: () => layers.get('coastline').update(layerCtx()),
+    // coastline: off→on also kicks the outlying-island rings' deferred fetch
+    // (loadCoastlineExtendedData no-ops once loaded/in-flight) — the layer
+    // shows its (possibly still main-ring-only) geometry immediately either way.
+    coastline: (v) => {
+      if (v) loadCoastlineExtendedData()
+      layers.get('coastline').update(layerCtx())
+    },
     coastlineWidth: () => layers.get('coastline').update(layerCtx()),
     coastlineOpacity: () => layers.get('coastline').update(layerCtx()),
     coastlineColor: () => layers.get('coastline').update(layerCtx()),

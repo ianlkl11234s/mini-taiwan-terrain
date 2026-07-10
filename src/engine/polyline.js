@@ -314,20 +314,34 @@ const POLYLINE_STYLE = (widthMax) => ({
 
 // Taiwan main-island coastline: one closed sea-level ring (county boundaries
 // unioned, largest polygon's exterior, simplified to 100 m — 1,289 points).
+// Rendered in 'draped' mode (LineSegments2, one baked elevation of 0 per
+// vertex) rather than 'flat' Line2 — not because the ring needs draping (it's
+// still a flat sea-level plane), but so the outlying-island rings (Penghu /
+// Kinmen / Matsu / China coast / Taiwan's own outlying islands —
+// public/layers/coastlines_extended.json) can share the SAME draw call and
+// the SAME toggle: draped mode's LineSegmentsGeometry holds any number of
+// disjoint polylines, unlike flat mode's Line2 (one single continuous line —
+// concatenating disjoint rings into it would draw stray connecting segments
+// between them). The extension rings are merged in lazily (see index.js
+// loadCoastlineExtendedData) via setExtraRings(), which rebakes setData()
+// with [mainRing, ...extraRings] — no separate layer, no separate toggle.
 export function createCoastlineLayer(params) {
-  return createPolylineLayer(
+  const mainRing = RING.map(([lon, lat]) => [lon, lat, 0])
+  const layer = createPolylineLayer(
     {
       id: 'coastline',
       label: 'Coastline',
       rowLabel: '海岸線 Coastline',
-      mode: 'flat',
-      polylines: RING,
+      mode: 'draped',
+      polylines: [mainRing],
       liftBase: 0.03,
       paramMap: { visible: 'coastline', color: 'coastlineColor', width: 'coastlineWidth', opacity: 'coastlineOpacity' },
       styleSchema: POLYLINE_STYLE(8),
     },
     params
   )
+  layer.setExtraRings = (extraRings) => layer.setData([mainRing, ...extraRings])
+  return layer
 }
 
 // County borders: the main island's INTERNAL county boundaries (33 polylines,
