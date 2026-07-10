@@ -342,6 +342,28 @@ export function createRailLayer(params) {
   )
 }
 
+// Trails: manifest-driven deferred layer (see index.js) — registers empty at
+// startup and is fed real polylines via setData() once
+// public/layers/trails.json has been fetched (first time the layer is
+// switched on). Unlike rail, every trail in the data shares ONE baked color
+// (#5a8f3d), so this uses the normal single paramMap.color swatch (draped,
+// like counties) instead of per-line vertexColors — no lineColors passed in.
+export function createTrailsLayer(params) {
+  return createPolylineLayer(
+    {
+      id: 'trails',
+      label: 'Trails',
+      rowLabel: '步道 Trails',
+      mode: 'draped',
+      polylines: [],
+      liftBase: 0.05,
+      paramMap: { visible: 'trailsVisible', color: 'trailsColor', width: 'trailsWidth', opacity: 'trailsOpacity' },
+      styleSchema: POLYLINE_STYLE(6),
+    },
+    params
+  )
+}
+
 // River water surfaces: a translucent sheet filling the wider downstream/
 // midstream channels (public/layers/river_surfaces.json — the narrow upstream
 // creeks stay as the river LINE). Every baked polygon is triangulated on the

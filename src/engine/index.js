@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import { Terrain } from './terrain.js'
 import { LayerManager } from './layers.js'
-import { createCoastlineLayer, createCountiesLayer, createRailLayer, createRiversLayer } from './polyline.js'
+import { createCoastlineLayer, createCountiesLayer, createRailLayer, createTrailsLayer, createRiversLayer } from './polyline.js'
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
@@ -115,6 +115,14 @@ export const DEFAULT_PARAMS = {
   railVisible: false,
   railWidth: 2,
   railOpacity: 0.9,
+  // trails: manifest-driven deferred layer (public/layers/trails.json, fetched
+  // on first trailsVisible:true), same fail-quiet pattern as rail. Every trail
+  // shares one baked color (see polyline.js createTrailsLayer) so — unlike
+  // rail — there IS a color param.
+  trailsVisible: false,
+  trailsWidth: 2,
+  trailsOpacity: 0.9,
+  trailsColor: '#5a8f3d',
   // rivers: the river layer's BODY is a physics-derived flow-accumulation tint
   // painted into the terrain shader (terrain.js uRiverTex, whole-island bake
   // public/layers/river_sim.png — the retired vector centerlines are gone). ONE
@@ -368,20 +376,40 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     rowLabel: '車站 Stations',
     onActivate: () => loadStationsData(),
   })
+  // trail signs: a third marker-set collection (one set — 'signs' — 3,407
+  // points), same deferred onActivate pattern as stations. Unlike stations,
+  // these points are waypoints along a route (often literally the same
+  // coordinates as the trails layer's own baked line vertices — see
+  // polyline.js createTrailsLayer), not sparse distinctly-named entities:
+  // showLabels:false drops the per-point name tags (every waypoint on one
+  // trail shares that trail's name — tags would pile up), and a smaller
+  // dotRadius keeps the dense marker chain from reading as a solid tube that
+  // hides the thinner trail line drawn at the same spots. See
+  // loadTrailSignsData below.
+  const trailSignsLayer = createPointLayer(params, {
+    id: 'trail_signs',
+    label: 'Trail Signs',
+    rowLabel: '步道路標 Trail Signs',
+    onActivate: () => loadTrailSignsData(),
+    showLabels: false,
+    dotRadius: 0.05,
+  })
   const labelsLayer = createLabelsLayer(params)
   const reservoirsLayer = createReservoirLayer(params)
   // registration order = draw / update order (coastline → counties → rail →
-  // rivers → reservoirs → markers → stations → labels)
+  // trails → rivers → reservoirs → markers → stations → trail signs → labels)
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
     createCountiesLayer(params),
     createRailLayer(params),
+    createTrailsLayer(params),
     createRiversLayer(params),
     reservoirsLayer,
     createTyphoonLayer(params),
     pointLayer,
     stationsLayer,
+    trailSignsLayer,
     labelsLayer,
   ]) {
     layers.register(layer, layerCtx())
@@ -728,6 +756,29 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
   }
 
+  // trails: same deferred fetch-once pattern as rail (baked polylines, no
+  // per-line official colors — see polyline.js createTrailsLayer). setData
+  // takes no lineColors arg so the single trailsColor swatch drives the style.
+  let trailsFetch = { loading: false, loaded: false }
+  async function loadTrailsData() {
+    if (trailsFetch.loading || trailsFetch.loaded) return
+    trailsFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('trails', '/layers/trails.json'))
+      if (!res.ok) throw new Error(`trails.json ${res.status}`)
+      const data = await res.json()
+      layers.get('trails').setData(data.lines.map((l) => l.points))
+      trailsFetch.loaded = true
+      layers.get('trails').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] trails fetch failed', err)
+    } finally {
+      trailsFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
   // region: deferred neighbouring-coastline data (public/layers/region_coast.json)
   // fetched once on first switch-on, exactly like rail. The sea plane shows even
   // before the lines land; a fetch failure just leaves the plane + a warn.
@@ -958,6 +1009,26 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
   }
 
+  // trailSignsLayer.onActivate — one marker set ('signs', 3,407 points, single
+  // baked color). Same fail-quiet deferred pattern as stations: a fetch
+  // failure just leaves the layer showing no sets.
+  async function loadTrailSignsData() {
+    try {
+      const res = await fetch(await manifestUrl('trail_signs', '/layers/trail_signs.json'))
+      if (!res.ok) throw new Error(`trail_signs.json ${res.status}`)
+      const data = await res.json()
+      for (const [systemId, sys] of Object.entries(data.systems)) {
+        trailSignsLayer.setSet(systemId, { color: sys.color, visible: true, points: sys.points })
+      }
+      trailSignsLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] trail signs fetch failed', err)
+    } finally {
+      invalidate()
+      emit('layers')
+    }
+  }
+
   // ---------------------------------------------------------------- real-world DEM loading
 
   // The whole session lives in ONE world: the projection is anchored at the
@@ -1120,6 +1191,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     },
     railWidth: () => layers.get('rail').update(layerCtx()),
     railOpacity: () => layers.get('rail').update(layerCtx()),
+    // trails: same deferred-fetch pattern as rail; unlike rail this one has a
+    // color param (every trail shares one baked color, no per-line override)
+    trailsVisible: (v) => {
+      if (v) loadTrailsData()
+      layers.get('trails').update(layerCtx())
+    },
+    trailsWidth: () => layers.get('trails').update(layerCtx()),
+    trailsOpacity: () => layers.get('trails').update(layerCtx()),
+    trailsColor: () => layers.get('trails').update(layerCtx()),
     // rivers: ONE toggle brings up the whole layer — the river-name labels +
     // water-surface sheet (deferred fetch) and the physics river-body tint
     // (deferred PNG fetch, via applyRiverSim). Same fail-quiet deferred pattern
