@@ -93,6 +93,19 @@
 
 Phase 1 與 2 可平行；3 依賴 2；4 獨立可插隊。
 
+### 近期排程（2026-07-10 可行性調查後定案，用戶指定順序：③→④→⑤→①②）
+
+三個平行調查（資料/引擎/DEM 上游）的關鍵結論與排程：
+
+| # | 項目 | 關鍵事實 | 做法 |
+|---|------|---------|------|
+| ③ | 海平面透出修復 | 根因雙重：(a) `region.js` 海面抗 z-fight 偏移是寫死常數，沒像 water/polyline 用 `zFightLift(base, fogScale)` 隨相機距離縮放；(b) `region_sea_mask.png` 僅 ~220m/px 且只描本島，與 20m DTM 邊界對不齊 | **③a 立即**：region 補 zFightLift（小）。**③b 併入④**：遮罩隨新覆蓋範圍重烘（解析度提高、含離島、與 DTM 有效邊界一致） |
+| ④ | 澎湖擴圖 | 現有 raw DEM（2024 不分幅 722MB）**不含澎湖**；[2018 年版](https://data.gov.tw/dataset/167387)有澎湖 20m DTM（CSV 網格點，OGDL）。引擎端多島免費（chunk 掃描自動跳過海面），只需 `geo.js:22` bbox 西擴至 ~119.2 + `flyToLonLat` guard 文案；z10 磚多 1-2 欄 | 上游 analytics `01_encode_terrarium_tiles.py`：澎湖 CSV→GeoTIFF 併入 VRT → 重烘 → R2；前端 bbox 一行 |
+| ⑤ | 海底地形 | terrarium 原生負值；著色 ramp 是 texture 查表免改 GLSL。資料源推薦 **GEBCO 2025**（public domain，~450m）；近岸更細需內政部申請制（不做第一步）。前端三處：`dem.js:43` 的 `v<-100→0` 會誤殺真水深（改判 NODATA sentinel）、`TAIWAN_MIN_M=0` 正規化擴負值域＋海洋藍 ramp 段、region 海面從遮罩板改半透明疊加 | 做成 bake 的 `--with-bathymetry` 獨立模式疊在④之上（陸=NLSC 20m、海=GEBCO），可回退；tile 估 2,706→~6,100（R2 +150-250MB） |
+| ①② | 農田 + 灌溉渠道 | 農田：PMTiles 102MB 現成（含澎金馬）但引擎無向量瓦片能力 → **首選 river_sim 已驗證的「柵格化+shader drape 染色」**，38.6 萬 polygon 變一張貼圖；要單田可點選再議 PMTiles。灌溉：**全國版** `infrastructure/irrigation_canal`（21,785 條/17 管理處/27MB）simplify 後照 trails 模式 bake，幹線常駐、細渠分級 | 各一支 bake + 圖層，照 /new-layer SOP |
+
+依賴鏈：③a 獨立；④ 是一次上游重烘工程（含③b 遮罩）；⑤ 疊在④的 bake 之上；①② 完全獨立、隨時可插隊。
+
 ## 6. Agent 分工
 
 - **主迴圈（Fable/Opus 級）**：理解需求、拆任務、派工（必指定模型）、驗收、跨 repo 決策把關。不下場寫大量程式碼。
