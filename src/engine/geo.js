@@ -19,7 +19,7 @@ const K_ANCHOR_UNITS = 56 // legacy TERRAIN_SIZE
 
 // Coverage of the self-hosted tile set. No tile requests happen outside this
 // box (it's all open sea / 404s) and the pan clamp keeps the target inside it.
-export const TAIWAN_BBOX = { minLon: 119.9, maxLon: 122.1, minLat: 21.8, maxLat: 25.4 }
+export const TAIWAN_BBOX = { minLon: 119.2, maxLon: 122.1, minLat: 21.8, maxLat: 25.4 }
 
 // Fixed island-wide elevation range: the hypsometric ramp and vertex tint must
 // normalize against ONE range or chunks built at different times would color

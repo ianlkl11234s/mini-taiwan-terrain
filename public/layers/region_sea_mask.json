@@ -1,14 +1,14 @@
 {
   "bbox": {
-    "minLon": 119.90691,
+    "minLon": 119.2,
     "maxLon": 122.1275,
     "minLat": 21.7756,
     "maxLat": 25.4203
   },
   "size": {
-    "w": 1024,
+    "w": 1350,
     "h": 1835
   },
   "png": "/layers/region_sea_mask.png",
-  "note": "row 0 = north, col 0 = west; L: sea=255 land=0 (main island only)"
+  "note": "row 0 = north, col 0 = west; L: sea=255 land=0; DEM-derived from 本島+澎湖 20m DTM mosaic 有效像素=陸（gdalbuildvrt+gdalwarp nearest）; 內陸孤立 nodata（雲遮等）用 binary_fill_holes 補為陸; 綠島/龜山島不在任一來源 DTM 範圍內，nodata 仍判為海"
 }
