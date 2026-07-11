@@ -155,6 +155,15 @@
       "rowLabel": "高鐵列車 THSR Trains",
       "url": "/layers/thsr_schedule.json",
       "visible": false
+    },
+    {
+      "id": "airspace",
+      "kind": "area",
+      "label": "Airspace",
+      "rowLabel": "空域 Airspace",
+      "url": "/layers/airspace.json",
+      "visible": false,
+      "style": { "opacity": 0.25 }
     }
   ]
 }

@@ -10,6 +10,7 @@ import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
 import { createOsmRoadsLayer, createTrailsLayer, createFtwFieldsLayer, createBuildingsLayer } from './vectortiles.js'
+import { createAirspaceLayer } from './airspace.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
 import * as timeStore from '../state/timeStore.js'
@@ -280,6 +281,12 @@ export const DEFAULT_PARAMS = {
   // is the only style param, default just under fully opaque.
   buildingsVisible: false,
   buildingsOpacity: 0.95,
+  // airspace: baked-JSON polygon-extrusion layer (src/engine/airspace.js,
+  // public/layers/airspace.json — bake_airspace.py's P/R/D-filtered 31 zones
+  // out of the source 81). 0.25 default so the stacked walls of overlapping
+  // zones don't read as a solid opaque blob (design brief).
+  airspaceVisible: false,
+  airspaceOpacity: 0.25,
   // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
   // S Japan, S Korea, SE China) as flat strokes over a sea-coloured plane —
   // geographic context beyond the Taiwan DEM footprint (src/engine/region.js).
@@ -689,6 +696,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const trailsLayer = createTrailsLayer(params, { invalidate })
   const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
   const buildingsLayer = createBuildingsLayer(params, { invalidate })
+  const airspaceLayer = createAirspaceLayer(params)
   const shipsLayer = createShipsLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
@@ -731,6 +739,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // infrastructure like stations/ships above
     airports: { group: GROUP_MOVE },
     ports: { group: GROUP_MOVE },
+    // 3D airspace fence (bake_airspace.py / src/engine/airspace.js) — aviation
+    // hazard/restriction overlay, alongside airports/ports above
+    airspace: { group: GROUP_MOVE },
     rivers: { group: GROUP_WATER },
     reservoirs: { group: GROUP_WATER },
     // farmland tint + irrigation canals: agriculture, not hydrology — its own
@@ -752,13 +763,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     typhoon: { group: GROUP_FX },
   }
   // registration order = draw / update order (coastline → counties →
-  // buildings → rail → trains → thsr → trails → rivers → reservoirs → farm
-  // sim → irrigation → typhoon → markers → stations → ships → trail signs →
-  // labels). thsr
+  // buildings → airspace → rail → trains → thsr → trails → rivers →
+  // reservoirs → farm sim → irrigation → typhoon → markers → stations →
+  // ships → trail signs → labels). thsr
   // registers right after trains so it lands directly below 台鐵列車 Trains,
   // and ships registers right after stations, both in the Layers panel's
   // 交通 Move group (Layers.jsx preserves registration order within a group
-  // — see groupLayers()).
+  // — see groupLayers()). airspace registers right after buildings (same
+  // low-pick-priority reasoning).
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
@@ -767,6 +779,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // order) so its solid extruded meshes never swallow clicks meant for
     // roads/rail/markers drawn on top of it
     buildingsLayer,
+    // airspace: same early/low-pick-priority registration as buildings — a
+    // large translucent volume floating well above ground level shouldn't
+    // steal clicks meant for anything drawn on top of it
+    airspaceLayer,
     createRailLayer(params),
     createTrainsLayer(params, {
       // near-view car-chain LOD (see trains.js module header) — real TRA EMU
@@ -1786,6 +1802,30 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
   }
 
+  // airspace: manifest-driven deferred polygon-extrusion layer (bake_airspace.py
+  // -> public/layers/airspace.json). Same fail-quiet fetch-once pattern as
+  // loadPoiData above; airspaceLayer.setData/update mirror water.js's
+  // reservoirs setData/build split (see airspace.js module header).
+  let airspaceFetch = { loading: false, loaded: false }
+  async function loadAirspaceData() {
+    if (airspaceFetch.loading || airspaceFetch.loaded) return
+    airspaceFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('airspace', '/layers/airspace.json'))
+      if (!res.ok) throw new Error(`airspace.json ${res.status}`)
+      const data = await res.json()
+      airspaceLayer.setData(data.zones)
+      airspaceFetch.loaded = true
+      airspaceLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] airspace fetch failed', err)
+    } finally {
+      airspaceFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
   // ---------------------------------------------------------------- real-world DEM loading
 
   // The whole session lives in ONE world: the projection is anchored at the
@@ -2081,6 +2121,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // against the z13 source minzoom
     buildingsVisible: () => buildingsLayer.update(layerCtx()),
     buildingsOpacity: () => buildingsLayer.update(layerCtx()),
+    // airspace: manifest-driven deferred polygon layer, same first-switch-on-
+    // fetches pattern as reservoirs/region below
+    airspaceVisible: (v) => {
+      if (v) loadAirspaceData()
+      airspaceLayer.update(layerCtx())
+    },
+    airspaceOpacity: () => airspaceLayer.update(layerCtx()),
     // region: first switch-on fetches the neighbouring coastlines (deferred);
     // the sea plane + style params re-run the layer's update
     regionVisible: (v) => {
