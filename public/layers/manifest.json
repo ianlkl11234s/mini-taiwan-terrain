@@ -108,6 +108,22 @@
       "rowLabel": "台鐵列車 Trains",
       "url": "/layers/train_schedule.json",
       "visible": false
+    },
+    {
+      "id": "thsr_tracks",
+      "kind": "train-tracks",
+      "label": "THSR Tracks",
+      "rowLabel": "高鐵路段比例表 THSR Tracks",
+      "url": "/layers/thsr_tracks.json",
+      "visible": false
+    },
+    {
+      "id": "thsr_schedule",
+      "kind": "train-schedule",
+      "label": "THSR Trains",
+      "rowLabel": "高鐵列車 THSR Trains",
+      "url": "/layers/thsr_schedule.json",
+      "visible": false
     }
   ]
 }

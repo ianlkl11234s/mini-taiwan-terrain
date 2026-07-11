@@ -59,6 +59,40 @@ Outputs (both go to public/layers/, committed to git, no R2)
 -------------------------------------------------------------
   public/layers/train_tracks.json    -- per-part station ratio tables
   public/layers/train_schedule.json  -- per-train stop times
+
+THSR (高鐵) extension
+---------------------
+Same script also bakes public/layers/thsr_tracks.json + thsr_schedule.json,
+same schema, from:
+- rail_lines.json system=="thsr": exactly 2 parts, mirrored geometry of the
+  SAME single physical corridor (both literally named "高速鐵路" -- name is
+  even less useful than for TRA). Verified by snapping all 12 stations onto
+  each part (EPSG:3826): part 0 is 南下 (南港 ratio~0 -> 左營 ratio~1), part 1
+  is 北上 (左營 ratio~0 -> 南港 ratio~1). Always join by part_id (thsr_00/
+  thsr_01), never by name.
+- stations.json systems.thsr: 12 stations, already complete (all 12 pulse
+  THSR station_id->name_zh strings match this repo's 12 names verbatim, 0
+  aliasing needed -- unlike TRA there was no "missing station" gap to fill).
+- ../mini-taiwan-pulse/public/rail/thsr/stations/stations.geojson: THSR
+  station_id (TDX 4-digit code, e.g. "0990") -> name_zh, for resolving the
+  schedule's numeric station_id.
+- ../mini-taiwan-pulse/public/rail/thsr/schedules/daily/2026-02-18.json:
+  one concrete calendar day (per its own _metadata), 2 direction tracks
+  (THSR-1-0 南下 / THSR-1-1 北上) each with a `departures[]` array of real
+  trains -- this is the per-train version (the sibling thsr_schedules.json
+  in the same dir has the identical per-train shape but is NOT tied to a
+  specific date and has fewer departures per track -- an aggregate/rollup,
+  not what we want; the dated daily/ file is the direct analogue of TRA's
+  master_schedule.json "one representative weekday" role).
+- Unlike TRA (37 disjoint/overlapping corridor parts, ambiguous station<->
+  part matching), THSR has only 2 full-length mirrored parts and EVERY
+  station sits on BOTH -- so a naive "do these two stops share any part"
+  test would trivially always pass regardless of direction. Instead each
+  departures[] track is resolved ONCE to its correct part_id by geometry
+  (find the part where the track's origin has a lower ratio than its
+  destination), then every train under that track reuses that same
+  part_id. This is expected to give ~100% leg coverage (no cross-line
+  ambiguity like TRA's mislabeled/duplicated part names).
 """
 import json
 import sys
@@ -79,6 +113,9 @@ RAIL_LINES_SRC = ROOT / "public" / "layers" / "rail_lines.json"
 STATIONS_SRC = ROOT / "public" / "layers" / "stations.json"
 PULSE_STATIONS_SRC = PULSE_ROOT / "public/rail/tra/stations/stations.geojson"
 MASTER_SCHEDULE_SRC = PULSE_ROOT / "public/rail/tra/master_schedule.json"
+
+PULSE_THSR_STATIONS_SRC = PULSE_ROOT / "public/rail/thsr/stations/stations.geojson"
+THSR_SCHEDULE_SRC = PULSE_ROOT / "public/rail/thsr/schedules/daily/2026-02-18.json"
 
 # Empirically chosen (see report): p99 nearest-station-to-its-own-line
 # distance across all 244 TRA stations was ~129m, with a single genuine
@@ -128,6 +165,29 @@ def nearest_on_polyline(poly_xy, query_xy):
     return best_dist, ratio, total_len
 
 
+def write_json_stable(path, payload):
+    """Write payload (compact JSON) to path, EXCEPT when an existing file
+    at path already holds byte-identical content once its own meta.generated
+    is patched to payload's meta.generated -- in that case leave the
+    existing file (and its original, real "last changed" timestamp)
+    untouched. Without this, every rerun would rewrite meta.generated to
+    datetime.now() and produce a spurious 1-field diff on every bake, even
+    when nothing about the actual data changed (the repo's tra outputs must
+    stay git-diff-clean across reruns of an unchanged upstream snapshot)."""
+    new_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if path.exists():
+        try:
+            old = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            old = None
+        if isinstance(old, dict) and "meta" in old and "meta" in payload:
+            old_restamped = {**old, "meta": {**old["meta"], "generated": payload["meta"]["generated"]}}
+            if json.dumps(old_restamped, ensure_ascii=False, separators=(",", ":")) == new_bytes:
+                print(f"  (content unchanged, keeping generated={old['meta'].get('generated')}) -> {path.name}")
+                return
+    path.write_text(new_bytes)
+
+
 def build_station_catalog():
     """name -> (lon, lat, source). Prefer terrain-art coords; fill gaps
     from pulse. Also returns pulse station_id -> name for schedule lookup,
@@ -162,7 +222,7 @@ def build_station_catalog():
     return catalog, id2name, added_from_pulse, conflicts, len(ta_stations), len(pulse_geo)
 
 
-def build_tracks(tra_parts, catalog):
+def build_tracks(tra_parts, catalog, prefix="tra"):
     names = sorted(catalog.keys())
     station_xy = project_lonlat([(catalog[n][0], catalog[n][1]) for n in names])
 
@@ -195,7 +255,7 @@ def build_tracks(tra_parts, catalog):
 
         parts_out.append(
             {
-                "part_id": f"tra_{i:02d}",
+                "part_id": f"{prefix}_{i:02d}",
                 "name": part.get("name", ""),
                 "label": label,
                 "length_m": round(total_len, 1),
@@ -208,9 +268,50 @@ def build_tracks(tra_parts, catalog):
     for n in names:
         parts = sorted(station_parts[n].keys())
         if len(parts) >= 2:
-            interchanges.append({"station": n, "parts": [f"tra_{p:02d}" for p in parts]})
+            interchanges.append({"station": n, "parts": [f"{prefix}_{p:02d}" for p in parts]})
 
     return parts_out, station_parts, interchanges
+
+
+def build_thsr_station_catalog():
+    """THSR name -> (lon, lat) catalog, sourced from this repo's
+    stations.json systems.thsr (already complete, all 12 stations present --
+    unlike TRA there is no gap to fill from pulse). Also returns pulse THSR
+    station_id -> name_zh (for resolving the schedule's numeric station_id),
+    plus a list of any pulse station name NOT found in the terrain-art
+    catalog (sanity check -- expect empty, verified while writing this
+    script: all 12 pulse name_zh strings match this repo's 12 thsr names
+    verbatim)."""
+    ta_stations = json.loads(STATIONS_SRC.read_text())["systems"]["thsr"]["points"]
+    pulse_geo = json.loads(PULSE_THSR_STATIONS_SRC.read_text())["features"]
+
+    catalog = {p["name"]: (p["lon"], p["lat"]) for p in ta_stations}
+
+    id2name = {}
+    conflicts = []
+    for feat in pulse_geo:
+        pr = feat["properties"]
+        name = pr["name_zh"]
+        id2name[pr["station_id"]] = name
+        if name not in catalog:
+            conflicts.append(name)
+
+    return catalog, id2name, conflicts, len(ta_stations), len(pulse_geo)
+
+
+def match_thsr_track_to_part(origin, dest, station_parts):
+    """A THSR direction-track (e.g. "南下": origin=南港, dest=左營) is
+    resolved to whichever built part has origin's ratio < dest's ratio
+    (both parts touch every station, so this direction test -- not mere
+    membership -- is what actually distinguishes them). Returns the part
+    index, or None if no part qualifies."""
+    part_idxs = sorted({p for parts in station_parts.values() for p in parts})
+    for i in part_idxs:
+        ro = station_parts.get(origin, {}).get(i)
+        rd = station_parts.get(dest, {}).get(i)
+        if ro is not None and rd is not None and ro < rd:
+            return i
+    return None
 
 
 TRAIN_TYPE_HINT = {
@@ -243,6 +344,169 @@ def resolve_stops(schedule, id2name):
     return stops, dropped
 
 
+def bake_thsr(generated):
+    """Bake thsr_tracks.json + thsr_schedule.json (same schema as the TRA
+    outputs above, independent files -- see module docstring's "THSR
+    extension" section). `generated` is the SAME run timestamp main() used,
+    so both file pairs share one bake epoch."""
+    print("\n=== THSR 1/4 loading sources ===")
+    rail = json.loads(RAIL_LINES_SRC.read_text())
+    thsr_parts = [l for l in rail["lines"] if l.get("system") == "thsr"]
+    print(f"rail_lines.json: {len(rail['lines'])} lines total, {len(thsr_parts)} system=='thsr'")
+
+    catalog, id2name, conflicts, ta_count, pulse_count = build_thsr_station_catalog()
+    print(f"stations.json (thsr): {ta_count} stations")
+    print(f"pulse thsr stations.geojson: {pulse_count} stations")
+    if conflicts:
+        print(f"  ! {len(conflicts)} pulse station name(s) not found in terrain-art catalog: {conflicts}")
+    else:
+        print("  0 alias conflicts (all pulse THSR station names match terrain-art stations.json)")
+
+    print("\n=== THSR 2/4 snapping stations onto each THSR line part (EPSG:3826 arc length) ===")
+    parts_out, station_parts, interchanges = build_tracks(thsr_parts, catalog, prefix="thsr")
+    total_membership = sum(len(v) for v in station_parts.values())
+    print(f"total station<->part memberships (dist<{MATCH_THRESHOLD_M:.0f}m): {total_membership}")
+
+    tracks_payload = {
+        "meta": {
+            "generated": generated,
+            "distance_metric": "epsg3826_arc_length_m",
+            "match_threshold_m": MATCH_THRESHOLD_M,
+            "partCount": len(parts_out),
+            "note": (
+                "parts[] is index-aligned 1:1 with rail_lines.json's "
+                "system=='thsr' filter (same order, same count=2). Both "
+                "parts are mirrored geometry of the SAME single physical "
+                "corridor -- part thsr_00 is 南下 (南港->左營, ratio 0->1), "
+                "part thsr_01 is 北上 (左營->南港, ratio 0->1). Always join "
+                "by part_id/array index, never by name (both parts are "
+                "literally named '高速鐵路')."
+            ),
+        },
+        "parts": parts_out,
+        "interchanges": interchanges,
+    }
+    write_json_stable(OUT_DIR / "thsr_tracks.json", tracks_payload)
+
+    print("\n=== THSR 3/4 mapping departures onto line parts (coverage check) ===")
+    daily = json.loads(THSR_SCHEDULE_SRC.read_text())
+    source_meta = daily.get("_metadata", {})
+    track_keys = sorted(k for k in daily.keys() if k != "_metadata")
+
+    track_part_id = {}
+    for tk in track_keys:
+        track = daily[tk]
+        part_idx = match_thsr_track_to_part(track["origin"], track["destination"], station_parts)
+        track_part_id[tk] = f"thsr_{part_idx:02d}" if part_idx is not None else None
+        print(
+            f"  track {tk}  {track['name']}  {track['origin']}->{track['destination']}"
+            f"  departures={track['departure_count']}  -> part {track_part_id[tk]}"
+        )
+
+    schedule_out = []
+    total_departures = 0
+    total_dropped_stops = 0
+    trains_with_lt2_stops = 0
+    total_legs = 0
+    matched_legs = 0
+    trains_fully_matched = 0
+    trains_mostly_matched = 0
+
+    for tk in track_keys:
+        track = daily[tk]
+        part_id = track_part_id[tk]
+        part_idx = int(part_id.split("_")[1]) if part_id else None
+        for dep in track["departures"]:
+            total_departures += 1
+            stops, dropped = resolve_stops(dep, id2name)
+            total_dropped_stops += dropped
+            if len(stops) < 2:
+                trains_with_lt2_stops += 1
+
+            legs = max(len(stops) - 1, 0)
+            leg_matched = 0
+            if part_idx is not None:
+                for a, b in zip(stops, stops[1:]):
+                    ra = station_parts.get(a["station"], {}).get(part_idx)
+                    rb = station_parts.get(b["station"], {}).get(part_idx)
+                    if ra is not None and rb is not None and ra <= rb:
+                        leg_matched += 1
+            total_legs += legs
+            matched_legs += leg_matched
+            if legs > 0 and leg_matched == legs:
+                trains_fully_matched += 1
+            if legs > 0 and leg_matched / legs >= 0.8:
+                trains_mostly_matched += 1
+
+            origin = stops[0]["station"] if stops else track["origin"]
+            dest = stops[-1]["station"] if stops else track["destination"]
+            dep_h, dep_m, dep_s = (int(x) for x in dep["departure_time"].split(":"))
+            dep_sec_of_day = dep_h * 3600 + dep_m * 60 + dep_s
+            train_no = dep["train_id"].replace("THSR-", "")
+            schedule_out.append(
+                {
+                    "train_no": train_no,
+                    "train_type": "高鐵",
+                    "direction": f"{origin}→{dest}",
+                    "dep_sec_of_day": dep_sec_of_day,
+                    "stops": stops,
+                }
+            )
+
+    leg_coverage = matched_legs / total_legs if total_legs else 0.0
+    train_full_coverage = trains_fully_matched / total_departures if total_departures else 0.0
+    train_mostly_coverage = trains_mostly_matched / total_departures if total_departures else 0.0
+
+    print(f"schedules: {total_departures} departures across {len(track_keys)} tracks -> {len(schedule_out)} trains (none dropped)")
+    print(f"stops dropped (unresolvable station_id): {total_dropped_stops}")
+    print(f"trains with <2 resolvable stops: {trains_with_lt2_stops}")
+    print(f"total legs (adjacent resolvable-stop pairs): {total_legs}")
+    print(f"leg coverage (legs mapped to their track's direction part): {matched_legs}/{total_legs} = {leg_coverage:.1%}")
+    print(f"train coverage (100% of a train's legs mapped): {trains_fully_matched}/{total_departures} = {train_full_coverage:.1%}")
+    print(f"train coverage (>=80% of a train's legs mapped): {trains_mostly_matched}/{total_departures} = {train_mostly_coverage:.1%}")
+
+    schedule_payload = {
+        "meta": {
+            "generated": generated,
+            "source": source_meta,
+            "trainCount": len(schedule_out),
+            "leg_coverage": round(leg_coverage, 4),
+            "note": (
+                "Same convention as train_schedule.json (TRA): arr_sec/"
+                "dep_sec are seconds relative to this train's own "
+                "first-station departure; `dep_sec_of_day` is that first "
+                "departure's Asia/Taipei wall-clock time as integer "
+                "seconds-since-local-midnight (0..86399) -- the anchor an "
+                "engine needs to add to arr_sec/dep_sec before comparing "
+                "against a live clock. `direction` is literally "
+                "f'{first_stop}→{last_stop}' (some THSR trains start/end "
+                "mid-corridor, e.g. 台中-左營 shortworkings, so this is not "
+                "always 南港/左營). To place this train on the 3D map: for "
+                "each adjacent stop pair, look up thsr_tracks.json "
+                "parts[].stations for a station name match on both ends "
+                "(same part_id/index on both) to get ratio_from/ratio_to, "
+                "then lerp by elapsed time. Unlike TRA there is only ONE "
+                "physical corridor split into 2 mirrored direction parts "
+                "(thsr_00=南下, thsr_01=北上) -- a whole train's route "
+                "always lies on a single part."
+            ),
+        },
+        "schedules": schedule_out,
+    }
+    write_json_stable(OUT_DIR / "thsr_schedule.json", schedule_payload)
+
+    thsr_tracks_path = OUT_DIR / "thsr_tracks.json"
+    thsr_schedule_path = OUT_DIR / "thsr_schedule.json"
+
+    def _kb(p):
+        return f"{p.stat().st_size / 1024:.1f} KB"
+
+    print("\n=== THSR 4/4 output ===")
+    print(f"wrote -> {thsr_tracks_path} ({_kb(thsr_tracks_path)})")
+    print(f"wrote -> {thsr_schedule_path} ({_kb(thsr_schedule_path)})")
+    print(f"combined: {(thsr_tracks_path.stat().st_size + thsr_schedule_path.stat().st_size) / 1024:.1f} KB")
+
+
 def main():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     generated = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -264,7 +528,7 @@ def main():
         print("  0 alias conflicts (every shared name's coords agree within 100m)")
 
     print("\n=== 2/4 snapping stations onto each TRA line part (EPSG:3826 arc length) ===")
-    parts_out, station_parts, interchanges = build_tracks(tra_parts, catalog)
+    parts_out, station_parts, interchanges = build_tracks(tra_parts, catalog, prefix="tra")
     total_membership = sum(len(v) for v in station_parts.values())
     print(f"total station<->part memberships (dist<{MATCH_THRESHOLD_M:.0f}m): {total_membership}")
     print(f"stations touching >=2 parts (interchanges): {len(interchanges)}")
@@ -286,9 +550,7 @@ def main():
         "parts": parts_out,
         "interchanges": interchanges,
     }
-    (OUT_DIR / "train_tracks.json").write_text(
-        json.dumps(tracks_out, ensure_ascii=False, separators=(",", ":"))
-    )
+    write_json_stable(OUT_DIR / "train_tracks.json", tracks_out)
 
     print("\n=== 3/4 mapping 992 schedules onto line parts (coverage check) ===")
     master = json.loads(MASTER_SCHEDULE_SRC.read_text())
@@ -356,38 +618,33 @@ def main():
     print(f"train coverage (>=80% of a train's legs mapped): {trains_mostly_matched}/{len(schedules)} = {train_mostly_coverage:.1%}")
     print(f"train_type_code distribution: {Counter(s['train_type_code'] for s in schedules)}")
 
-    (OUT_DIR / "train_schedule.json").write_text(
-        json.dumps(
-            {
-                "meta": {
-                    "generated": generated,
-                    "source": master["metadata"],
-                    "trainCount": len(schedule_out),
-                    "leg_coverage": round(leg_coverage, 4),
-                    "note": (
-                        "arr_sec/dep_sec are seconds relative to this train's own "
-                        "first-station departure (same convention as pulse's "
-                        "master_schedule.json). `dep_sec_of_day` is that first "
-                        "departure's Asia/Taipei wall-clock time as integer "
-                        "seconds-since-local-midnight (0..86399) -- the anchor an "
-                        "engine needs to add to arr_sec/dep_sec before comparing "
-                        "against a live clock; a train can run past local "
-                        "midnight (dep_sec_of_day + last stop's arr_sec > 86400), "
-                        "so check both today's and yesterday's start instance. "
-                        "`direction` is literally f'{first_stop}→{last_stop}'. To "
-                        "place this train on the 3D map: for each adjacent stop "
-                        "pair, look up train_tracks.json parts[].stations for a "
-                        "station name match on both ends (same part_id/index on "
-                        "both) to get ratio_from/ratio_to, then lerp by elapsed "
-                        "time."
-                    ),
-                },
-                "schedules": schedule_out,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-    )
+    schedule_payload = {
+        "meta": {
+            "generated": generated,
+            "source": master["metadata"],
+            "trainCount": len(schedule_out),
+            "leg_coverage": round(leg_coverage, 4),
+            "note": (
+                "arr_sec/dep_sec are seconds relative to this train's own "
+                "first-station departure (same convention as pulse's "
+                "master_schedule.json). `dep_sec_of_day` is that first "
+                "departure's Asia/Taipei wall-clock time as integer "
+                "seconds-since-local-midnight (0..86399) -- the anchor an "
+                "engine needs to add to arr_sec/dep_sec before comparing "
+                "against a live clock; a train can run past local "
+                "midnight (dep_sec_of_day + last stop's arr_sec > 86400), "
+                "so check both today's and yesterday's start instance. "
+                "`direction` is literally f'{first_stop}→{last_stop}'. To "
+                "place this train on the 3D map: for each adjacent stop "
+                "pair, look up train_tracks.json parts[].stations for a "
+                "station name match on both ends (same part_id/index on "
+                "both) to get ratio_from/ratio_to, then lerp by elapsed "
+                "time."
+            ),
+        },
+        "schedules": schedule_out,
+    }
+    write_json_stable(OUT_DIR / "train_schedule.json", schedule_payload)
 
     tracks_path = OUT_DIR / "train_tracks.json"
     schedule_path = OUT_DIR / "train_schedule.json"
@@ -401,6 +658,9 @@ def main():
     print(f"combined: {(tracks_path.stat().st_size + schedule_path.stat().st_size) / 1024 / 1024:.2f} MB")
 
     verify_samples(schedules, id2name, station_parts, parts_out)
+
+    print("\n\n" + "=" * 70)
+    bake_thsr(generated)
 
 
 def leg_progress_at(stops, station_parts, t_query_sec):
