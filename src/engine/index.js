@@ -6,6 +6,7 @@ import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
 import { createTrainsLayer } from './trains.js'
+import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
 import { createOsmRoadsLayer, createFtwFieldsLayer } from './vectortiles.js'
@@ -52,7 +53,12 @@ export const DEFAULT_PARAMS = {
   demLat: 23.47,
   demLon: 120.9575,
   demZoom: 12,
-  demExaggeration: 1.6,
+  // real-world scale by default: horizontal and vertical share ONE world
+  // unit (≈ 480.78 m — see geo.js's K_ANCHOR comment) — 2026-07-11 user-
+  // specified default (docs/MARINE_DESIGN.md §0, was 1.6/exaggerated). The
+  // Settings 垂直放大 slider (0.5–5) still goes up to the old look, one drag
+  // away — this default only changes what loads on boot.
+  demExaggeration: 1.0,
   chunkRes: 128, // per-chunk grid density (real mode; 25 chunks share it)
   detailBias: 0, // 0|1 — lifts the distance-LOD ladder one zoom (Settings 精緻度; read by scene.tickView)
   outerChunkRes: 64, // grid density for outer LOD-ring chunks (64 標準/高, 128 超高)
@@ -157,6 +163,18 @@ export const DEFAULT_PARAMS = {
   thsrColor: '#ff7f2a',
   thsrSize: 1.0,
   thsrOpacity: 0.95,
+  // ships: AIS-tracked light dots (src/engine/ships.js) — a third timeline-
+  // driven track layer alongside trains/thsr, but keyed on absolute unix-
+  // epoch seconds (one calendar day's real trail) instead of a daily-
+  // repeating schedule. Deferred: first switch-on loads the current
+  // timeline date's trails (CDN snapshot → RPC fallback) and subscribes to
+  // future date changes — see docs/MARINE_DESIGN.md §1.2 and the
+  // shipsVisible HANDLER below. Navy-blue default keeps it visually distinct
+  // from TRA yellow / THSR orange.
+  shipsVisible: false,
+  shipsColor: '#3a6ea5',
+  shipsSize: 1.0,
+  shipsOpacity: 0.95,
   // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
   // — NOT a manifest-driven JSON fetch like rail/trails; the manager
   // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
@@ -375,6 +393,20 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const params = { ...DEFAULT_PARAMS, ...overrides }
   const layerManifest = loadLayerManifest() // fired now; awaited lazily by loadRailData/loadStationsData
   const manifestUrl = async (id, fallback) => (await layerManifest).find((l) => l.id === id)?.url ?? fallback
+  // ships' CDN snapshot base — same build-time env var + local-dev fallback
+  // as dem.js's TILE_BASE (VITE_TILE_BASE unset in dev → '/tiles', which
+  // 404s locally since no snapshot has been baked there yet, correctly
+  // falling through to the RPC path below — see loadShipsForDate).
+  const SHIPS_TILE_BASE = import.meta.env.VITE_TILE_BASE ?? '/tiles'
+
+  // shared Supabase anon-key access (mini-taiwan-pulse's project,
+  // read-only public.* RPCs only — repo rule: never realtime.* from the
+  // frontend). Originally reservoirs-only, private to that block; hoisted
+  // here (2026-07-11, docs/MARINE_DESIGN.md §1.1) so ships' RPC fallback
+  // reuses it too instead of a second declaration.
+  const SUPABASE_URL = 'https://utcmcikhvxnohbxchbrs.supabase.co'
+  const SUPABASE_ANON =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0Y21jaWtodnhub2hieGNoYnJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ1NjgyMDMsImV4cCI6MjA5MDE0NDIwM30.rQSjJ6WD53p9tRZ6M7xleDelktVHfKeZFGPC2ItULVQ'
 
   // ---------------------------------------------------------------- events
   const listeners = new Map()
@@ -524,6 +556,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const reservoirsLayer = createReservoirLayer(params)
   const osmRoadsLayer = createOsmRoadsLayer(params, { invalidate })
   const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
+  const shipsLayer = createShipsLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
   // whatever meta.group/subgroup it's registered with through to describe(),
@@ -553,6 +586,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     thsr: { group: GROUP_MOVE },
     stations: { group: GROUP_MOVE },
     osm_roads: { group: GROUP_MOVE },
+    ships: { group: GROUP_MOVE },
     rivers: { group: GROUP_WATER },
     reservoirs: { group: GROUP_WATER },
     // farmland tint + irrigation canals: agriculture, not hydrology — its own
@@ -570,10 +604,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
   // registration order = draw / update order (coastline → counties → rail →
   // trains → thsr → trails → rivers → reservoirs → farm sim → irrigation →
-  // typhoon → markers → stations → trail signs → labels). thsr registers
-  // right after trains so it lands directly below 台鐵列車 Trains in the
-  // Layers panel's 交通 Move group (Layers.jsx preserves registration order
-  // within a group — see groupLayers()).
+  // typhoon → markers → stations → ships → trail signs → labels). thsr
+  // registers right after trains so it lands directly below 台鐵列車 Trains,
+  // and ships registers right after stations, both in the Layers panel's
+  // 交通 Move group (Layers.jsx preserves registration order within a group
+  // — see groupLayers()).
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
@@ -599,6 +634,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     createTyphoonLayer(params),
     pointLayer,
     stationsLayer,
+    shipsLayer,
     trailSignsLayer,
     labelsLayer,
   ]) {
@@ -1391,12 +1427,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
 
   // reservoirs: fetch the baked basin polygons + dam markers, then the LIVE
-  // storage ratios from the mini-taiwan-pulse Supabase RPC (anon read-only key).
-  // A live-fetch failure is non-fatal: every basin falls back to ratio 1.0
-  // (full pool) with a console.warn, so the water surfaces still render.
-  const SUPABASE_URL = 'https://utcmcikhvxnohbxchbrs.supabase.co'
-  const SUPABASE_ANON =
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0Y21jaWtodnhub2hieGNoYnJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ1NjgyMDMsImV4cCI6MjA5MDE0NDIwM30.rQSjJ6WD53p9tRZ6M7xleDelktVHfKeZFGPC2ItULVQ'
+  // storage ratios from the mini-taiwan-pulse Supabase RPC (anon read-only key,
+  // SUPABASE_URL/SUPABASE_ANON declared near the top of createEngine — shared
+  // with ships' RPC fallback below). A live-fetch failure is non-fatal: every
+  // basin falls back to ratio 1.0 (full pool) with a console.warn, so the
+  // water surfaces still render.
   async function fetchReservoirRatios() {
     try {
       const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_reservoir_status_latest`, {
@@ -1447,6 +1482,80 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       emit('layers')
     }
   }
+
+  // ships: RPC fallback for whichever date's CDN snapshot 404s (not baked
+  // yet / today-before-first-bake-run — see docs/MARINE_DESIGN.md §1.1).
+  // Parses the "lat,lng,ts;..." trail column + applies the >40kt GPS filter
+  // (both ported into ships.js from pulse's shipLoader.ts — see its
+  // parseTrailString/filterGpsAnomalies). Never throws: an RPC failure
+  // resolves an empty trail list, same fail-quiet contract as the CDN path.
+  async function fetchShipsFromRpc(dateKey) {
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_ship_trails`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_ANON,
+          Authorization: `Bearer ${SUPABASE_ANON}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ target_date: dateKey }),
+      })
+      if (!res.ok) throw new Error(`get_ship_trails ${res.status}`)
+      const rows = await res.json()
+      return rows.map((r) => ({
+        mmsi: String(r.mmsi),
+        name: null,
+        shipType: r.ship_type || null,
+        points: filterGpsAnomalies(parseTrailString(r.trail)),
+      }))
+    } catch (err) {
+      console.warn(`[layers] ships RPC fallback failed for ${dateKey}`, err)
+      return []
+    }
+  }
+
+  // ships: CDN snapshot first, RPC fallback on 404 (docs/MARINE_DESIGN.md
+  // §1.1) — the timeline's FIRST subscribeDate consumer (§1.2). shipsCurrentDate
+  // is a race guard: subscribeDate's callback can fire again (scrub to a new
+  // day) while an earlier date's fetch is still in flight — whichever
+  // response lands with a stale dateKey (not the latest one requested) is
+  // discarded rather than clobbering the newer selection. trails=[] (either
+  // path) is a legitimate "this day has no ship data" result — setData still
+  // runs so the layer shows correctly-empty instead of staying gated off.
+  let shipsCurrentDate = null
+  async function loadShipsForDate(dateKey) {
+    shipsCurrentDate = dateKey
+    let trails = null // null = CDN path didn't produce usable trails; triggers RPC fallback below
+    try {
+      const res = await fetch(`${SHIPS_TILE_BASE}/ships/trails/${dateKey}.json`)
+      if (res.ok) {
+        // dev-server gotcha (same one dem.js's TILE_URL comment documents for
+        // DEM tiles): an unmatched path under the LOCAL '/tiles' base returns
+        // Vite's SPA-fallback index.html with status 200, not a real 404 —
+        // res.json() throws on it, caught below, same as a real miss. In
+        // production SHIPS_TILE_BASE is a different origin (R2/CDN), where a
+        // missing snapshot is a genuine 404 and lands in the `else` below.
+        const data = await res.json()
+        trails = (data.trails || []).map((t) => ({
+          mmsi: String(t.mmsi),
+          name: t.name || null,
+          shipType: t.ship_type || null,
+          points: t.points || [],
+        }))
+      }
+      // any other status (404 or otherwise) falls through to the RPC
+      // fallback below, same as a JSON-parse failure caught here
+    } catch (err) {
+      console.warn(`[layers] ships snapshot fetch failed for ${dateKey} — falling back to RPC`, err)
+    }
+    if (trails === null) trails = await fetchShipsFromRpc(dateKey)
+    if (dateKey !== shipsCurrentDate) return // stale — a newer date was requested meanwhile
+    shipsLayer.setData(trails)
+    shipsLayer.update(layerCtx())
+    invalidate()
+    emit('layers')
+  }
+  let shipsActivated = false // onActivate: first switch-on loads today + subscribes to future date changes (once — see shipsVisible HANDLER)
 
   // stationsLayer.onActivate — grouped one marker set per transit system.
   // Never rejects: a fetch failure just leaves the layer showing no sets
@@ -1698,6 +1807,22 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     thsrColor: () => layers.get('thsr').update(layerCtx()),
     thsrSize: () => layers.get('thsr').update(layerCtx()),
     thsrOpacity: () => layers.get('thsr').update(layerCtx()),
+    // ships: onActivate (docs/MARINE_DESIGN.md §1.2) — first switch-on loads
+    // the timeline's CURRENT date immediately (subscribeDate's callback only
+    // fires on FUTURE changes, never on subscribe itself) and subscribes to
+    // subsequent date changes (scrub/seek/play across midnight) exactly
+    // once; later toggles just re-apply gate/style like trains/thsr above.
+    shipsVisible: (v) => {
+      if (v && !shipsActivated) {
+        shipsActivated = true
+        loadShipsForDate(timeStore.getDateKey())
+        timeStore.subscribeDate((dateKey) => loadShipsForDate(dateKey))
+      }
+      layers.get('ships').update(layerCtx())
+    },
+    shipsColor: () => layers.get('ships').update(layerCtx()),
+    shipsSize: () => layers.get('ships').update(layerCtx()),
+    shipsOpacity: () => layers.get('ships').update(layerCtx()),
     // OSM roads: no deferred JSON fetch to kick — the PMTiles manager streams
     // tiles itself once switched on (see vectortiles.js). update() just
     // (re)applies the gate/style; the manager's own setEnabled starts/stops
@@ -1951,7 +2076,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (params.source !== 'real' || !heightField) return true
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
-      ((params.trainsVisible || params.thsrVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
+      ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||
