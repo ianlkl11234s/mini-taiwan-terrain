@@ -235,6 +235,12 @@ export const DEFAULT_PARAMS = {
   hospitalsOpacity: 0.9,
   policeStationsSize: 1.0,
   policeStationsOpacity: 0.9,
+  // medical (medical.js, R2-hosted national 醫院/診所/藥局 roll) — declared here
+  // like every other layer so params serialization sees them even before the
+  // user first touches the sliders; medical.js's `?? 1`/`?? 0.92` guards keep
+  // working as the same defaults (opus final-review note).
+  medicalSize: 1.0,
+  medicalOpacity: 0.92,
   // rivers: the river layer's BODY is a physics-derived flow-accumulation tint
   // painted into the terrain shader (terrain.js uRiverTex, whole-island bake
   // public/layers/river_sim.png — the retired vector centerlines are gone). ONE
@@ -2555,7 +2561,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
-      params.currentsVisible || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below)
+      (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
       motion.tourActive ||
       motion.tweenActive ||
