@@ -104,6 +104,12 @@ function notifyThrottled() {
   for (const entry of throttledEntries) {
     const elapsed = now - entry.lastFire
     if (elapsed >= entry.ms) {
+      if (entry.timer !== null) {
+        // event-loop 壅塞時 trailing timer 可能比排定時間晚點名——若不清掉，
+        // 這裡立即發完後 timer 又會補發一次（ms 窗內雙發）
+        clearTimeout(entry.timer)
+        entry.timer = null
+      }
       entry.lastFire = now
       entry.pending = false
       entry.cb()
