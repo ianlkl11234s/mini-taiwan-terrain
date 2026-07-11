@@ -5,7 +5,7 @@ import { PbfReader } from 'pbf'
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js'
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js'
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
-import { makeProjection, metersToWorldY, zFightLift } from './geo.js'
+import { makeProjection, metersToWorldY, worldYScale, zFightLift } from './geo.js'
 
 // ⑥ PMTiles vector-tile subsystem (docs/VECTOR_TILES_DESIGN.md). A parallel
 // streaming manager modeled on chunks.js's desired-set/LRU/build-budget
@@ -1141,6 +1141,420 @@ export function createFtwFieldsLayer(params, { invalidate } = {}) {
         style: {
           opacity: params.ftwFieldsOpacity,
         },
+      }
+    },
+
+    dispose() {
+      manager.dispose()
+    },
+  }
+}
+
+// ==================================================================== buildings (Phase 4)
+
+// GBA (Global Building Atlas, TUM — Zhu et al. 2025) LoD1 footprints, handed
+// off via taipei-gis-analytics/docs/handoff/gba_canopy_frontend.md: one flat-
+// topped box per building, height baked per-feature (`height`, meters —
+// missing/non-positive falls back to BUILDING_DEFAULT_HEIGHT_M). z13 is the
+// SOURCE ARCHIVE'S OWN minzoom (unlike roads/fields, whose tippecanoe
+// generalization stays cheap even at their own low zoom) — a national
+// 1.52M-building dataset means an explicit hard gate on ctx.lodZoom, checked
+// BEFORE any fetch (BUILDINGS_MIN_ZOOM below), not just letting
+// VectorTileManager's normal vz-clamp-to-source-min do the limiting (that
+// alone would still stream every on-screen z13 tile across a full-island
+// low-zoom view — the "全台縮圖卡頓" the handoff doc warns about).
+const BUILDINGS_MESH_KEYS = ['fill']
+const BUILDING_DEFAULT_HEIGHT_M = 3
+const BUILDINGS_MIN_ZOOM = 13
+// CC BY-NC 4.0 requires attribution — surfaced in describe()'s `note` and
+// every pick() popup's 授權 row (the two places a user/maintainer can
+// actually see it; Layers.jsx doesn't render an attribution string today).
+const BUILDINGS_ATTRIBUTION = 'GBA © TUM (Zhu et al. 2025) · CC BY-NC 4.0'
+// vertex kind tag — which Y a vertex takes (see writeBuildingY)
+const VK_BASE = 0
+const VK_ROOF = 1
+
+// height → colour ramp (design handoff's 3-stop version, not the standalone
+// demo POC's 5-stop one): 0m #2c7bb6 (blue) → 15m #fee08b (straw) → 50m+
+// #a50026 (deep red), clamped at both ends. Manual float-triplet lerp (no
+// THREE.Color allocation per call) — same low-allocation spirit as roadRGB's
+// cache, just continuous instead of a fixed per-class table since every
+// building can carry a distinct height.
+const BUILDING_COLOR_STOPS = [
+  { h: 0, r: 0x2c / 255, g: 0x7b / 255, b: 0xb6 / 255 },
+  { h: 15, r: 0xfe / 255, g: 0xe0 / 255, b: 0x8b / 255 },
+  { h: 50, r: 0xa5 / 255, g: 0x00 / 255, b: 0x26 / 255 },
+]
+function buildingHeightColor(h) {
+  const stops = BUILDING_COLOR_STOPS
+  if (h <= stops[0].h) return stops[0]
+  const last = stops[stops.length - 1]
+  if (h >= last.h) return last
+  for (let i = 0; i < stops.length - 1; i++) {
+    const a = stops[i]
+    const b = stops[i + 1]
+    if (h <= b.h) {
+      const t = (h - a.h) / (b.h - a.h)
+      return { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t }
+    }
+  }
+  return last
+}
+
+const fmtHeightM = (h) => (typeof h === 'number' ? `${h.toFixed(1)} m` : '—')
+
+// §5 pick — one building resolves to height/source/license rows; license is
+// repeated here (not just in describe()) because this is the ONE place in the
+// current UI a user actually sees per-layer text (design: CC BY-NC 4.0 "必須
+// 署名").
+function buildingPickResult(feat, worldPos) {
+  const rows = [
+    ['高度 Height', fmtHeightM(feat.height)],
+    ['來源 Source', feat.src || '—'],
+    ['授權 License', BUILDINGS_ATTRIBUTION],
+  ]
+  return { title: '建物 Building', rows, worldPos }
+}
+
+function resolveBuildingHit(hit) {
+  const faceFeature = hit.object.userData.faceFeature
+  const features = hit.object.userData.features
+  if (!faceFeature || !features) return null
+  const feat = features[faceFeature[hit.faceIndex]]
+  if (!feat) return null
+  return buildingPickResult(feat, hit.point.clone())
+}
+
+// per-tile building decode: walks every Polygon feature, classifies its rings
+// into polygon parts (exterior + holes) via classifyRings — same winding trap
+// and fix as decodeFieldLayer above (a naive "ring[0]=contour, rest=holes"
+// assumption breaks the moment a feature is a MultiPolygon; classifyRings'
+// sign-relative grouping is required, and THREE.ShapeUtils.triangulateShape/
+// Earcut is itself winding-agnostic so no manual flip is needed — see that
+// comment block for the full reasoning, unchanged here). For EACH resulting
+// part this builds a flat-topped extrusion: an earcut-triangulated roof cap
+// plus one quad (2 triangles) per ring edge — exterior AND holes alike, so a
+// courtyard gets its own inward-facing walls too — for the walls. Roof and
+// wall vertices share ONE position/color/index buffer per tile (still one
+// draw call per tile, same "merge everything" pattern as fields/river
+// surfaces), tagged VK_BASE/VK_ROOF per vertex (`vertKind`) and pointed at a
+// per-part slot (`vertGroup`) in the parallel groupHeightM/groupBaseElevM
+// arrays — a "group" is one contiguous ring-set (almost always the building's
+// whole footprint; only a MultiPolygon building splits into >1 group, each
+// still carrying that one feature's shared height). baseY is intentionally
+// the MINIMUM heightAtWorld sampled across a group's own contour+hole
+// vertices (not per-vertex terrain-following) — a flat foundation plane that
+// sinks slightly into a slope rather than leaving a gap on the downhill side,
+// per the design brief. faceFeature carries one feature-index entry PER
+// TRIANGLE (roof + wall alike, same convention as fields' faceFeature) so
+// pick() resolves back to {height, src}.
+function decodeBuildingLayer(layer, { proj, center, hf }) {
+  const features = []
+  const pos = []
+  const col = []
+  const idx = []
+  const faceFeature = []
+  const vertGroup = []
+  const vertKind = []
+  const groupHeightM = []
+  const groupBaseElevM = []
+  for (let i = 0; i < layer.length; i++) {
+    const feature = layer.feature(i)
+    if (feature.type !== POLYGON_TYPE) continue
+    const rings = feature.loadGeometry()
+    const polygons = classifyRings(rings)
+    if (!polygons.length) continue
+    const props = feature.properties || {}
+    let heightM = Number(props.height)
+    if (!Number.isFinite(heightM) || heightM <= 0) heightM = BUILDING_DEFAULT_HEIGHT_M
+    const extent = feature.extent
+    const s = proj.tileWorldSize / extent
+    const toVec2 = (ring) =>
+      ring.map((p) => new THREE.Vector2(center.x + (p.x - extent / 2) * s, center.z + (p.y - extent / 2) * s))
+    const featIdx = features.length
+    const roof = buildingHeightColor(heightM)
+    const wall = { r: roof.r * 0.72, g: roof.g * 0.72, b: roof.b * 0.72 } // §-spec "牆面色 ×0.72"
+    let usedThisFeature = false
+    for (const group of polygons) {
+      const contour = toVec2(group[0])
+      if (contour.length < 3) continue
+      const holes = group.slice(1).map(toVec2)
+      let faces
+      try {
+        faces = THREE.ShapeUtils.triangulateShape(contour, holes)
+      } catch (err) {
+        continue // malformed part (degenerate/self-intersecting ring) — skip it, never crash the whole tile build
+      }
+      if (!faces.length) continue
+
+      const gid = groupHeightM.length
+      groupHeightM.push(heightM)
+      const ringsForWalls = [contour, ...holes]
+      let minM = Infinity
+      for (const ring of ringsForWalls) {
+        for (const v of ring) {
+          const hM = hf ? hf.heightAtWorld(v.x, v.y) : 0
+          if (hM < minM) minM = hM
+        }
+      }
+      groupBaseElevM.push(minM === Infinity ? 0 : minM)
+
+      // roof cap
+      const roofBase = pos.length / 3
+      const flat = [...contour, ...holes.flat()]
+      for (const v of flat) {
+        pos.push(v.x, 0, v.y) // v.y holds world Z (Vector2 reused as (worldX, worldZ), matches fields' convention)
+        col.push(roof.r, roof.g, roof.b)
+        vertGroup.push(gid)
+        vertKind.push(VK_ROOF)
+      }
+      for (const f of faces) {
+        idx.push(roofBase + f[0], roofBase + f[1], roofBase + f[2])
+        faceFeature.push(featIdx)
+      }
+
+      // walls: one quad (2 triangles) per ring edge
+      for (const ring of ringsForWalls) {
+        const n = ring.length
+        for (let e = 0; e < n; e++) {
+          const p0 = ring[e]
+          const p1 = ring[(e + 1) % n]
+          const base = pos.length / 3
+          pos.push(p0.x, 0, p0.y); col.push(wall.r, wall.g, wall.b); vertGroup.push(gid); vertKind.push(VK_BASE)
+          pos.push(p1.x, 0, p1.y); col.push(wall.r, wall.g, wall.b); vertGroup.push(gid); vertKind.push(VK_BASE)
+          pos.push(p1.x, 0, p1.y); col.push(wall.r, wall.g, wall.b); vertGroup.push(gid); vertKind.push(VK_ROOF)
+          pos.push(p0.x, 0, p0.y); col.push(wall.r, wall.g, wall.b); vertGroup.push(gid); vertKind.push(VK_ROOF)
+          idx.push(base, base + 1, base + 2, base, base + 2, base + 3)
+          faceFeature.push(featIdx, featIdx)
+        }
+      }
+      usedThisFeature = true
+    }
+    if (usedThisFeature) features.push({ height: heightM, src: props.src })
+  }
+  if (!idx.length) return null
+  return {
+    buckets: {
+      fill: {
+        pos: new Float32Array(pos),
+        col: new Float32Array(col),
+        idx, // plain array — BufferGeometry.setIndex auto-picks Uint16/Uint32 (same as fields)
+        faceFeature: new Int32Array(faceFeature),
+        vertGroup: new Int32Array(vertGroup),
+        vertKind: new Uint8Array(vertKind),
+        groupHeightM: new Float32Array(groupHeightM),
+        groupBaseElevM: new Float32Array(groupBaseElevM), // decode-time min sample — decode owns sampling, same as roads/fields
+        nVerts: pos.length / 3,
+        nGroups: groupHeightM.length,
+      },
+    },
+    features,
+  }
+}
+
+// shared by buildBuildingMesh (first materialization, off the decode-time
+// groupBaseElevM cache) and redrapeBuildingBucket (which refreshes that cache
+// first, since a DEM-coverage change can make the old samples stale) — writes
+// every vertex's Y from its group's baseY/roofY, no geometry rebuild. baseY
+// uses metersToWorldY (an ABSOLUTE elevation → scene Y, datum-shifted); the
+// extrusion height is a DELTA on top of that, so it's scaled by
+// worldYScale(=K×exaggeration) alone, never datum-shifted a second time.
+function writeBuildingY(bd, heightField, exaggeration) {
+  const scale = worldYScale(heightField, exaggeration)
+  const baseYPerGroup = new Float32Array(bd.nGroups)
+  for (let g = 0; g < bd.nGroups; g++) baseYPerGroup[g] = metersToWorldY(heightField, bd.groupBaseElevM[g], exaggeration)
+  for (let i = 0; i < bd.nVerts; i++) {
+    const g = bd.vertGroup[i]
+    bd.pos[i * 3 + 1] = bd.vertKind[i] === VK_ROOF ? baseYPerGroup[g] + bd.groupHeightM[g] * scale : baseYPerGroup[g]
+  }
+}
+
+function buildBuildingMesh(material, bd, hf, exaggeration) {
+  if (hf) writeBuildingY(bd, hf, exaggeration)
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.BufferAttribute(bd.pos, 3))
+  geo.setAttribute('color', new THREE.BufferAttribute(bd.col, 3))
+  geo.setIndex(bd.idx)
+  const mesh = new THREE.Mesh(geo, material)
+  mesh.userData.faceFeature = bd.faceFeature
+  return mesh
+}
+
+// in-place y rewrite for a live building bucket — no geometry rebuild (design
+// §3/§6). Re-samples heightAtWorld per group (DEM coverage may have changed
+// since decode) before calling the same writeBuildingY the first build used.
+function redrapeBuildingBucket(bd, mesh, heightField, exaggeration) {
+  const groupMin = new Float32Array(bd.nGroups).fill(Infinity)
+  for (let i = 0; i < bd.nVerts; i++) {
+    const g = bd.vertGroup[i]
+    const hM = heightField.heightAtWorld(bd.pos[i * 3], bd.pos[i * 3 + 2])
+    if (hM < groupMin[g]) groupMin[g] = hM
+  }
+  bd.groupBaseElevM = groupMin
+  writeBuildingY(bd, heightField, exaggeration)
+  mesh.geometry.attributes.position.needsUpdate = true
+  mesh.geometry.computeBoundingBox()
+  mesh.geometry.computeBoundingSphere()
+}
+
+// no color param — height-band color is baked per-vertex (BUILDING_COLOR_STOPS);
+// only opacity is user-adjustable (matches fields' single-knob convention).
+// transparent only turns on when opacity actually reduces visibility (design:
+// "無透明優先...opacity styleSchema 用 uniform 控制時再開 transparent") — skips
+// the always-on alpha-blend/sort cost across a whole tile's worth of extruded
+// roofs+walls when the slider sits at its default-adjacent 1.0.
+function applyBuildingStyle(materials, { opacity } = {}) {
+  if (opacity === undefined) return
+  materials.fill.opacity = opacity
+  materials.fill.transparent = opacity < 1
+}
+
+const BUILDINGS_STYLE_SCHEMA = {
+  opacity: { type: 'slider', label: '不透明度 Opacity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+}
+
+const BUILDINGS_URL = `${VECTOR_BASE}/buildings_3d_taiwan.pmtiles`
+
+// LayerManager adapter — Phase 4: GBA (TUM) 3D building extrusions. One Mesh
+// per tile (single 'fill' bucket, vertexColors baked per height band). z13 is
+// the SOURCE'S OWN minzoom (unlike roads/fields — see file header above), so
+// this layer's gate() also checks ctx.lodZoom, and — unlike roads/fields,
+// which only re-derive their gate on the rarer update()-only param-change
+// path — tickView() here re-evaluates the SAME gate every frame, so panning/
+// zooming across the z13 boundary with no param touched starts/stops
+// streaming immediately instead of waiting for the next visibility/style
+// change (design: "lodZoom < 13 時不 fetch、整層隱藏；≥13 才載入當前視野
+// tile"). No setLift()/zFightLift call (unlike roads/fields' draped lines):
+// a building's own base is intentionally sunk to the polygon's minimum
+// sampled terrain height (see decodeBuildingLayer), so a rigid group-level
+// lift would reintroduce the slope-gap that baseY placement was designed to
+// avoid.
+export function createBuildingsLayer(params, { invalidate } = {}) {
+  const materials = {
+    fill: new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      transparent: params.buildingsOpacity < 1,
+      opacity: params.buildingsOpacity,
+      depthTest: true,
+      depthWrite: true,
+      // DoubleSide sidesteps the same MVT-winding-vs-view-direction mismatch
+      // fields.js's own DoubleSide choice avoids (Vector2(x,y)→(worldX,y,worldZ)
+      // flips the effective winding as seen from above) — simpler and safer
+      // than deriving per-triangle front-face orientation for both a roof cap
+      // and four wall orientations per building.
+      side: THREE.DoubleSide,
+      fog: true,
+    }),
+  }
+  const manager = new VectorTileManager({
+    url: BUILDINGS_URL,
+    layerName: 'buildings',
+    meshKeys: BUILDINGS_MESH_KEYS,
+    materials,
+    decodeLayer: decodeBuildingLayer,
+    buildMesh: (key, bd, hf, exaggeration) => buildBuildingMesh(materials[key], bd, hf, exaggeration),
+    redrapeBucket: redrapeBuildingBucket,
+    resolveHit: resolveBuildingHit,
+    applyStyle: applyBuildingStyle,
+  })
+  manager.onTilesChanged = invalidate // a tile finished building — repaint (on-demand render)
+
+  // BUILDINGS_MIN_ZOOM gate lives OUTSIDE the manager (roads/fields precedent:
+  // gate only on params/heightField there — see file header above for why
+  // buildings additionally needs the zoom check).
+  function gate(ctx) {
+    return (
+      params.source === 'real' &&
+      !!ctx.heightField &&
+      !!params.buildingsVisible &&
+      (ctx.lodZoom ?? 0) >= BUILDINGS_MIN_ZOOM
+    )
+  }
+
+  return {
+    id: 'buildings',
+    kind: 'area',
+    label: 'Buildings',
+    rowLabel: '建物 Buildings',
+    object3d: manager.group,
+    visibleParam: 'buildingsVisible',
+    paramMap: {
+      visible: 'buildingsVisible',
+      opacity: 'buildingsOpacity',
+    },
+
+    build() {},
+
+    // style/visibility path (setParams → HANDLERS.buildings* → this.update)
+    update(ctx) {
+      const show = gate(ctx)
+      manager.setStyle({ opacity: params.buildingsOpacity })
+      manager.group.visible = show
+      manager.setEnabled(show)
+    },
+
+    // per-frame streaming — gate is re-checked every call (not cached from the
+    // last update()) specifically so the z13 threshold reacts to plain
+    // panning/zooming, see the export's header comment.
+    tickView(ctx) {
+      const show = gate(ctx)
+      manager.group.visible = show
+      manager.setEnabled(show)
+      if (!show) return // z13 gate — never fetch below it
+      const cx = ctx.labelCenter ? ctx.labelCenter.x : ctx.camera.position.x
+      const cz = ctx.labelCenter ? ctx.labelCenter.z : ctx.camera.position.z
+      manager.update(ctx.dt, {
+        targetX: cx,
+        targetZ: cz,
+        // same starting fraction as roads/fields (createOsmRoadsLayer.tickView)
+        // — Phase 2 must re-measure against real z13/14 downtown density
+        // (Taipei/Kaohsiung core), which packs far more triangles per tile
+        // than a road/field tile of the same footprint
+        radius: ctx.params.fogFar * ctx.fogScale * 0.65,
+        lodZoom: ctx.lodZoom ?? 12,
+        demLat: ctx.params.demLat,
+        demLon: ctx.params.demLon,
+        exaggeration: ctx.params.demExaggeration,
+        heightField: ctx.heightField,
+      })
+    },
+
+    setVisible(v) {
+      params.buildingsVisible = v
+      manager.group.visible = v
+      manager.setEnabled(v)
+    },
+
+    setStyle(patch) {
+      for (const k in patch) if (this.paramMap[k]) params[this.paramMap[k]] = patch[k]
+      manager.setStyle({ opacity: params.buildingsOpacity })
+    },
+
+    // click-to-inspect — delegates to the manager, which only ever raycasts
+    // against live (materialized) tile meshes.
+    pick(raycaster) {
+      return manager.pick(raycaster)
+    },
+
+    // chunkManager.onChunksChanged hook (index.js) — coalesced redrape, see
+    // VectorTileManager.markDemDirty
+    markDemDirty() {
+      manager.markDemDirty()
+    },
+
+    describe() {
+      return {
+        id: 'buildings',
+        kind: 'area',
+        label: 'Buildings',
+        rowLabel: '建物 Buildings',
+        count: manager.tiles.size, // live tile count, not building count (matches roads/fields' describe convention)
+        visible: params.buildingsVisible,
+        styleSchema: BUILDINGS_STYLE_SCHEMA,
+        style: {
+          opacity: params.buildingsOpacity,
+        },
+        note: BUILDINGS_ATTRIBUTION, // CC BY-NC 4.0 attribution (see file header)
       }
     },
 

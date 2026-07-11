@@ -9,7 +9,7 @@ import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
-import { createOsmRoadsLayer, createFtwFieldsLayer } from './vectortiles.js'
+import { createOsmRoadsLayer, createFtwFieldsLayer, createBuildingsLayer } from './vectortiles.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
 import * as timeStore from '../state/timeStore.js'
@@ -255,6 +255,15 @@ export const DEFAULT_PARAMS = {
   // (design §4); 濃度 (opacity) is the only style param.
   ftwFieldsVisible: false,
   ftwFieldsOpacity: 0.6,
+  // buildings: PMTiles-streamed vector-tile POLYGON layer, same streamed-not-
+  // manifest pattern as osmRoadsVisible/ftwFieldsVisible above, but extruded
+  // into flat-topped 3D boxes (GBA/TUM LoD1 footprints, see vectortiles.js
+  // createBuildingsLayer). z13 is the source archive's own minzoom — see that
+  // module's file header for why this layer alone needs a hard lodZoom gate.
+  // Fill color is a baked per-vertex height-band ramp (design handoff); 不透明度
+  // is the only style param, default just under fully opaque.
+  buildingsVisible: false,
+  buildingsOpacity: 0.95,
   // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
   // S Japan, S Korea, SE China) as flat strokes over a sea-coloured plane —
   // geographic context beyond the Taiwan DEM footprint (src/engine/region.js).
@@ -579,6 +588,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const reservoirsLayer = createReservoirLayer(params)
   const osmRoadsLayer = createOsmRoadsLayer(params, { invalidate })
   const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
+  const buildingsLayer = createBuildingsLayer(params, { invalidate })
   const shipsLayer = createShipsLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
@@ -604,6 +614,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // normal use). Not tied to any theme (transport/water/outdoor); parked
     // under Base as a generic overlay utility rather than left in "其他".
     markers: { group: GROUP_BASE },
+    // GBA/TUM 3D building extrusions (vectortiles.js createBuildingsLayer) —
+    // static base-map 3D content like region/coastline/counties above, not a
+    // themed transport/water/agriculture/outdoor/fx dataset
+    buildings: { group: GROUP_BASE },
     rail: { group: GROUP_MOVE },
     trains: { group: GROUP_MOVE },
     thsr: { group: GROUP_MOVE },
@@ -625,9 +639,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     labels: { group: GROUP_OUTDOOR },
     typhoon: { group: GROUP_FX },
   }
-  // registration order = draw / update order (coastline → counties → rail →
-  // trains → thsr → trails → rivers → reservoirs → farm sim → irrigation →
-  // typhoon → markers → stations → ships → trail signs → labels). thsr
+  // registration order = draw / update order (coastline → counties →
+  // buildings → rail → trains → thsr → trails → rivers → reservoirs → farm
+  // sim → irrigation → typhoon → markers → stations → ships → trail signs →
+  // labels). thsr
   // registers right after trains so it lands directly below 台鐵列車 Trains,
   // and ships registers right after stations, both in the Layers panel's
   // 交通 Move group (Layers.jsx preserves registration order within a group
@@ -636,6 +651,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     createRegionLayer(params),
     createCoastlineLayer(params),
     createCountiesLayer(params),
+    // registered early (low pick-priority — pickAll walks REVERSE registration
+    // order) so its solid extruded meshes never swallow clicks meant for
+    // roads/rail/markers drawn on top of it
+    buildingsLayer,
     createRailLayer(params),
     createTrainsLayer(params, {
       // near-view car-chain LOD (see trains.js module header) — real TRA EMU
@@ -699,6 +718,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     invalidate() // a chunk appeared/vanished (incl. after DEM tiles finish loading)
     osmRoadsLayer.markDemDirty() // coalesced redrape — see vectortiles.js VectorTileManager.markDemDirty
     ftwFieldsLayer.markDemDirty()
+    buildingsLayer.markDemDirty()
   }
 
   const cone = createCone()
@@ -1943,6 +1963,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // as osmRoadsVisible above (see vectortiles.js createFtwFieldsLayer)
     ftwFieldsVisible: () => ftwFieldsLayer.update(layerCtx()),
     ftwFieldsOpacity: () => ftwFieldsLayer.update(layerCtx()),
+    // buildings: no deferred JSON fetch — same PMTiles-streams-itself pattern
+    // as osmRoadsVisible/ftwFieldsVisible above (see vectortiles.js
+    // createBuildingsLayer); update()'s own gate() also checks ctx.lodZoom
+    // against the z13 source minzoom
+    buildingsVisible: () => buildingsLayer.update(layerCtx()),
+    buildingsOpacity: () => buildingsLayer.update(layerCtx()),
     // region: first switch-on fetches the neighbouring coastlines (deferred);
     // the sea plane + style params re-run the layer's update
     regionVisible: (v) => {
