@@ -59,6 +59,46 @@
       "visible": false
     },
     {
+      "id": "airports",
+      "kind": "point",
+      "label": "Airports",
+      "rowLabel": "機場 Airports",
+      "url": "/layers/airports.json",
+      "visible": false
+    },
+    {
+      "id": "ports",
+      "kind": "point",
+      "label": "Ports",
+      "rowLabel": "港口 Ports",
+      "url": "/layers/ports.json",
+      "visible": false
+    },
+    {
+      "id": "fire_stations",
+      "kind": "point",
+      "label": "Fire Stations",
+      "rowLabel": "消防分隊 Fire Stations",
+      "url": "/layers/fire_stations.json",
+      "visible": false
+    },
+    {
+      "id": "hospitals",
+      "kind": "point",
+      "label": "Hospitals",
+      "rowLabel": "急救醫院 Hospitals",
+      "url": "/layers/hospitals.json",
+      "visible": false
+    },
+    {
+      "id": "police_stations",
+      "kind": "point",
+      "label": "Police",
+      "rowLabel": "警察機關 Police",
+      "url": "/layers/police_stations.json",
+      "visible": false
+    },
+    {
       "id": "farm_sim",
       "kind": "raster",
       "label": "Farm Sim",

@@ -208,6 +208,21 @@ export const DEFAULT_PARAMS = {
   stationsOpacity: 0.9,
   markersSize: 1.0,
   markersOpacity: 0.9,
+  // basic POI point packs (bake_poi_layers.py) — same size/opacity slider
+  // convention as stations/markers above. fire_stations/police_stations use
+  // an explicit sizeParam/opacityParam override (createPointLayer's default
+  // `${id}Size` would read oddly off a snake_case id), everything else uses
+  // the default derived key.
+  airportsSize: 1.0,
+  airportsOpacity: 0.9,
+  portsSize: 1.0,
+  portsOpacity: 0.9,
+  fireStationsSize: 1.0,
+  fireStationsOpacity: 0.9,
+  hospitalsSize: 1.0,
+  hospitalsOpacity: 0.9,
+  policeStationsSize: 1.0,
+  policeStationsOpacity: 0.9,
   // rivers: the river layer's BODY is a physics-derived flow-accumulation tint
   // painted into the terrain shader (terrain.js uRiverTex, whole-island bake
   // public/layers/river_sim.png — the retired vector centerlines are gone). ONE
@@ -585,6 +600,89 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       ['分署 Department', pt.dept || '—'],
     ],
   })
+  // basic POI point packs (bake_poi_layers.py) — same deferred onActivate
+  // pattern as stations/trail_signs above (fetch public/layers/<id>.json on
+  // first switch-on, group into one setSet() call per bake-time "system").
+  // ports/hospitals split into several sets (port_class_group / level) whose
+  // ids are ALREADY the Chinese display string (see bake script), so no
+  // separate label-lookup table like STATION_SYSTEM_LABELS is needed; the
+  // set id is used directly in pickRows.
+  const airportsLayer = createPointLayer(params, {
+    id: 'airports',
+    label: 'Airports',
+    rowLabel: '機場 Airports',
+    onActivate: () => loadPoiData('airports', airportsLayer),
+    pickRows: (pt) => [
+      ['名稱 Name', pt.name || '—'],
+      ['ICAO', pt.icao || '—'],
+      ['IATA', pt.iata || '—'],
+      ['類型 Type', pt.type || '—'],
+      ['高度 Elevation', pt.elevFt != null ? `${pt.elevFt} ft` : '—'],
+    ],
+  })
+  const portsLayer = createPointLayer(params, {
+    id: 'ports',
+    label: 'Ports',
+    rowLabel: '港口 Ports',
+    onActivate: () => loadPoiData('ports', portsLayer),
+    pickRows: (pt, setId) => [
+      ['名稱 Name', pt.name || '—'],
+      ['分類 Class', setId],
+      ['等級 Grade', pt.class || '—'],
+      ['縣市 County', pt.county || '—'],
+    ],
+  })
+  const fireStationsLayer = createPointLayer(params, {
+    id: 'fire_stations',
+    label: 'Fire Stations',
+    rowLabel: '消防分隊 Fire Stations',
+    onActivate: () => loadPoiData('fire_stations', fireStationsLayer),
+    sizeParam: 'fireStationsSize',
+    opacityParam: 'fireStationsOpacity',
+    pickRows: (pt) => [
+      ['名稱 Name', pt.name || '—'],
+      ['類型 Type', pt.type || '—'],
+      ['地址 Address', pt.address || '—'],
+    ],
+  })
+  const hospitalsLayer = createPointLayer(params, {
+    id: 'hospitals',
+    label: 'Hospitals',
+    rowLabel: '急救醫院 Hospitals',
+    onActivate: () => loadPoiData('hospitals', hospitalsLayer),
+    pickRows: (pt, setId) => [
+      ['名稱 Name', pt.name || '—'],
+      ['分級 Level', setId],
+      ['外傷中心 Trauma', pt.trauma ? '是 Yes' : '否 No'],
+      ['中風中心 Stroke', pt.stroke ? '是 Yes' : '否 No'],
+      ['地址 Address', pt.address || '—'],
+    ],
+  })
+  // police_stations.json's facility_subtype is the raw English source enum
+  // (police_justice/police_stations pipeline) — same bilingual-label-lookup
+  // pattern as STATION_SYSTEM_LABELS/HIGHWAY_LABELS above, a tag missing from
+  // this table just shows the raw string instead of blowing up.
+  const POLICE_SUBTYPE_LABELS = {
+    headquarters: '警察局本部 HQ',
+    police_dept: '警察局 Dept',
+    precinct: '分局 Precinct',
+    substation: '派出所 Substation',
+    specialized: '專業警察 Specialized',
+    other: '其他 Other',
+  }
+  const policeLayer = createPointLayer(params, {
+    id: 'police_stations',
+    label: 'Police',
+    rowLabel: '警察機關 Police',
+    onActivate: () => loadPoiData('police_stations', policeLayer),
+    sizeParam: 'policeStationsSize',
+    opacityParam: 'policeStationsOpacity',
+    pickRows: (pt) => [
+      ['名稱 Name', pt.name || '—'],
+      ['類型 Type', POLICE_SUBTYPE_LABELS[pt.subtype] ?? pt.subtype ?? '—'],
+      ['地址 Address', pt.address || '—'],
+    ],
+  })
   const labelsLayer = createLabelsLayer(params)
   const reservoirsLayer = createReservoirLayer(params)
   const osmRoadsLayer = createOsmRoadsLayer(params, { invalidate })
@@ -604,8 +702,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const GROUP_MOVE = { id: 'move', label: '交通 Move', order: 1 }
   const GROUP_WATER = { id: 'water', label: '水文 Water', order: 2 }
   const GROUP_AGRI = { id: 'agri', label: '農業 Agriculture', order: 3 }
-  const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 4 }
-  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 5 }
+  // basic public-safety POI packs (bake_poi_layers.py: fire/hospitals/police)
+  // — its own theme, not transport/water/agri/outdoor/fx
+  const GROUP_SAFETY = { id: 'safety', label: '安全 Safety', order: 4 }
+  const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 5 }
+  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 6 }
   const LAYER_GROUPS = {
     region: { group: GROUP_BASE },
     coastline: { group: GROUP_BASE },
@@ -626,6 +727,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     stations: { group: GROUP_MOVE },
     osm_roads: { group: GROUP_MOVE },
     ships: { group: GROUP_MOVE },
+    // basic POI packs (bake_poi_layers.py) — airports/ports are transport
+    // infrastructure like stations/ships above
+    airports: { group: GROUP_MOVE },
+    ports: { group: GROUP_MOVE },
     rivers: { group: GROUP_WATER },
     reservoirs: { group: GROUP_WATER },
     // farmland tint + irrigation canals: agriculture, not hydrology — its own
@@ -634,6 +739,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     farm_sim: { group: GROUP_AGRI },
     ftw_fields: { group: GROUP_AGRI },
     irrigation: { group: GROUP_AGRI },
+    // basic POI packs (bake_poi_layers.py), continued — public-safety response
+    // infrastructure, its own theme (see GROUP_SAFETY)
+    fire_stations: { group: GROUP_SAFETY },
+    hospitals: { group: GROUP_SAFETY },
+    police_stations: { group: GROUP_SAFETY },
     trails: { group: GROUP_OUTDOOR },
     trail_signs: { group: GROUP_OUTDOOR },
     // peak spot-elevation / place-name labels (labels.js) — cartography tied
@@ -692,6 +802,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     stationsLayer,
     shipsLayer,
     trailSignsLayer,
+    airportsLayer,
+    portsLayer,
+    fireStationsLayer,
+    hospitalsLayer,
+    policeLayer,
     labelsLayer,
   ]) {
     layers.register(layer, layerCtx(), LAYER_GROUPS[layer.id])
@@ -1642,6 +1757,29 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       trailSignsLayer.update(layerCtx())
     } catch (err) {
       console.warn('[layers] trail signs fetch failed', err)
+    } finally {
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // generic loader for bake_poi_layers.py's 5 basic POI packs (airports/
+  // ports/fire_stations/hospitals/police_stations) — same {systems: {id:
+  // {color, points}}} shape as stations.json/trail_signs.json above, so one
+  // function covers all 5 onActivate hooks instead of 5 near-identical
+  // copies. Same fail-quiet deferred pattern: a fetch failure just leaves
+  // the layer showing no sets.
+  async function loadPoiData(id, layer) {
+    try {
+      const res = await fetch(await manifestUrl(id, `/layers/${id}.json`))
+      if (!res.ok) throw new Error(`${id}.json ${res.status}`)
+      const data = await res.json()
+      for (const [systemId, sys] of Object.entries(data.systems)) {
+        layer.setSet(systemId, { color: sys.color, visible: true, points: sys.points })
+      }
+      layer.update(layerCtx())
+    } catch (err) {
+      console.warn(`[layers] ${id} fetch failed`, err)
     } finally {
       invalidate()
       emit('layers')
