@@ -507,18 +507,56 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   let pixelBumped = false // whether the idle freeze raised the pixel ratio
   let renderCount = 0 // DEV verify hook: +1 per real composer.render
 
+  // 顯示效能提升包 killswitch: flip to false to fully disable both the 30fps
+  // ambient throttle and the ambient DPR drop below, reverting to pre-package
+  // behavior (always full-rate, always params.pixelRatio). Static — requires
+  // a rebuild, not a runtime toggle.
+  const PERF_THROTTLE = true
+
+  // 顯示效能提升包 a: ambient (non-interactive) animation throttles to 30fps —
+  // trains/ships/tide playback and sea ripple decoration don't need 60fps+ to
+  // read fine, so the tick skips frames instead of doing full work every RAF.
+  // tour/flyTo camera tweens and any live pointer/wheel interaction always run
+  // full-rate (see fullRate below in tick()).
+  const ANIM_FPS = 30 // ambient throttle target — HUD fps settling ~30 during ambient-only playback is expected, not a regression
+  const ANIM_FRAME_MS = 1000 / ANIM_FPS
+  let interactUntil = 0 // performance.now() deadline — full-rate while now < this
+  let ambientThrottled = false // true when the last processed frame was ambient-only (ungated by interaction/tour)
+  let nextAmbientFrameAt = 0 // accumulator pacing target for the next throttled frame
+
+  // 顯示效能提升包 b: ambient-only playback also drops to a fixed DPR (1.0) —
+  // only meaningful when the display's devicePixelRatio > 1 (Retina/HiDPI).
+  // Debounced (>500ms of sustained ambient-only) so a brief blip doesn't
+  // thrash the composer buffer realloc that setPixelRatio triggers.
+  const ANIM_PIXEL_RATIO = 1.0
+  const AMBIENT_PIXEL_DEBOUNCE_MS = 500
+  let ambientSince = 0 // performance.now() when the current ambient-only streak started (0 = no streak)
+  let ambientPixelDropped = false // whether the renderer is currently sitting at ANIM_PIXEL_RATIO because of ambient
+
   // any state change that should show on screen calls this — it (re)opens the
   // render window; the tick keeps rendering until it expires AND nothing animates
   function invalidate() {
     activeUntil = performance.now() + ACTIVE_WINDOW_MS
   }
 
+  // live input (drag/wheel/keypan-via-controls.update) — always full-rate for
+  // 300ms and immediately cancels any pending ambient throttle so the very
+  // next RAF after a gesture starts renders at full speed, not mid-pace.
+  function noteInteraction() {
+    interactUntil = performance.now() + 300
+    ambientThrottled = false
+    nextAmbientFrameAt = 0
+  }
+
   // controls fire 'change' every frame the camera actually moves (drag, wheel,
   // damping tail, keypan → controls.update, programmatic). 'start'/'end' bracket
   // a grab so the window opens on mousedown before any motion.
   controls.addEventListener('start', invalidate)
+  controls.addEventListener('start', noteInteraction)
   controls.addEventListener('change', invalidate)
+  controls.addEventListener('change', noteInteraction)
   controls.addEventListener('end', invalidate)
+  controls.addEventListener('end', noteInteraction)
   const onResize = () => invalidate() // scene.js owns the actual resize handler
   window.addEventListener('resize', onResize)
   // timeline: every discrete change (seek/play/pause/setSpeed) reopens the
@@ -2565,8 +2603,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // Freeze: bump to native DPR for a Retina-sharp still, draw exactly one frame
   // at that resolution, then park. setPixelRatio reallocates the composer
   // buffers, so this cost lands once per idle transition — never mid-interaction.
+  // Compares against the renderer's actual current ratio (not params.pixelRatio)
+  // because ambient playback (perf pack b, below) may have already parked it at
+  // ANIM_PIXEL_RATIO — idle always wins the max either way. exitIdle below
+  // restores params.pixelRatio read LIVE (not a bump-time snapshot) so a
+  // Settings-panel pixelRatio change made while parked in idle takes effect on
+  // wake instead of being clobbered by a stale value (regression found in
+  // review: a preIdleRatio snapshot here would re-assert the ratio that was
+  // active at bump time, silently overwriting whatever the user just set).
   function enterIdle(dt) {
-    if (IDLE_PIXEL_RATIO > params.pixelRatio + 1e-3) {
+    const current = stage.renderer.getPixelRatio()
+    if (IDLE_PIXEL_RATIO > current + 1e-3) {
       stage.setPixelRatio(IDLE_PIXEL_RATIO)
       pixelBumped = true
     }
@@ -2578,9 +2625,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
 
   // Thaw on the next invalidate: restore the interactive (lower) pixel ratio so
   // live frames stay cheap. The active tick that follows renders at that ratio.
+  // Reads params.pixelRatio live so a mid-idle Settings change wins on wake.
+  // The ambientPixelDropped branch is defensive, not the common path: by the
+  // time idle is reached, ambient-drop bookkeeping (further down in tick())
+  // has always already restored params.pixelRatio and cleared the flag — see
+  // that block's own comment — so this ternary normally just resolves to
+  // params.pixelRatio. It's kept in case that invariant ever breaks, so a
+  // stale idle-exit doesn't silently re-bump DPR past an active ambient drop.
   function exitIdle() {
     if (pixelBumped) {
-      stage.setPixelRatio(params.pixelRatio)
+      stage.setPixelRatio(ambientPixelDropped ? Math.min(ANIM_PIXEL_RATIO, params.pixelRatio) : params.pixelRatio)
       pixelBumped = false
     }
     idle = false
@@ -2589,6 +2643,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function tick() {
     if (disposed) return
     rafId = requestAnimationFrame(tick)
+    // perf pack a: ambient-throttle gate — skipped frames never call
+    // clock.getDelta(), so their elapsed time simply accumulates into the
+    // next processed frame's dt (nothing is lost, motion just steps in
+    // bigger increments at ~30fps instead of every RAF).
+    if (PERF_THROTTLE && ambientThrottled && performance.now() < nextAmbientFrameAt) return
     const dt = Math.min(clock.getDelta(), 0.05)
     const t = clock.elapsedTime
 
@@ -2596,6 +2655,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // open. Animating frames roll the window forward so any motion always gets a
     // full ACTIVE_WINDOW_MS tail (damping, settle) before the loop can idle.
     const animating = isAnimating()
+    // full-rate whenever a camera animation (tour/flyTo) or live pointer/wheel
+    // input is in play; note follow-camera mode is deliberately NOT included
+    // here — it's classified as ambient and throttles to 30fps too (see
+    // docs/HANDOFF.md 顯示效能提升包 for the tradeoff writeup)
+    const fullRate = motion.tweenActive || motion.tourActive || performance.now() < interactUntil
+    const ambientOnly = animating && !fullRate
     if (animating) invalidate()
     if (!animating && performance.now() >= activeUntil) {
       if (!idle) {
@@ -2744,6 +2809,38 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
 
     renderFrame(dt)
+
+    // perf pack a/b bookkeeping — only reached on a processed frame (the idle
+    // early-return above skips it entirely, which is fine: ambientPixelDropped
+    // is always cleared before the activity window can expire into true idle,
+    // see the restore branch below). Gated by PERF_THROTTLE: false means
+    // ambientThrottled never turns true (top-of-tick gate becomes a no-op) and
+    // the DPR-drop block below is skipped outright — full pre-package behavior.
+    ambientThrottled = PERF_THROTTLE && ambientOnly
+    if (ambientThrottled) {
+      // accumulator pacing (not "now + interval") so a slow frame can't drift
+      // the schedule forward or spiral — it just catches up to `now`.
+      nextAmbientFrameAt = Math.max(nextAmbientFrameAt + ANIM_FRAME_MS, performance.now())
+    }
+    if (PERF_THROTTLE && window.devicePixelRatio > 1) {
+      if (ambientOnly) {
+        if (!ambientSince) ambientSince = performance.now()
+        if (!ambientPixelDropped && performance.now() - ambientSince > AMBIENT_PIXEL_DEBOUNCE_MS) {
+          stage.setPixelRatio(Math.min(ANIM_PIXEL_RATIO, params.pixelRatio))
+          ambientPixelDropped = true
+        }
+      } else {
+        if (!ambientPixelDropped) ambientSince = 0 // streak broken before it dropped — restart the debounce clock next time
+        // restore only when ambient fully ends (animating → false), never just
+        // because interaction started a fullRate overlay on top of it — that
+        // would force a mid-gesture composer buffer realloc (see enterIdle)
+        if (!animating && ambientPixelDropped) {
+          stage.setPixelRatio(params.pixelRatio)
+          ambientPixelDropped = false
+          ambientSince = 0
+        }
+      }
+    }
   }
 
   // ---------------------------------------------------------------- facade
@@ -2923,6 +3020,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       },
       get idle() {
         return idle
+      },
+      // 顯示效能提升包 verify hook: the renderer's *actual* current DPR — 1.0
+      // during debounced ambient-only playback, IDLE_PIXEL_RATIO on the idle
+      // still, params.pixelRatio otherwise
+      get pixelRatio() {
+        return stage.renderer.getPixelRatio()
+      },
+      // 顯示效能提升包 verify hook: true on frames the ambient throttle is
+      // pacing to ~30fps (ambient motion, no tour/tween/interaction in play)
+      get ambientThrottled() {
+        return ambientThrottled
       },
       invalidate,
       stats,
