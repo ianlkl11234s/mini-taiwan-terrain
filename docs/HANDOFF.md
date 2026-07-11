@@ -4,8 +4,8 @@
 
 ## 現況快照
 
-- **本地 main 領先 origin/main 21 個 commit，未 push、未發 PR**（用戶指示：修到一個程度再收）。全部經過驗收、`npm run build` 通過。
-- 本 session 完成（時序）：步道圖層 → 階層面板+點選 popup 系統 → 山頂鑽地修復 → ③海平面 z-fight → ④澎湖擴圖 → ⑤海底地形（GEBCO）→ ①②農田 drape+灌溉渠道 → overzoom/快取/淡綠帶三修 → 金馬+福建擴圖 → 外島海岸線+南界 21.0 → **向量瓦片三期**（OSM 路網分級+點選、農田單田點選、投影錨點修復）→ **列車 MVP**（TRA 992 班時刻表光點）→ **時間軸**（見下節）。
+- **本地 main 領先 origin/main 28 個 commit，未 push、未發 PR**（用戶指示：修到一個程度再收）。全部經過驗收、`npm run build` 通過。
+- 本 session 完成（時序）：步道圖層 → 階層面板+點選 popup 系統 → 山頂鑽地修復 → ③海平面 z-fight → ④澎湖擴圖 → ⑤海底地形（GEBCO）→ ①②農田 drape+灌溉渠道 → overzoom/快取/淡綠帶三修 → 金馬+福建擴圖 → 外島海岸線+南界 21.0 → **向量瓦片三期**（OSM 路網分級+點選、農田單田點選、投影錨點修復）→ **列車 MVP**（TRA 992 班時刻表光點）→ **時間軸**（見下節）→ **面板格式整頓**（rowLabel 鐵則落地、Row 防凸框、車站/點層 size+opacity 滑桿範本、Markers 列移除、海底地形預設開）→ **高鐵列車**（THSR 212 班，trains.js 工廠參數化雙實例）。
 - 設計文件（opus 審定、實作前必讀）：`docs/BATHYMETRY_DESIGN.md`、`docs/VECTOR_TILES_DESIGN.md`、`docs/TIMELINE_DESIGN.md`。
 - R2 資產現況：`terrain-tiles/`（本島舊磚，舊版前端用）、`terrain-tiles/bathy/`（8,096 磚，現行前端唯一讀取路徑）、`terrain-tiles/vector/`（osm_road_drive.pmtiles 59MB + ftw_fields_2025.pmtiles 107MB）。
 - bbox 現況：117.8–123.5E / 21.0–26.5N（含金馬澎+福建沿岸+巴士海峽）。
@@ -42,3 +42,5 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 - 驗證分級：shader/部署/跨 repo 才雙道（實作自驗+opus 終審），一般圖層煙霧測試即可；截圖抓到證據即停
 - 用戶 dev server 慣用 port 6015（`gis-up` 清單目前登記 6007，尚未改）
 - 列車資料契約：`train_tracks.json` 弧長度量=EPSG:3826 真實公尺；part key=`tra_00..36`（rail_lines 篩 tra 後的 index）；`dep_sec_of_day`=Asia/Taipei 當日秒
+- 高鐵資料契約：`thsr_tracks/thsr_schedule.json` schema 同台鐵；part=`thsr_00` 南下/`thsr_01` 北上（鏡射走廊）；**方向判定=整班「起點 ratio < 終點 ratio」**（bake 的 `match_thsr_track_to_part()` 與前端 `resolveCorridorPart()` 同一套規則，改一邊必改另一邊）；時刻表源=pulse 快照 2026-02-18（212 班）
+- 圖層列格式鐵則已入 `/new-layer` skill §4b：rowLabel 嚴格「中文名 英文名」、禁動態數字、新圖層必須有 styleSchema（點層 size+opacity 起跳，範本=markers.js POINT_STYLE / trains.js TRAIN_STYLE）
