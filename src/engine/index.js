@@ -11,6 +11,7 @@ import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
 import { createOsmRoadsLayer, createTrailsLayer, createFtwFieldsLayer, createBuildingsLayer } from './vectortiles.js'
 import { createAirspaceLayer } from './airspace.js'
+import { createPowerTowersLayer, createWindTurbinesLayer } from './energy.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
 import * as timeStore from '../state/timeStore.js'
@@ -287,6 +288,16 @@ export const DEFAULT_PARAMS = {
   // zones don't read as a solid opaque blob (design brief).
   airspaceVisible: false,
   airspaceOpacity: 0.25,
+  // power towers / wind turbines: InstancedMesh point layers with real 3D
+  // silhouettes (src/engine/energy.js), gated to near-view only (see that
+  // module's camDist hysteresis) — size scales footprint only, never true
+  // height (matches trains.js's widthM/heightM convention).
+  powerTowersVisible: false,
+  powerTowersSize: 1.0,
+  powerTowersOpacity: 0.9,
+  windTurbinesVisible: false,
+  windTurbinesSize: 1.0,
+  windTurbinesOpacity: 0.95,
   // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
   // S Japan, S Korea, SE China) as flat strokes over a sea-coloured plane —
   // geographic context beyond the Taiwan DEM footprint (src/engine/region.js).
@@ -697,6 +708,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
   const buildingsLayer = createBuildingsLayer(params, { invalidate })
   const airspaceLayer = createAirspaceLayer(params)
+  const powerTowersLayer = createPowerTowersLayer(params)
+  const windTurbinesLayer = createWindTurbinesLayer(params)
   const shipsLayer = createShipsLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
@@ -714,7 +727,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // — its own theme, not transport/water/agri/outdoor/fx
   const GROUP_SAFETY = { id: 'safety', label: '安全 Safety', order: 4 }
   const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 5 }
-  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 6 }
+  // power towers + wind turbines (src/engine/energy.js) — its own theme, not
+  // transport/agriculture/safety
+  const GROUP_ENERGY = { id: 'energy', label: '能源 Energy', order: 6 }
+  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 7 }
   const LAYER_GROUPS = {
     region: { group: GROUP_BASE },
     coastline: { group: GROUP_BASE },
@@ -742,6 +758,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // 3D airspace fence (bake_airspace.py / src/engine/airspace.js) — aviation
     // hazard/restriction overlay, alongside airports/ports above
     airspace: { group: GROUP_MOVE },
+    power_towers: { group: GROUP_ENERGY },
+    wind_turbines: { group: GROUP_ENERGY },
     rivers: { group: GROUP_WATER },
     reservoirs: { group: GROUP_WATER },
     // farmland tint + irrigation canals: agriculture, not hydrology — its own
@@ -765,12 +783,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // registration order = draw / update order (coastline → counties →
   // buildings → airspace → rail → trains → thsr → trails → rivers →
   // reservoirs → farm sim → irrigation → typhoon → markers → stations →
-  // ships → trail signs → labels). thsr
+  // ships → trail signs → airports/ports → fire/hospitals/police → power
+  // towers → wind turbines → labels). thsr
   // registers right after trains so it lands directly below 台鐵列車 Trains,
   // and ships registers right after stations, both in the Layers panel's
   // 交通 Move group (Layers.jsx preserves registration order within a group
   // — see groupLayers()). airspace registers right after buildings (same
-  // low-pick-priority reasoning).
+  // low-pick-priority reasoning); power towers/wind turbines register late
+  // (high pick-priority for their small near-view silhouettes) just before
+  // labels.
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
@@ -823,6 +844,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     fireStationsLayer,
     hospitalsLayer,
     policeLayer,
+    powerTowersLayer,
+    windTurbinesLayer,
     labelsLayer,
   ]) {
     layers.register(layer, layerCtx(), LAYER_GROUPS[layer.id])
@@ -1826,6 +1849,48 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
   }
 
+  // power towers / wind turbines: manifest-driven deferred point layers
+  // (bake_energy.py -> public/layers/power_towers.json / wind_turbines.json,
+  // src/engine/energy.js). Same fail-quiet fetch-once pattern as loadPoiData.
+  let powerTowersFetch = { loading: false, loaded: false }
+  async function loadPowerTowersData() {
+    if (powerTowersFetch.loading || powerTowersFetch.loaded) return
+    powerTowersFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('power_towers', '/layers/power_towers.json'))
+      if (!res.ok) throw new Error(`power_towers.json ${res.status}`)
+      const data = await res.json()
+      powerTowersLayer.setData(data.points, data.meta?.operators)
+      powerTowersFetch.loaded = true
+      powerTowersLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] power_towers fetch failed', err)
+    } finally {
+      powerTowersFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+  let windTurbinesFetch = { loading: false, loaded: false }
+  async function loadWindTurbinesData() {
+    if (windTurbinesFetch.loading || windTurbinesFetch.loaded) return
+    windTurbinesFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('wind_turbines', '/layers/wind_turbines.json'))
+      if (!res.ok) throw new Error(`wind_turbines.json ${res.status}`)
+      const data = await res.json()
+      windTurbinesLayer.setData(data.points)
+      windTurbinesFetch.loaded = true
+      windTurbinesLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] wind_turbines fetch failed', err)
+    } finally {
+      windTurbinesFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
   // ---------------------------------------------------------------- real-world DEM loading
 
   // The whole session lives in ONE world: the projection is anchored at the
@@ -2128,6 +2193,24 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       airspaceLayer.update(layerCtx())
     },
     airspaceOpacity: () => airspaceLayer.update(layerCtx()),
+    // power towers / wind turbines: manifest-driven deferred point layers,
+    // same first-switch-on-fetches pattern. size/opacity just re-run update()
+    // (buildings/trains convention) — energy.js's own tickView/update staleness
+    // checks (lastSizeMult/lastExaggeration) pick up the new params[key] value
+    // and re-lay-out on the very next frame (setParams's trailing invalidate()
+    // guarantees one happens).
+    powerTowersVisible: (v) => {
+      if (v) loadPowerTowersData()
+      powerTowersLayer.update(layerCtx())
+    },
+    powerTowersSize: () => powerTowersLayer.update(layerCtx()),
+    powerTowersOpacity: () => powerTowersLayer.update(layerCtx()),
+    windTurbinesVisible: (v) => {
+      if (v) loadWindTurbinesData()
+      windTurbinesLayer.update(layerCtx())
+    },
+    windTurbinesSize: () => windTurbinesLayer.update(layerCtx()),
+    windTurbinesOpacity: () => windTurbinesLayer.update(layerCtx()),
     // region: first switch-on fetches the neighbouring coastlines (deferred);
     // the sea plane + style params re-run the layer's update
     regionVisible: (v) => {
