@@ -4,8 +4,8 @@
 
 ## 現況快照
 
-- **本地 main 領先 origin/main 35 個 commit，未 push、未發 PR**（用戶指示：修到一個程度再收）。全部經過驗收、`npm run build` 通過。
-- 本 session 完成（時序）：步道圖層 → 階層面板+點選 popup 系統 → 山頂鑽地修復 → ③海平面 z-fight → ④澎湖擴圖 → ⑤海底地形（GEBCO）→ ①②農田 drape+灌溉渠道 → overzoom/快取/淡綠帶三修 → 金馬+福建擴圖 → 外島海岸線+南界 21.0 → **向量瓦片三期**（OSM 路網分級+點選、農田單田點選、投影錨點修復）→ **列車 MVP**（TRA 992 班時刻表光點）→ **時間軸**（見下節）→ **面板格式整頓**（rowLabel 鐵則落地、Row 防凸框、車站/點層 size+opacity 滑桿範本、Markers 列移除、海底地形預設開）→ **高鐵列車**（THSR 212 班，trains.js 工廠參數化雙實例）→ **列車點選資訊卡**（proximity pick，台鐵/高鐵通用）→ **船舶 AIS 圖層**（`ships.js` track 層，CDN 快照優先+RPC fallback，subscribeDate 首戰）→ **比例尺真實化**（demExaggeration 預設 1.0，滑桿可調回）→ **海面淡波紋**（region 海面板 onBeforeCompile 注入 fresnel/spec，opus 雙道審過，customProgramCacheKey 隔離）。設計 SSOT：`docs/MARINE_DESIGN.md`。
+- **本地 main 領先 origin/main 45 個 commit，未 push、未發 PR**（用戶指示：修到一個程度再收）。全部經過驗收、`npm run build` 通過。
+- 本 session 完成（時序）：步道圖層 → 階層面板+點選 popup 系統 → 山頂鑽地修復 → ③海平面 z-fight → ④澎湖擴圖 → ⑤海底地形（GEBCO）→ ①②農田 drape+灌溉渠道 → overzoom/快取/淡綠帶三修 → 金馬+福建擴圖 → 外島海岸線+南界 21.0 → **向量瓦片三期**（OSM 路網分級+點選、農田單田點選、投影錨點修復）→ **列車 MVP**（TRA 992 班時刻表光點）→ **時間軸**（見下節）→ **面板格式整頓**（rowLabel 鐵則落地、Row 防凸框、車站/點層 size+opacity 滑桿範本、Markers 列移除、海底地形預設開）→ **高鐵列車**（THSR 212 班，trains.js 工廠參數化雙實例）→ **列車點選資訊卡**（proximity pick，台鐵/高鐵通用）→ **船舶 AIS 圖層**（`ships.js` track 層，CDN 快照優先+RPC fallback，subscribeDate 首戰）→ **比例尺真實化**（demExaggeration 預設 1.0，滑桿可調回）→ **海面淡波紋**（region 海面板 onBeforeCompile 注入 fresnel/spec，opus 雙道審過，customProgramCacheKey 隔離）→ **台鐵切段點重縫**（全段涵蓋 84→100%）→ **3D 車廂**（近景 LOD）→ **船舶快照 7 天上 R2** → **跟隨鏡頭**（delta-carry）。設計 SSOT：`docs/MARINE_DESIGN.md`、`docs/FOLLOW_CAMERA_DESIGN.md`。
 - 設計文件（opus 審定、實作前必讀）：`docs/BATHYMETRY_DESIGN.md`、`docs/VECTOR_TILES_DESIGN.md`、`docs/TIMELINE_DESIGN.md`。
 - R2 資產現況：`terrain-tiles/`（本島舊磚，舊版前端用）、`terrain-tiles/bathy/`（8,096 磚，現行前端唯一讀取路徑）、`terrain-tiles/vector/`（osm_road_drive.pmtiles 59MB + ftw_fields_2025.pmtiles 107MB）。
 - bbox 現況：117.8–123.5E / 21.0–26.5N（含金馬澎+福建沿岸+巴士海峽）。
@@ -24,7 +24,7 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 | # | 項目 | 脈絡 |
 |---|------|------|
 | 1 | ~~時間軸~~ ✅ 2026-07-11 完成 | 見上節；設計 `docs/TIMELINE_DESIGN.md` |
-| 2 | 列車二期：~~點選班次資訊卡~~✅、3D 車廂、**跟隨鏡頭** | 資訊卡 2026-07-11 完成；跟隨鏡頭無範本（v3/pulse 都沒做），需從零設計且不與 tour.js 打架 |
+| 2 | ~~列車二期~~ ✅ 2026-07-11 全數完成 | 資訊卡＋3D 車廂（近景 LOD 鏈狀 instanced box，hysteresis 7/10 world units）＋跟隨鏡頭（delta-carry，設計 SSOT `docs/FOLLOW_CAMERA_DESIGN.md` opus 審定；follow.js 也支援未來 ships 的 mmsi） |
 | 3 | ~~rail_lines.json 切段點維護~~ ✅ 2026-07-11 完成 | `scripts/fix_rail_cuts.py` 簡單路徑分解重縫，全段涵蓋 **84%→100%**、leg 98.7%→100%；幾何聯集不變（`verify_rail_geometry.py` 可重驗）、thsr byte-identical |
 | 4 | OSM 步道圖層 | 需上游 analytics 從 PBF 重抽全台 walk network（path/footway/steps/track ~19 萬邊，現有萃取只有 9 城市）；OSM 無 sac_scale 難度標籤 |
 | 5 | Cloudflare Cache Rule（`.pmtiles` **＋ `/ships/trails/*.json`**） | **用戶手動**：dashboard 對 tiles.itsmigu.com 加 Cache Rule，否則每個請求回源（兩路徑實測都 cf-cache-status: DYNAMIC）；船舶快照單檔 3.7–7.4MB、Cloudflare 會 zstd 壓縮 |
