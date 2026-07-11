@@ -12,6 +12,7 @@ import { createLabelsLayer } from './labels.js'
 import { createOsmRoadsLayer, createTrailsLayer, createFtwFieldsLayer, createBuildingsLayer } from './vectortiles.js'
 import { createAirspaceLayer } from './airspace.js'
 import { createPowerTowersLayer, createWindTurbinesLayer } from './energy.js'
+import { createMedicalLayer } from './medical.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
 import * as timeStore from '../state/timeStore.js'
@@ -676,6 +677,20 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       ['地址 Address', pt.address || '—'],
     ],
   })
+  // F 醫療設施 POI: the full national NHI-contracted institution roll
+  // (bake_medical_poi.py -> medical.json, R2-hosted — see manifest entry and
+  // that bake script's docstring for the "42MB source" investigation and the
+  // 2-8MB-bracket R2 decision). Complements, does not replace, hospitalsLayer
+  // above (232 emergency-responsible hospitals only) — registered right after
+  // it for the same panel-proximity reasoning as thsr/ships elsewhere in this
+  // list. NOT a createPointLayer: see src/engine/medical.js module header for
+  // why (21,765 診所 alone is too many for markers.js's always-resident-dots
+  // convention — this follows energy.js's InstancedMesh+grid-gather playbook
+  // instead), but it still exposes the same `sets` panel contract (describe/
+  // setSet) as ports/hospitals so 醫院/診所/藥局 get independent toggles.
+  const medicalLayer = createMedicalLayer(params, {
+    onActivate: () => loadMedicalData(),
+  })
   // police_stations.json's facility_subtype is the raw English source enum
   // (police_justice/police_stations pipeline) — same bilingual-label-lookup
   // pattern as STATION_SYSTEM_LABELS/HIGHWAY_LABELS above, a tag missing from
@@ -772,6 +787,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // infrastructure, its own theme (see GROUP_SAFETY)
     fire_stations: { group: GROUP_SAFETY },
     hospitals: { group: GROUP_SAFETY },
+    // full national 醫院/診所/藥局 roll (bake_medical_poi.py) — complements
+    // hospitals above, same theme
+    medical: { group: GROUP_SAFETY },
     police_stations: { group: GROUP_SAFETY },
     trails: { group: GROUP_OUTDOOR },
     trail_signs: { group: GROUP_OUTDOOR },
@@ -783,7 +801,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // registration order = draw / update order (coastline → counties →
   // buildings → airspace → rail → trains → thsr → trails → rivers →
   // reservoirs → farm sim → irrigation → typhoon → markers → stations →
-  // ships → trail signs → airports/ports → fire/hospitals/police → power
+  // ships → trail signs → airports/ports → fire/hospitals/medical/police → power
   // towers → wind turbines → labels). thsr
   // registers right after trains so it lands directly below 台鐵列車 Trains,
   // and ships registers right after stations, both in the Layers panel's
@@ -843,6 +861,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     portsLayer,
     fireStationsLayer,
     hospitalsLayer,
+    medicalLayer,
     policeLayer,
     powerTowersLayer,
     windTurbinesLayer,
@@ -1886,6 +1905,34 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       console.warn('[layers] wind_turbines fetch failed', err)
     } finally {
       windTurbinesFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // medical: manifest-driven deferred point layer, but R2-hosted (not
+  // committed to git — see bake_medical_poi.py's size-bracket decision, 2.83
+  // MB lands in the 2-8 MB rule, not the <2MB git bracket the other 5 basic
+  // POI packs above use). Same fail-quiet fetch-once pattern as loadPoiData/
+  // loadPowerTowersData; medicalLayer.setData takes the flat {name,cat,
+  // county,lon,lat,elev} point array directly (bake_medical_poi.py's schema
+  // — no `systems` dict like the git-committed POI packs, since category is
+  // a plain int enum per the task spec, not a bake-time named-set split).
+  let medicalFetch = { loading: false, loaded: false }
+  async function loadMedicalData() {
+    if (medicalFetch.loading || medicalFetch.loaded) return
+    medicalFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('medical', 'https://tiles.itsmigu.com/layers/medical.json'))
+      if (!res.ok) throw new Error(`medical.json ${res.status}`)
+      const data = await res.json()
+      medicalLayer.setData(data.points)
+      medicalFetch.loaded = true
+      medicalLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] medical fetch failed', err)
+    } finally {
+      medicalFetch.loading = false
       invalidate()
       emit('layers')
     }

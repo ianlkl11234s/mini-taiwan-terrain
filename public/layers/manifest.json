@@ -91,6 +91,14 @@
       "visible": false
     },
     {
+      "id": "medical",
+      "kind": "point",
+      "label": "Medical",
+      "rowLabel": "醫療設施 Medical",
+      "url": "https://tiles.itsmigu.com/layers/medical.json",
+      "visible": false
+    },
+    {
       "id": "police_stations",
       "kind": "point",
       "label": "Police",

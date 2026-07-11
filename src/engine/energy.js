@@ -130,7 +130,9 @@ function buildTurbineUnitGeometry() {
 
 // ---------------------------------------------------------------- spatial grid (towers only)
 
-function buildGrid(points, cellSize) {
+// exported so other high-count point layers (medical.js) can reuse the same
+// gather-near-camera pattern instead of re-deriving it
+export function buildGrid(points, cellSize) {
   const grid = new Map()
   for (let i = 0; i < points.length; i++) {
     const p = points[i]
@@ -145,7 +147,7 @@ function buildGrid(points, cellSize) {
   return grid
 }
 
-function gatherNear(grid, cellSize, cx, cz, radius, points, maxCount) {
+export function gatherNear(grid, cellSize, cx, cz, radius, points, maxCount) {
   const r2 = radius * radius
   const cMin = Math.floor((cx - radius) / cellSize)
   const cMax = Math.floor((cx + radius) / cellSize)
