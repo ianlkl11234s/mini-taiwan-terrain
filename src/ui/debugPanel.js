@@ -228,7 +228,6 @@ export function createDebugPanel(engine, hud2) {
   // only Terrain source starts expanded (Tour closed too — the GUI docks on
   // the left and a fully expanded column would cover the bottom-left telemetry)
   fTour.close()
-  fTrains.close()
   fTerrain.close()
   fSurface.close()
   fCamera.close()
