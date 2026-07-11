@@ -265,6 +265,16 @@ export const DEFAULT_PARAMS = {
   regionLineColor: '#303030', // dark-grey coastline (user default, RGB 48 48 48)
   regionLineWidth: 1.3,
   regionLineOpacity: 0.9,
+  // sea ripple decoration (docs/MARINE_DESIGN.md §2): fragment-only
+  // onBeforeCompile injection on the region sea plane's OWN MeshBasicMaterial
+  // (region.js) — fresnel sky-tint + faint specular glint from a few
+  // scrolling analytic sine fields, no vertex displacement (this repo's
+  // ~480 m/world-unit scale makes real wave amplitude sub-pixel). seaAnimated
+  // keeps the render loop non-idle while on (isAnimating() below) — a
+  // wall-clock decoration, NOT gated on the timeline, same as typhoon.
+  seaAnimated: true,
+  seaRippleStrength: 0.3,
+  seaRippleSpeed: 1.0,
   // typhoon: a purely procedural vortex cloud sheet high above the terrain
   // (src/engine/typhoon.js) — no data, animated entirely in the fragment shader.
   // The eye defaults to just off the SE coast so the rainbands sweep the island;
@@ -1899,6 +1909,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     regionLineColor: () => layers.get('region').update(layerCtx()),
     regionLineWidth: () => layers.get('region').update(layerCtx()),
     regionLineOpacity: () => layers.get('region').update(layerCtx()),
+    seaAnimated: () => layers.get('region').update(layerCtx()),
+    seaRippleStrength: () => layers.get('region').update(layerCtx()),
+    seaRippleSpeed: () => layers.get('region').update(layerCtx()),
     // typhoon: procedural vortex cloud sheet — every param just re-runs the
     // layer's update (visibility gate + place/scale + shader-uniform style)
     typhoonVisible: () => layers.get('typhoon').update(layerCtx()),
@@ -2076,6 +2089,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (params.source !== 'real' || !heightField) return true
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
+      (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
       motion.tourActive ||
       motion.tweenActive ||

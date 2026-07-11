@@ -277,6 +277,13 @@ function StyleControl({ value, schema, onChange }) {
       </Row>
     )
   }
+  if (schema.type === 'toggle') {
+    return (
+      <Row label={schema.label}>
+        <Toggle on={value} onChange={onChange} />
+      </Row>
+    )
+  }
   // slider (live onChange — all layer style params are non-rebuild)
   return <Slider label={schema.label} min={schema.min} max={schema.max} step={schema.step} value={value} onChange={onChange} format={schema.format} />
 }

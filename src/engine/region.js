@@ -75,6 +75,103 @@ export function createRegionLayer(params) {
   sea.frustumCulled = false
   group.add(sea)
 
+  // --- sea ripple decoration (docs/MARINE_DESIGN.md §2) ------------------
+  // opus M1: never swap seaMat for a raw ShaderMaterial — its alphaMap (land
+  // mask) / alphaTest / fog / opacity (the bathymetryVisible HANDLER's 0.5⇄1.0
+  // toggle) / polygonOffset are load-bearing and must survive untouched.
+  // Instead, onBeforeCompile injects fragment-only fresnel/specular GLSL into
+  // the material's own generated shader (same technique as terrain.js:79).
+  // No vertex displacement: this repo's ~480 m/world-unit scale makes real
+  // wave amplitude (~0.5 m) sub-pixel, so only the visual language is worth
+  // borrowing (see z_japan_virtual_town/web/island/src/water.js's fresnel/
+  // specular, NOT its Gerstner geometry).
+  //
+  // Uniform VALUE OBJECTS are created once here (not inside onBeforeCompile,
+  // which can re-run on recompile — e.g. setMask() flips seaMat.needsUpdate)
+  // so every recompile re-attaches the SAME references via Object.assign,
+  // and outside code (applyStyle below, tickView's uSeaTime advance) keeps
+  // driving objects it already holds. Also parked on seaMat.userData for
+  // external inspection/driving (debug handle, future callers).
+  const rippleUniforms = {
+    uSeaTime: { value: 0 },
+    uRippleStrength: { value: params.seaRippleStrength },
+    uRippleSpeed: { value: params.seaRippleSpeed },
+  }
+  seaMat.userData.uniforms = rippleUniforms
+  seaMat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, rippleUniforms)
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\nvarying vec3 vWorldPos;`)
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>\nvWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`
+      )
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+varying vec3 vWorldPos;
+uniform float uSeaTime;
+uniform float uRippleStrength;
+uniform float uRippleSpeed;`
+      )
+      // AFTER alphatest_fragment: the land/sea mask discard has already run,
+      // so this only ever touches sea pixels, and diffuseColor already has
+      // alphaMap applied — nothing here can resurrect a discarded land pixel.
+      .replace(
+        '#include <alphatest_fragment>',
+        `#include <alphatest_fragment>
+{
+  // three independently-scrolling analytic sine fields fake a perturbed
+  // normal via their own slope (no dFdx/dFdy — portable to SwiftShader),
+  // which drives a fresnel sky-tint + a faint specular glint. At
+  // uRippleStrength 0 every term collapses back to the flat plane's original
+  // diffuseColor (rSlope*0 -> rN=(0,1,0), and every mix/add below is ALSO
+  // scaled by uRippleStrength again) — "拖到 0 = 現狀靜態海面" is a hard UI
+  // requirement, verified by this double-gating.
+  vec2 rp = vWorldPos.xz;
+  float rt = uSeaTime * uRippleSpeed;
+
+  vec2 rDir0 = vec2(0.79, 0.61);
+  vec2 rDir1 = vec2(-0.54, 0.84);
+  vec2 rDir2 = vec2(0.35, -0.94);
+  float rK0 = 1.7, rK1 = 2.6, rK2 = 4.1;    // 2*pi/wavelength, world units
+  float rW0 = 0.55, rW1 = 0.35, rW2 = 0.80; // angular rate
+  float rA0 = 1.0, rA1 = 0.65, rA2 = 0.4;   // relative weight
+
+  float rPh0 = dot(rDir0, rp) * rK0 - rt * rW0;
+  float rPh1 = dot(rDir1, rp) * rK1 - rt * rW1;
+  float rPh2 = dot(rDir2, rp) * rK2 - rt * rW2;
+
+  // analytic slope of the summed sine field = fake normal, kept tiny by design
+  vec2 rSlope = rDir0 * (rK0 * rA0 * cos(rPh0))
+              + rDir1 * (rK1 * rA1 * cos(rPh1))
+              + rDir2 * (rK2 * rA2 * cos(rPh2));
+  rSlope *= 0.05 * uRippleStrength;
+  vec3 rN = normalize(vec3(-rSlope.x, 1.0, -rSlope.y));
+  vec3 rV = normalize(cameraPosition - vWorldPos);
+  float rFres = pow(1.0 - clamp(dot(rN, rV), 0.0, 1.0), 5.0);
+
+  // paper-toned sky tint at grazing angles (#dfe6e2 direction) — NOT a
+  // saturated blue, matches the theme's paper aesthetic
+  vec3 rSky = vec3(0.8745, 0.9020, 0.8863);
+  diffuseColor.rgb = mix(diffuseColor.rgb, rSky, rFres * 0.5 * uRippleStrength);
+
+  // faint specular glint off a fixed decorative light direction (matches the
+  // scene's default sun az/el 64deg/19deg — not wired live to the sun
+  // sliders; this is decoration, not a lighting simulation)
+  vec3 rL = vec3(0.4145, 0.3256, 0.8496);
+  vec3 rH = normalize(rL + rV);
+  float rSpec = pow(max(dot(rN, rH), 0.0), 200.0);
+  diffuseColor.rgb += vec3(1.0) * rSpec * 0.12 * uRippleStrength;
+
+  // opacity: gentle +0..0.05 lift at grazing angles only — "很淡、接近透明"
+  // is a hard requirement, this must never push the sea toward opaque
+  diffuseColor.a = clamp(diffuseColor.a + rFres * 0.05 * uRippleStrength, 0.0, 1.0);
+}`
+      )
+  }
+
   const lineMat = new LineMaterial({
     color: new THREE.Color(params.regionLineColor),
     linewidth: params.regionLineWidth,
@@ -154,6 +251,8 @@ export function createRegionLayer(params) {
   function applyStyle() {
     seaMat.color.set(params.regionSeaColor)
     seaMat.opacity = params.regionSeaOpacity
+    rippleUniforms.uRippleStrength.value = params.seaRippleStrength
+    rippleUniforms.uRippleSpeed.value = params.seaRippleSpeed
     lineMat.color.set(params.regionLineColor)
     lineMat.linewidth = params.regionLineWidth
     lineMat.opacity = params.regionLineOpacity
@@ -170,6 +269,9 @@ export function createRegionLayer(params) {
       visible: 'regionVisible',
       seaColor: 'regionSeaColor',
       seaOpacity: 'regionSeaOpacity',
+      seaAnimated: 'seaAnimated',
+      seaRippleStrength: 'seaRippleStrength',
+      seaRippleSpeed: 'seaRippleSpeed',
       lineColor: 'regionLineColor',
       lineWidth: 'regionLineWidth',
       lineOpacity: 'regionLineOpacity',
@@ -214,10 +316,18 @@ export function createRegionLayer(params) {
     tickView(ctx) {
       const nextSea = zFightLift(SEA_LIFT_BASE, ctx.fogScale)
       const nextLine = zFightLift(LINE_LIFT_BASE, ctx.fogScale)
-      if (nextSea === seaLift && nextLine === lineLift) return
-      seaLift = nextSea
-      lineLift = nextLine
-      placeVertical()
+      if (nextSea !== seaLift || nextLine !== lineLift) {
+        seaLift = nextSea
+        lineLift = nextLine
+        placeVertical()
+      }
+      // sea ripple decoration: a wall-clock animation (not gated on the
+      // timeline), same as typhoon's uTime. gate() (not just group.visible)
+      // matches the isAnimating() proxy in index.js — regionVisible is used
+      // there without waiting on maskReady/hf, so a brief idle-spin before
+      // the mask loads is expected (docs/MARINE_DESIGN.md §2.2 opus m3);
+      // this only actually advances once gate() is fully true.
+      if (params.seaAnimated && gate()) rippleUniforms.uSeaTime.value += ctx.dt
     },
 
     // deferred land/sea mask: sea=255 / land=0, sampled as the sea plane's
@@ -242,6 +352,9 @@ export function createRegionLayer(params) {
         styleSchema: {
           seaColor: { type: 'color', label: '海色 Sea' },
           seaOpacity: { type: 'slider', label: '海透明度 Sea opacity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+          seaAnimated: { type: 'toggle', label: '海面動態 Ripple' },
+          seaRippleStrength: { type: 'slider', label: '波紋強度 Ripple strength', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+          seaRippleSpeed: { type: 'slider', label: '波紋速度 Ripple speed', min: 0, max: 3, step: 0.1, format: (v) => v.toFixed(1) },
           lineColor: { type: 'color', label: '海岸線色 Coast' },
           lineWidth: { type: 'slider', label: '線寬 Width', min: 0.3, max: 4, step: 0.1, format: (v) => v.toFixed(1) },
           lineOpacity: { type: 'slider', label: '線透明度 Line opacity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
@@ -249,6 +362,9 @@ export function createRegionLayer(params) {
         style: {
           seaColor: params.regionSeaColor,
           seaOpacity: params.regionSeaOpacity,
+          seaAnimated: params.seaAnimated,
+          seaRippleStrength: params.seaRippleStrength,
+          seaRippleSpeed: params.seaRippleSpeed,
           lineColor: params.regionLineColor,
           lineWidth: params.regionLineWidth,
           lineOpacity: params.regionLineOpacity,
