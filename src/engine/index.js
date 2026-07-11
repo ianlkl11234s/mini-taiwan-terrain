@@ -16,7 +16,7 @@ import * as timeStore from '../state/timeStore.js'
 import { makeProjection, HeightField, TAIWAN_BBOX, worldYScale, metersToWorldY } from './geo.js'
 import { ChunkManager } from './chunks.js'
 import { findRealPeaks } from './peaks.js'
-import { createStage, LOD_MIN, LOD_MAX } from './scene.js'
+import { createStage, LOD_MIN, LOD_MAX, LOD_D0 } from './scene.js'
 import { createMotion } from './tour.js'
 import { createKeyPan } from './keypan.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
@@ -484,6 +484,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   let heightField = null // real-world height source (geo.js) — set on first DEM load
   let demBusy = false
   const toFeetFn = (h) => terrain.heightToFeet(h)
+  // raw camera-target distance (world units), refreshed once per tick() —
+  // see its computation below at the P2 distance-LOD block. Separate from
+  // fogScale because fogScale clamps to 1 across the whole near range (see
+  // scene.js), too coarse for trains.js's near-view car-chain LOD to use.
+  // Layers that only run inside tick() (tickAll) always see the current
+  // frame's value; the rarer update()-only call sites just see the last one.
+  let lastCamDist = LOD_D0
 
   // fresh per-call snapshot of the live world state every layer reads from
   function layerCtx(dt = 0) {
@@ -493,6 +500,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       projection: heightField ? heightField.projection : null,
       camera,
       fogScale: stage.fogScale,
+      camDist: lastCamDist,
       dt,
       lineResolution: stage.lineResolution,
       // label-specific: fictional cartography in noise mode, real spot heights
@@ -624,7 +632,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     createCoastlineLayer(params),
     createCountiesLayer(params),
     createRailLayer(params),
-    createTrainsLayer(params),
+    createTrainsLayer(params, {
+      // near-view car-chain LOD (see trains.js module header) — real TRA EMU
+      // dimensions: ~20m/car, 6 cars/train. 320 × 6 = 1920 car instances.
+      carLenM: 20,
+      carCount: 6,
+      widthM: 3,
+      heightM: 4,
+    }),
     createTrainsLayer(params, {
       id: 'thsr',
       label: 'THSR',
@@ -633,6 +648,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       maxInstances: 64,
       singleCorridor: true,
       netLabel: '高鐵', // pick()'s info-card title prefix (see trains.js createTrainsLayer's netLabel doc)
+      // real THSR 700T dimensions: ~25m/car, 12 cars/train. 64 × 12 = 768 car instances.
+      carLenM: 25,
+      carCount: 12,
+      widthM: 3.4,
+      heightM: 4,
     }),
     osmRoadsLayer,
     createTrailsLayer(params),
@@ -2225,6 +2245,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // the new scale), fades the shadows, and re-targets the LOD rings through
     // the hysteresis.
     const camDist = camera.position.distanceTo(controls.target)
+    lastCamDist = camDist // trains.js near-view car-chain LOD reads this via layerCtx().camDist
     const realMode = params.source === 'real' && heightField
     const lodChanged = stage.tickView(camDist, !!realMode)
     const fogScale = stage.fogScale

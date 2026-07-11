@@ -53,11 +53,41 @@ import * as timeStore from '../state/timeStore.js'
 //   3. tickView(): every frame — find which trains are currently in service
 //      (sweep-line index, not a full-roster scan), locate each one's current
 //      leg/ratio, sample the part's arc-length table, project to world space.
+//
+// Dual-mode LOD (2026-07): at the P0/P1 default view (camDist ~26 world
+// units) and beyond, trains render exactly as before — one light dot per
+// train (layoutDots). Dolly in past CAR_LOD_ENTER_DIST and each train
+// switches to a chain of `carCount` instanced boxes (layoutCars): car i's
+// center sits at ratio `headRatio − dir·i·(carLenM/part.lengthM)` — a real
+// arc-length offset behind the head, walked along the SAME part the head is
+// on, so the chain naturally hugs curves instead of cutting corners like a
+// rigid rod would. `dir` (see locateTrain's _loc.dir) is the sign of the
+// current leg's ratioTo−ratioFrom: which way ratio increases isn't always
+// "forward" (depends on the part's own vertex order vs the train's travel
+// direction), so the tail offset has to follow it or it'd extend the wrong
+// way on roughly half of all legs. Car orientation comes from the chain
+// itself (tail→head vector between adjacent car centers), not a fresh
+// per-car tangent sample — cheap and correct since the cars are already laid
+// out along the curve. camDist crosses back out past CAR_LOD_EXIT_DIST
+// (> CAR_LOD_ENTER_DIST) before reverting to dots — the gap is deliberate
+// hysteresis so a small dolly wobble near the boundary can't flap the mode
+// every frame. Both InstancedMeshes are built once, up front, at full
+// capacity ("先空後填" — see module CLAUDE.md) — only mesh.count toggles
+// between 0 and real per frame; only one of dotMesh/carMesh is ever nonzero
+// at a time.
 
 const DEFAULT_MAX_INSTANCES = 320 // TRA default: ~3x the observed weekday concurrent peak, margin for safety
 const DOT_R = 0.11 // world units at fogScale 1
 const LIFT_BASE = 0.08 // sits above the rail line's own 0.05 lift (polyline.js createRailLayer)
 const REBUILD_ON_BACKWARD_JUMP = true
+// Dual-mode LOD thresholds — raw camera-target distance (world units, NOT
+// fogScale: fogScale stays clamped to 1 across this entire near range, see
+// scene.js's `Math.max(1, camDist / LOD_D0)`, so it can't distinguish "just
+// dollied in a bit" from "right on top of the tracks"). ENTER < EXIT is the
+// hysteresis band (see module header) — a plain single threshold would flap
+// every frame a dolly sat right on the boundary.
+const CAR_LOD_ENTER_DIST = 7 // world units (~3.4km) — camDist below this: dots -> car chains
+const CAR_LOD_EXIT_DIST = 10 // world units (~4.8km) — camDist above this: car chains -> dots
 // click-to-inspect hit radius, CSS px — same fixed-screen-space rationale as
 // markers.js's PICK_PX (dots are a few px on screen regardless of zoom, via
 // the fogScale-scaled DOT_R; a world-space tolerance wouldn't track that)
@@ -89,7 +119,11 @@ function sectionAt(stops, elapsedSec) {
 
 // point-layer styleSchema (size/opacity sliders) — same shape as markers.js's
 // POINT_STYLE, plus the light-dot's own color swatch (trains have no baked
-// per-line color the way rail does, see trains.js's material below).
+// per-line color the way rail does, see trains.js's material below). `size`
+// pulls double duty: far view (dots) scales DOT_R same as always; near view
+// (car chains, see layoutCars) scales the car cross-section (width/height)
+// only — a real-scale 3m-wide car is sub-pixel at any distance a human would
+// call "close", so this slider is the near-view legibility control too.
 const TRAIN_STYLE = {
   color: { type: 'color', label: '光點顏色 Color' },
   size: { type: 'slider', label: '大小 Size', min: 0.5, max: 3.0, step: 0.05, format: (v) => v.toFixed(2) },
@@ -164,7 +198,11 @@ function buildPartGeometry(pts) {
   const total = cum[n - 1] || 1
   const ratio = new Float32Array(n)
   for (let i = 0; i < n; i++) ratio[i] = cum[i] / total
-  return { lon, lat, elev, ratio, n }
+  // lengthM: real arc length (meters) — layoutCars converts a car's real
+  // length (carLenM) into a ratio delta via carLenM / lengthM, so the car
+  // chain's on-track spacing matches its baked geometry exactly regardless
+  // of how long this particular part happens to be.
+  return { lon, lat, elev, ratio, n, lengthM: cum[n - 1] || 0 }
 }
 
 // ratio (0..1) -> lon/lat/elev along one part's polyline, via binary search +
@@ -239,6 +277,15 @@ function resolveCorridorPart(stops, stationParts) {
 //                 (e.g. "台鐵 1234 自強" / "高鐵 0803" — the type suffix is
 //                 dropped when train_type already equals netLabel, which is
 //                 always true for THSR's single "高鐵" train_type)
+//   carLenM/carCount/widthM/heightM  near-view car-chain dimensions (see
+//                 module header's dual-mode LOD section) — real per-car
+//                 length in meters (drives on-track spacing, never resized:
+//                 the chain must stay glued to its true arc length or it'd
+//                 drift off the track as the train moves) and count, plus
+//                 the cross-section (width/height) that DOES scale with the
+//                 size param + demExaggeration (see layoutCars) since a
+//                 true-scale 3m-wide box is sub-pixel at any distance a
+//                 human would call "close". Defaults reproduce TRA's numbers.
 export function createTrainsLayer(params, config = {}) {
   const {
     id = 'trains',
@@ -248,6 +295,10 @@ export function createTrainsLayer(params, config = {}) {
     maxInstances = DEFAULT_MAX_INSTANCES,
     singleCorridor = false,
     netLabel = '台鐵',
+    carLenM = 20,
+    carCount = 6,
+    widthM = 3,
+    heightM = 4,
   } = config
   const visibleKey = `${id}Visible`
   const colorKey = `${id}Color`
@@ -266,14 +317,38 @@ export function createTrainsLayer(params, config = {}) {
     depthWrite: false,
     fog: true,
   })
-  const mesh = new THREE.InstancedMesh(geo, material, maxInstances)
-  mesh.count = 0 // "先空後填": nothing drawn until real schedule data lands (see setData)
-  mesh.renderOrder = 5
-  group.add(mesh)
+  const dotMesh = new THREE.InstancedMesh(geo, material, maxInstances)
+  dotMesh.count = 0 // "先空後填": nothing drawn until real schedule data lands (see setData)
+  dotMesh.renderOrder = 5
+  group.add(dotMesh)
+
+  // car-chain mesh (near-view LOD, see module header) — same "先空後填"
+  // discipline: built once at full capacity (maxInstances × carCount, see
+  // config doc above) with count 0, never rebuilt. depthWrite true (unlike
+  // the dot material): these are meant to read as solid boxes sitting on the
+  // track, not billboard-style glow dots, so cars need to occlude each other
+  // and the terrain correctly.
+  const carGeo = new THREE.BoxGeometry(1, 1, 1)
+  const carMaterial = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(params[colorKey]),
+    transparent: true,
+    opacity: params[opacityKey] ?? 0.95,
+    depthWrite: true,
+    fog: true,
+  })
+  const carMesh = new THREE.InstancedMesh(carGeo, carMaterial, maxInstances * carCount)
+  carMesh.count = 0
+  carMesh.renderOrder = 5
+  group.add(carMesh)
+  const maxCarInstances = maxInstances * carCount
+  // car-chain position scratch (layoutCars) — carCount is fixed for this
+  // layer instance, so one flat Float64Array reused across every train/frame
+  const _carPos = new Float64Array(carCount * 3)
 
   let hf = null
   let fogScale = 1
   let lift = LIFT_BASE
+  let carMode = false // dot chain vs car chain — see updateCarMode
 
   // ---- data (populated once by setData; leg→part resolution happens HERE,
   // not per tick — see module header)
@@ -291,9 +366,16 @@ export function createTrainsLayer(params, config = {}) {
   // ---- zero-allocation scratch (reused every tick)
   const _dummy = new THREE.Matrix4()
   const _sample = { lon: 0, lat: 0, elev: 0 }
-  const _loc = { partIdx: -1, ratio: 0 }
+  // dir: sign of ratioTo-ratioFrom for whichever leg supplied this fix — the
+  // direction "forward" runs in ratio-space (see locateTrain). Only consumed
+  // by layoutCars (car i's tail offset needs to know which way is "behind"
+  // the head along the part's own ratio parametrization); layoutDots ignores it.
+  const _loc = { partIdx: -1, ratio: 0, dir: 1 }
   const _pickWorld = new THREE.Vector3()
   const _pickProj = new THREE.Vector3()
+  // car-chain scratch (layoutCars) — sized once per layer instance (carCount
+  // is fixed per network, see config below), reused every train every frame
+  const _carScale = new THREE.Vector3()
 
   // click-to-inspect candidates (pick() below), refreshed every layout() call
   // — one entry per instance actually drawn this pass, carrying the train ref
@@ -365,9 +447,17 @@ export function createTrainsLayer(params, config = {}) {
     lastQueryT = t
   }
 
-  // find a train's current [partIdx, ratio] at `elapsedSec` (seconds since
-  // its own first departure) — dwelling at a station or moving along a leg.
-  // Writes into the shared _loc scratch; returns false if elapsedSec is
+  // sign of ratioTo-ratioFrom — which way ratio increases as the train moves
+  // forward along this leg's part (see _loc.dir doc above). Ties (a
+  // degenerate zero-length ratio span) default to +1; never 0, so layoutCars
+  // always has a well-defined "behind the head" direction to walk.
+  function legDir(leg) {
+    return leg.ratioTo >= leg.ratioFrom ? 1 : -1
+  }
+
+  // find a train's current [partIdx, ratio, dir] at `elapsedSec` (seconds
+  // since its own first departure) — dwelling at a station or moving along a
+  // leg. Writes into the shared _loc scratch; returns false if elapsedSec is
   // outside the journey or falls in an unresolved (no common part) leg.
   function locateTrain(train, elapsedSec) {
     const stops = train.stops
@@ -383,12 +473,14 @@ export function createTrainsLayer(params, config = {}) {
         if (prev && prev.partIdx >= 0) {
           _loc.partIdx = prev.partIdx
           _loc.ratio = prev.ratioTo
+          _loc.dir = legDir(prev)
           return true
         }
         const next = legs[i]
         if (next.partIdx >= 0) {
           _loc.partIdx = next.partIdx
           _loc.ratio = next.ratioFrom
+          _loc.dir = legDir(next)
           return true
         }
         return false
@@ -401,6 +493,7 @@ export function createTrainsLayer(params, config = {}) {
         const frac = span > 0 ? (elapsedSec - a.dep_sec) / span : 0
         _loc.partIdx = leg.partIdx
         _loc.ratio = leg.ratioFrom + (leg.ratioTo - leg.ratioFrom) * frac
+        _loc.dir = legDir(leg)
         return true
       }
     }
@@ -409,19 +502,37 @@ export function createTrainsLayer(params, config = {}) {
     if (lastLeg && lastLeg.partIdx >= 0) {
       _loc.partIdx = lastLeg.partIdx
       _loc.ratio = lastLeg.ratioTo
+      _loc.dir = legDir(lastLeg)
       return true
     }
     return false
   }
 
-  // per-frame: place every currently-active train's instance matrix
+  // camDist (world units, raw camera-target distance — NOT fogScale, see
+  // CAR_LOD_ENTER_DIST's doc) crossing the hysteresis band flips carMode.
+  // ENTER < EXIT: dolly in past ENTER to switch to car chains, dolly back out
+  // past the (farther) EXIT before reverting to dots — the gap between them
+  // is what stops a dolly sitting near the boundary from flapping every frame.
+  function updateCarMode(camDist) {
+    if (camDist == null) return
+    if (carMode && camDist > CAR_LOD_EXIT_DIST) carMode = false
+    else if (!carMode && camDist < CAR_LOD_ENTER_DIST) carMode = true
+  }
+
+  // per-frame: place every currently-active train's instance matrix, in
+  // whichever of the two InstancedMeshes carMode currently selects (the
+  // other one's count is forced to 0 so it draws nothing — see module header).
   function layout() {
     if (!hf || !parts) return 0
     const proj = hf.projection
     const exaggeration = params.demExaggeration
+    lastHits.length = 0
+    return carMode ? layoutCars(proj, exaggeration) : layoutDots(proj, exaggeration)
+  }
+
+  function layoutDots(proj, exaggeration) {
     const r = DOT_R * fogScale * (params[sizeKey] ?? 1)
     let count = 0
-    lastHits.length = 0
     for (let i = 0; i < active.length && count < maxInstances; i++) {
       const tr = active[i]
       const elapsed = elapsedFor(tr, lastQueryT)
@@ -433,21 +544,105 @@ export function createTrainsLayer(params, config = {}) {
       const y = metersToWorldY(hf, _sample.elev, exaggeration) + lift
       _dummy.makeScale(r, r, r)
       _dummy.setPosition(w.x, y, w.z)
-      mesh.setMatrixAt(count, _dummy)
+      dotMesh.setMatrixAt(count, _dummy)
       lastHits.push({ train: tr, elapsed, x: w.x, y, z: w.z })
       count++
     }
-    mesh.count = count
+    dotMesh.count = count
     if (count > 0) {
-      mesh.instanceMatrix.needsUpdate = true
-      mesh.computeBoundingSphere()
+      dotMesh.instanceMatrix.needsUpdate = true
+      dotMesh.computeBoundingSphere()
     }
+    carMesh.count = 0
     return count
+  }
+
+  // near-view LOD: every active train becomes a chain of carCount instanced
+  // boxes (see module header for the placement algorithm). Two passes per
+  // train: (1) walk the part's arc-length table to get every car's real
+  // world-space center (headRatio offset backward by i·carLenM, converted to
+  // this part's own ratio units via carLenM/part.lengthM — the same real
+  // arc-length metric buildPartGeometry used to bake the table, so the chain
+  // never drifts off-track regardless of how sharply the part curves); (2)
+  // derive each car's yaw from the vector between its neighbors' ALREADY-
+  // COMPUTED centers (tail->head), not a fresh tangent sample — the chain is
+  // already the curve, sampling it again would be redundant work for the
+  // same answer. Budget-capped by instances (maxCarInstances = maxInstances
+  // × carCount), never by a per-train camera-distance check: the LOD
+  // decision is global (one dolly-distance switch for the whole layer, see
+  // updateCarMode), not per-train — matches how layoutDots has always
+  // rendered every active train regardless of where it sits on-screen.
+  function layoutCars(proj, exaggeration) {
+    const sizeMult = params[sizeKey] ?? 1
+    const lengthWorld = carLenM * proj.K // true arc length — never scaled by size, see config doc
+    const widthWorld = widthM * proj.K * sizeMult
+    const heightWorld = heightM * proj.K * exaggeration * sizeMult
+    let trainCount = 0
+    let instCount = 0
+    for (let i = 0; i < active.length; i++) {
+      if (instCount + carCount > maxCarInstances) break
+      const tr = active[i]
+      const elapsed = elapsedFor(tr, lastQueryT)
+      if (!locateTrain(tr, elapsed)) continue
+      const part = parts[_loc.partIdx]
+      if (!part) continue
+      const headRatio = _loc.ratio
+      const dir = _loc.dir
+      const deltaRatio = part.lengthM > 0 ? carLenM / part.lengthM : 0
+
+      // pass 1: every car's world-space center (front car i=0 .. tail i=carCount-1)
+      for (let c = 0; c < carCount; c++) {
+        const ratioC = THREE.MathUtils.clamp(headRatio - dir * c * deltaRatio, 0, 1)
+        sampleAlongPart(part, ratioC, _sample)
+        const w = proj.lonLatToWorld(_sample.lon, _sample.lat)
+        _carPos[c * 3] = w.x
+        _carPos[c * 3 + 1] = metersToWorldY(hf, _sample.elev, exaggeration) + lift + heightWorld / 2
+        _carPos[c * 3 + 2] = w.z
+      }
+
+      // pass 2: orient + emit — yaw from the tail->head vector between
+      // neighboring already-computed centers (see function doc)
+      let yaw = 0
+      for (let c = 0; c < carCount; c++) {
+        const bx = _carPos[c * 3]
+        const by = _carPos[c * 3 + 1]
+        const bz = _carPos[c * 3 + 2]
+        let dx
+        let dz
+        if (c < carCount - 1) {
+          dx = bx - _carPos[(c + 1) * 3]
+          dz = bz - _carPos[(c + 1) * 3 + 2]
+        } else if (c > 0) {
+          dx = _carPos[(c - 1) * 3] - bx
+          dz = _carPos[(c - 1) * 3 + 2] - bz
+        } else {
+          dx = 0
+          dz = 1 // single-car degenerate fallback (carCount === 1)
+        }
+        if (dx !== 0 || dz !== 0) yaw = Math.atan2(dx, dz) // else: reuse previous car's yaw (adjacent samples clamped to the same point)
+        _dummy.makeRotationY(yaw)
+        _dummy.scale(_carScale.set(widthWorld, heightWorld, lengthWorld))
+        _dummy.setPosition(bx, by, bz)
+        carMesh.setMatrixAt(instCount, _dummy)
+        lastHits.push({ train: tr, elapsed, x: bx, y: by, z: bz })
+        instCount++
+      }
+      trainCount++
+    }
+    carMesh.count = instCount
+    if (instCount > 0) {
+      carMesh.instanceMatrix.needsUpdate = true
+      carMesh.computeBoundingSphere()
+    }
+    dotMesh.count = 0
+    return trainCount
   }
 
   function applyStyle() {
     material.color.set(params[colorKey])
     material.opacity = params[opacityKey] ?? 0.95
+    carMaterial.color.set(params[colorKey])
+    carMaterial.opacity = params[opacityKey] ?? 0.95
   }
 
   return {
@@ -476,6 +671,7 @@ export function createTrainsLayer(params, config = {}) {
       fogScale = ctx.fogScale
       lift = zFightLift(LIFT_BASE, ctx.fogScale)
       if (!gate()) return
+      updateCarMode(ctx.camDist)
       const t = currentDaySeconds()
       updateActiveSet(t)
       lastActiveCount = layout()
@@ -628,6 +824,8 @@ export function createTrainsLayer(params, config = {}) {
     dispose() {
       geo.dispose()
       material.dispose()
+      carGeo.dispose()
+      carMaterial.dispose()
     },
   }
 }
