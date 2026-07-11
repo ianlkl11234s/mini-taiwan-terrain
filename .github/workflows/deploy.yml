@@ -27,7 +27,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # 圖磚/向量瓦片/船舶快照都在 R2+CDN，備線注入同一個 base 才載得到
+      # （不注入會 fallback '/tiles'，Pages 上不存在——即 HANDOFF 舊註記
+      # 「備線產物不含圖磚」的根因）
       - run: npm run build
+        env:
+          VITE_TILE_BASE: https://tiles.itsmigu.com
       - uses: actions/configure-pages@v5
         with:
           enablement: true
