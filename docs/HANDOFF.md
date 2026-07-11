@@ -34,6 +34,9 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 | 9 | 生態系 P1：Supabase rate limit / Spend Cap | 全生態系共同缺口（與 pulse 一起解），藍圖 §7 L5 |
 | 10 | farm/river_sim 貼圖 vs 低階 GPU 8192 材質上限 | SwiftShader 會自動縮圖；真 GPU 16384 通常無虞，觀察即可 |
 | 11 | 灌溉全量版（3.4MB）上 R2 | 現行 repo 內為 80m/470m 簡化版；備案 B 參數在 `scripts/bake_irrigation.py` 回報中 |
+| 12 | **船舶 AIS 圖層**（2026-07-11 用戶新增） | 生態系已有 AIS 源（pulse 有 Ships track 圖層、collectors 在收）；接入路徑/表名/量級偵察中 |
+| 13 | **海面動態**（2026-07-11 用戶新增） | 很淡、接近透明的海面微波動態；參考 `~/Desktop/資料庫/gen_ai_try/z_japan_virtual_town` 的海的感覺；疊在 bathymetry 半透明海面上，動態必須過 on-demand render 鐵則（可見才動） |
+| 14 | **比例尺校正**（2026-07-11 用戶新增） | 用戶要求整體比例尺正確（水平投影一致性＋垂直誇張盤點），AIS 船位精度的前置；geo.js 縮放模型偵察中，結論主迴圈自審 |
 
 ## 開發慣例備忘（跨 session 有效）
 
