@@ -4,8 +4,8 @@
 
 ## 現況快照
 
-- **本地 main 領先 origin/main 28 個 commit，未 push、未發 PR**（用戶指示：修到一個程度再收）。全部經過驗收、`npm run build` 通過。
-- 本 session 完成（時序）：步道圖層 → 階層面板+點選 popup 系統 → 山頂鑽地修復 → ③海平面 z-fight → ④澎湖擴圖 → ⑤海底地形（GEBCO）→ ①②農田 drape+灌溉渠道 → overzoom/快取/淡綠帶三修 → 金馬+福建擴圖 → 外島海岸線+南界 21.0 → **向量瓦片三期**（OSM 路網分級+點選、農田單田點選、投影錨點修復）→ **列車 MVP**（TRA 992 班時刻表光點）→ **時間軸**（見下節）→ **面板格式整頓**（rowLabel 鐵則落地、Row 防凸框、車站/點層 size+opacity 滑桿範本、Markers 列移除、海底地形預設開）→ **高鐵列車**（THSR 212 班，trains.js 工廠參數化雙實例）。
+- **本地 main 領先 origin/main 35 個 commit，未 push、未發 PR**（用戶指示：修到一個程度再收）。全部經過驗收、`npm run build` 通過。
+- 本 session 完成（時序）：步道圖層 → 階層面板+點選 popup 系統 → 山頂鑽地修復 → ③海平面 z-fight → ④澎湖擴圖 → ⑤海底地形（GEBCO）→ ①②農田 drape+灌溉渠道 → overzoom/快取/淡綠帶三修 → 金馬+福建擴圖 → 外島海岸線+南界 21.0 → **向量瓦片三期**（OSM 路網分級+點選、農田單田點選、投影錨點修復）→ **列車 MVP**（TRA 992 班時刻表光點）→ **時間軸**（見下節）→ **面板格式整頓**（rowLabel 鐵則落地、Row 防凸框、車站/點層 size+opacity 滑桿範本、Markers 列移除、海底地形預設開）→ **高鐵列車**（THSR 212 班，trains.js 工廠參數化雙實例）→ **列車點選資訊卡**（proximity pick，台鐵/高鐵通用）→ **船舶 AIS 圖層**（`ships.js` track 層，CDN 快照優先+RPC fallback，subscribeDate 首戰）→ **比例尺真實化**（demExaggeration 預設 1.0，滑桿可調回）→ **海面淡波紋**（region 海面板 onBeforeCompile 注入 fresnel/spec，opus 雙道審過，customProgramCacheKey 隔離）。設計 SSOT：`docs/MARINE_DESIGN.md`。
 - 設計文件（opus 審定、實作前必讀）：`docs/BATHYMETRY_DESIGN.md`、`docs/VECTOR_TILES_DESIGN.md`、`docs/TIMELINE_DESIGN.md`。
 - R2 資產現況：`terrain-tiles/`（本島舊磚，舊版前端用）、`terrain-tiles/bathy/`（8,096 磚，現行前端唯一讀取路徑）、`terrain-tiles/vector/`（osm_road_drive.pmtiles 59MB + ftw_fields_2025.pmtiles 107MB）。
 - bbox 現況：117.8–123.5E / 21.0–26.5N（含金馬澎+福建沿岸+巴士海峽）。
@@ -24,7 +24,7 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 | # | 項目 | 脈絡 |
 |---|------|------|
 | 1 | ~~時間軸~~ ✅ 2026-07-11 完成 | 見上節；設計 `docs/TIMELINE_DESIGN.md` |
-| 2 | 列車二期：點選班次資訊卡、3D 車廂、**跟隨鏡頭** | 跟隨鏡頭無範本（v3/pulse 都沒做），需從零設計且不與 tour.js 打架；盤點結論在 session 記錄 |
+| 2 | 列車二期：~~點選班次資訊卡~~✅、3D 車廂、**跟隨鏡頭** | 資訊卡 2026-07-11 完成；跟隨鏡頭無範本（v3/pulse 都沒做），需從零設計且不與 tour.js 打架 |
 | 3 | rail_lines.json 切段點維護 | 切段點不在真轉乘站 → 16% 班次無法全段映射（桃園↔板橋、羅東↔花蓮等）；修好整班涵蓋 84%→~98%（`scripts/bake_trains.py` 會回報涵蓋率） |
 | 4 | OSM 步道圖層 | 需上游 analytics 從 PBF 重抽全台 walk network（path/footway/steps/track ~19 萬邊，現有萃取只有 9 城市）；OSM 無 sac_scale 難度標籤 |
 | 5 | Cloudflare `.pmtiles` Cache Rule | **用戶手動**：dashboard 對 tiles.itsmigu.com 加 Cache Rule，否則每個 Range 請求回源（現況 cf-cache-status: DYNAMIC） |
@@ -34,9 +34,9 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 | 9 | 生態系 P1：Supabase rate limit / Spend Cap | 全生態系共同缺口（與 pulse 一起解），藍圖 §7 L5 |
 | 10 | farm/river_sim 貼圖 vs 低階 GPU 8192 材質上限 | SwiftShader 會自動縮圖；真 GPU 16384 通常無虞，觀察即可 |
 | 11 | 灌溉全量版（3.4MB）上 R2 | 現行 repo 內為 80m/470m 簡化版；備案 B 參數在 `scripts/bake_irrigation.py` 回報中 |
-| 12 | **船舶 AIS 圖層**（2026-07-11 用戶新增） | 生態系已有 AIS 源（pulse 有 Ships track 圖層、collectors 在收）；接入路徑/表名/量級偵察中 |
-| 13 | **海面動態**（2026-07-11 用戶新增） | 很淡、接近透明的海面微波動態；參考 `~/Desktop/資料庫/gen_ai_try/z_japan_virtual_town` 的海的感覺；疊在 bathymetry 半透明海面上，動態必須過 on-demand render 鐵則（可見才動） |
-| 14 | **比例尺校正**（2026-07-11 用戶新增） | 用戶要求整體比例尺正確（水平投影一致性＋垂直誇張盤點），AIS 船位精度的前置；geo.js 縮放模型偵察中，結論主迴圈自審 |
+| 12 | ~~船舶 AIS 圖層~~ ✅ 2026-07-11 完成 | `ships.js` 上線（設計 `docs/MARINE_DESIGN.md`）；CDN 快照 bake（`scripts/bake_ship_trails.py` → R2 `ships/trails/`）視上傳結果補跑；phase 2=即時船位（需 gis-platform 開 `get_ship_current` RPC）、船種分色 |
+| 13 | ~~海面動態~~ ✅ 2026-07-11 完成 | fresnel 波紋 onBeforeCompile 注入，opus 雙道審過；波紋強度/速度/開關在 Region 圖層樣式 |
+| 14 | ~~比例尺校正~~ ✅ 2026-07-11 結案 | demExaggeration 預設 1.0（真實比例）；Mercator ±2% 緯度伸縮記為已知特性不重建（結論見 MARINE_DESIGN §0）；船位精度與比例尺無關（同投影自然精準） |
 
 ## 開發慣例備忘（跨 session 有效）
 
