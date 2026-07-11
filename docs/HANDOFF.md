@@ -27,14 +27,14 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 | 2 | 列車二期：~~點選班次資訊卡~~✅、3D 車廂、**跟隨鏡頭** | 資訊卡 2026-07-11 完成；跟隨鏡頭無範本（v3/pulse 都沒做），需從零設計且不與 tour.js 打架 |
 | 3 | ~~rail_lines.json 切段點維護~~ ✅ 2026-07-11 完成 | `scripts/fix_rail_cuts.py` 簡單路徑分解重縫，全段涵蓋 **84%→100%**、leg 98.7%→100%；幾何聯集不變（`verify_rail_geometry.py` 可重驗）、thsr byte-identical |
 | 4 | OSM 步道圖層 | 需上游 analytics 從 PBF 重抽全台 walk network（path/footway/steps/track ~19 萬邊，現有萃取只有 9 城市）；OSM 無 sac_scale 難度標籤 |
-| 5 | Cloudflare `.pmtiles` Cache Rule | **用戶手動**：dashboard 對 tiles.itsmigu.com 加 Cache Rule，否則每個 Range 請求回源（現況 cf-cache-status: DYNAMIC） |
+| 5 | Cloudflare Cache Rule（`.pmtiles` **＋ `/ships/trails/*.json`**） | **用戶手動**：dashboard 對 tiles.itsmigu.com 加 Cache Rule，否則每個請求回源（兩路徑實測都 cf-cache-status: DYNAMIC）；船舶快照單檔 3.7–7.4MB、Cloudflare 會 zstd 壓縮 |
 | 6 | Worker 逃生艙（向量瓦片） | z14 密集瓦片解碼移 Web Worker；壓測 56-84fps 暫不需要，設計 §3 有方案 |
 | 7 | 澎湖 DTM 相位對齊 | mosaic 網格相位未對齊造成 bathy 磚 ~3m 微漂移；下次重烘用金門同款 `-te` 相位對齊手法一併修（analytics `docs/data-catalog/base_map/dtm_20m_kinmen.md` 有完整記錄） |
 | 8 | 綠島/龜山島 DEM 補洞 | 主 DEM 這兩島是 nodata（蘭嶼有值）；分幅版 dataset 35430 可能有 |
 | 9 | 生態系 P1：Supabase rate limit / Spend Cap | 全生態系共同缺口（與 pulse 一起解），藍圖 §7 L5 |
 | 10 | farm/river_sim 貼圖 vs 低階 GPU 8192 材質上限 | SwiftShader 會自動縮圖；真 GPU 16384 通常無虞，觀察即可 |
 | 11 | 灌溉全量版（3.4MB）上 R2 | 現行 repo 內為 80m/470m 簡化版；備案 B 參數在 `scripts/bake_irrigation.py` 回報中 |
-| 12 | ~~船舶 AIS 圖層~~ ✅ 2026-07-11 完成 | `ships.js` 上線（設計 `docs/MARINE_DESIGN.md`）；CDN 快照 bake（`scripts/bake_ship_trails.py` → R2 `ships/trails/`）視上傳結果補跑；phase 2=即時船位（需 gis-platform 開 `get_ship_current` RPC）、船種分色 |
+| 12 | ~~船舶 AIS 圖層~~ ✅ 2026-07-11 完成 | `ships.js` 上線（設計 `docs/MARINE_DESIGN.md`）；CDN 快照 **7 天已上 R2**（`bake_ship_trails.py`，每天 1.1–1.4 萬艘、RDP 抽稀 gzip<2MiB，格式已對前端契約實測）；快照非當日自動 fallback RPC；phase 2=快照 cron 化、即時船位（需 gis-platform 開 `get_ship_current` RPC）、船種分色 |
 | 13 | ~~海面動態~~ ✅ 2026-07-11 完成 | fresnel 波紋 onBeforeCompile 注入，opus 雙道審過；波紋強度/速度/開關在 Region 圖層樣式 |
 | 14 | ~~比例尺校正~~ ✅ 2026-07-11 結案 | demExaggeration 預設 1.0（真實比例）；Mercator ±2% 緯度伸縮記為已知特性不重建（結論見 MARINE_DESIGN §0）；船位精度與比例尺無關（同投影自然精準） |
 
