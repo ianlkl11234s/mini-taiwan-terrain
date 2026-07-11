@@ -98,6 +98,10 @@ export function createRegionLayer(params) {
     uRippleSpeed: { value: params.seaRippleSpeed },
   }
   seaMat.userData.uniforms = rippleUniforms
+  // three 的 program cache key 不含 onBeforeCompile（r172）：任何未來新增的
+  // alphaMap+alphaTest BasicMaterial 若指紋相同會與本材質共用 program——
+  // 靜默偷走或剝掉波紋注入。獨立 key 永久隔離（opus 終審硬化建議）。
+  seaMat.customProgramCacheKey = () => 'region-sea-ripple'
   seaMat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, rippleUniforms)
     shader.vertexShader = shader.vertexShader
