@@ -144,6 +144,19 @@ export const DEFAULT_PARAMS = {
   // timeStore.getPlaying() is true.
   trainsVisible: false,
   trainsColor: '#ffcf40',
+  trainsSize: 1.0,
+  trainsOpacity: 0.95,
+  // thsr: second createTrainsLayer instance (src/engine/trains.js — the
+  // factory is parametrized by id/rowLabel/railNetwork/maxInstances/
+  // singleCorridor) — same manifest-driven deferred + timeline-clock pattern
+  // as trains above, fed thsr_tracks.json/thsr_schedule.json (212 trains,
+  // scripts/bake_trains.py's bake_thsr()) filtered to rail_lines.json's
+  // system=='thsr' polylines instead of 'tra'. THSR orange keeps it visually
+  // distinct from TRA's yellow at a glance.
+  thsrVisible: false,
+  thsrColor: '#ff7f2a',
+  thsrSize: 1.0,
+  thsrOpacity: 0.95,
   // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
   // — NOT a manifest-driven JSON fetch like rail/trails; the manager
   // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
@@ -537,6 +550,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     markers: { group: GROUP_BASE },
     rail: { group: GROUP_MOVE },
     trains: { group: GROUP_MOVE },
+    thsr: { group: GROUP_MOVE },
     stations: { group: GROUP_MOVE },
     osm_roads: { group: GROUP_MOVE },
     rivers: { group: GROUP_WATER },
@@ -555,14 +569,25 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     typhoon: { group: GROUP_FX },
   }
   // registration order = draw / update order (coastline → counties → rail →
-  // trains → trails → rivers → reservoirs → farm sim → irrigation → typhoon →
-  // markers → stations → trail signs → labels)
+  // trains → thsr → trails → rivers → reservoirs → farm sim → irrigation →
+  // typhoon → markers → stations → trail signs → labels). thsr registers
+  // right after trains so it lands directly below 台鐵列車 Trains in the
+  // Layers panel's 交通 Move group (Layers.jsx preserves registration order
+  // within a group — see groupLayers()).
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
     createCountiesLayer(params),
     createRailLayer(params),
     createTrainsLayer(params),
+    createTrainsLayer(params, {
+      id: 'thsr',
+      label: 'THSR',
+      rowLabel: '高鐵列車 THSR',
+      railNetwork: 'thsr',
+      maxInstances: 64,
+      singleCorridor: true,
+    }),
     osmRoadsLayer,
     createTrailsLayer(params),
     createRiversLayer(params),
@@ -973,40 +998,86 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
   }
 
-  // trains: real TRA timetable (see src/engine/trains.js) — needs THREE
-  // sources landed together: train_tracks.json (per-part station ratios),
-  // train_schedule.json (992 trains) and rail_lines.json itself (re-fetched
-  // here, filtered client-side to system=='tra', to get the raw lon/lat/elev
-  // polylines the ratio tables are index-aligned against — see trains.js
-  // header). Same fail-quiet deferred pattern as rail/trails; a partial
-  // failure (any one of the three) drops the whole activation rather than
-  // rendering trains against mismatched/missing track geometry.
-  let trainsFetch = { loading: false, loaded: false }
-  async function loadTrainsData() {
-    if (trainsFetch.loading || trainsFetch.loaded) return
-    trainsFetch.loading = true
+  // shared rail_lines.json fetch cache for the trains/thsr loaders below —
+  // both need the SAME file (filtered client-side to a different `system`),
+  // so switching both light-dot layers on in one session doesn't double-
+  // fetch it. Separate from loadRailData's own fetch above (the rail line
+  // layer's setData wants a different {points,color} shape) — this cache
+  // holds the raw {lines:[...]} payload. A failed fetch clears the cache so
+  // the next toggle-on retries instead of replaying the same failure forever
+  // (mirrors railFetch/trainsFetch's loaded-only-on-success convention).
+  let railLinesCache = null
+  async function fetchRailLines() {
+    if (railLinesCache) return railLinesCache
+    const req = (async () => {
+      const res = await fetch(await manifestUrl('rail', '/layers/rail_lines.json'))
+      if (!res.ok) throw new Error(`rail_lines.json ${res.status}`)
+      return res.json()
+    })()
+    railLinesCache = req
     try {
-      const [tracksRes, scheduleRes, railRes] = await Promise.all([
-        fetch(await manifestUrl('train_tracks', '/layers/train_tracks.json')),
-        fetch(await manifestUrl('train_schedule', '/layers/train_schedule.json')),
-        fetch(await manifestUrl('rail', '/layers/rail_lines.json')),
-      ])
-      if (!tracksRes.ok) throw new Error(`train_tracks.json ${tracksRes.status}`)
-      if (!scheduleRes.ok) throw new Error(`train_schedule.json ${scheduleRes.status}`)
-      if (!railRes.ok) throw new Error(`rail_lines.json ${railRes.status}`)
-      const [tracks, schedule, rail] = await Promise.all([tracksRes.json(), scheduleRes.json(), railRes.json()])
-      const traLines = rail.lines.filter((l) => l.system === 'tra').map((l) => l.points)
-      layers.get('trains').setData({ tracks, schedules: schedule.schedules, traLines })
-      trainsFetch.loaded = true
-      layers.get('trains').update(layerCtx())
+      return await req
     } catch (err) {
-      console.warn('[layers] trains fetch failed', err)
-    } finally {
-      trainsFetch.loading = false
-      invalidate()
-      emit('layers')
+      railLinesCache = null
+      throw err
     }
   }
+
+  // trains / thsr: real timetable-driven light dots (see src/engine/
+  // trains.js's parametrized createTrainsLayer) — each instance needs THREE
+  // sources landed together: <net>_tracks.json (per-part station ratios),
+  // <net>_schedule.json (real train roster) and rail_lines.json itself (via
+  // fetchRailLines() above, filtered client-side to this network's
+  // `system`) for the raw lon/lat/elev polylines the ratio tables are
+  // index-aligned against — see trains.js header. Same fail-quiet deferred
+  // pattern as rail/trails; a partial failure (any one of the three) drops
+  // the whole activation rather than rendering trains against mismatched/
+  // missing track geometry. One loader factory drives both the TRA and THSR
+  // instances — trains.js's own setData handles the one place their leg→
+  // part resolution actually diverges (singleCorridor).
+  function makeTrainLoader({ layerId, tracksKey, tracksFallback, scheduleKey, scheduleFallback, railSystem }) {
+    const fetchState = { loading: false, loaded: false }
+    return async function load() {
+      if (fetchState.loading || fetchState.loaded) return
+      fetchState.loading = true
+      try {
+        const [tracksRes, scheduleRes, rail] = await Promise.all([
+          fetch(await manifestUrl(tracksKey, tracksFallback)),
+          fetch(await manifestUrl(scheduleKey, scheduleFallback)),
+          fetchRailLines(),
+        ])
+        if (!tracksRes.ok) throw new Error(`${tracksKey}.json ${tracksRes.status}`)
+        if (!scheduleRes.ok) throw new Error(`${scheduleKey}.json ${scheduleRes.status}`)
+        const [tracks, schedule] = await Promise.all([tracksRes.json(), scheduleRes.json()])
+        const lines = rail.lines.filter((l) => l.system === railSystem).map((l) => l.points)
+        layers.get(layerId).setData({ tracks, schedules: schedule.schedules, lines })
+        fetchState.loaded = true
+        layers.get(layerId).update(layerCtx())
+      } catch (err) {
+        console.warn(`[layers] ${layerId} fetch failed`, err)
+      } finally {
+        fetchState.loading = false
+        invalidate()
+        emit('layers')
+      }
+    }
+  }
+  const loadTrainsData = makeTrainLoader({
+    layerId: 'trains',
+    tracksKey: 'train_tracks',
+    tracksFallback: '/layers/train_tracks.json',
+    scheduleKey: 'train_schedule',
+    scheduleFallback: '/layers/train_schedule.json',
+    railSystem: 'tra',
+  })
+  const loadThsrData = makeTrainLoader({
+    layerId: 'thsr',
+    tracksKey: 'thsr_tracks',
+    tracksFallback: '/layers/thsr_tracks.json',
+    scheduleKey: 'thsr_schedule',
+    scheduleFallback: '/layers/thsr_schedule.json',
+    railSystem: 'thsr',
+  })
 
   // trails: same deferred fetch-once pattern as rail (baked polylines, no
   // per-line official colors — see polyline.js createTrailsLayer). setData's
@@ -1615,6 +1686,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       layers.get('trains').update(layerCtx())
     },
     trainsColor: () => layers.get('trains').update(layerCtx()),
+    trainsSize: () => layers.get('trains').update(layerCtx()),
+    trainsOpacity: () => layers.get('trains').update(layerCtx()),
+    // thsr: second createTrainsLayer instance (src/engine/trains.js) — same
+    // deferred-fetch-on-first-toggle-on pattern as trains above.
+    thsrVisible: (v) => {
+      if (v) loadThsrData()
+      layers.get('thsr').update(layerCtx())
+    },
+    thsrColor: () => layers.get('thsr').update(layerCtx()),
+    thsrSize: () => layers.get('thsr').update(layerCtx()),
+    thsrOpacity: () => layers.get('thsr').update(layerCtx()),
     // OSM roads: no deferred JSON fetch to kick — the PMTiles manager streams
     // tiles itself once switched on (see vectortiles.js). update() just
     // (re)applies the gate/style; the manager's own setEnabled starts/stops
@@ -1868,7 +1950,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (params.source !== 'real' || !heightField) return true
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
-      (params.trainsVisible && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
+      ((params.trainsVisible || params.thsrVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||

@@ -2,24 +2,32 @@ import * as THREE from 'three'
 import { metersToWorldY, zFightLift } from './geo.js'
 import * as timeStore from '../state/timeStore.js'
 
-// Trains: real TRA (台鐵) timetable (992 trains, scripts/bake_trains.py) —
-// InstancedMesh light dots gliding along rail_lines.json's tra polylines,
-// driven by the timeline's time store (src/state/timeStore.js, see
-// docs/TIMELINE_DESIGN.md) instead of the live wall clock — play/pause/seek/
-// speed all flow through timeStore.getDaySeconds(). Manifest-driven deferred
-// layer, same fail-quiet pattern as rail/trails (see index.js
-// loadTrainsData): registers empty at startup, fed real data via setData()
-// once train_tracks.json + train_schedule.json + rail_lines.json have all
+// Trains: real timetable-driven InstancedMesh light dots gliding along
+// rail_lines.json polylines, driven by the timeline's time store (src/state/
+// timeStore.js, see docs/TIMELINE_DESIGN.md) instead of the live wall clock —
+// play/pause/seek/speed all flow through timeStore.getDaySeconds(). Manifest-
+// driven deferred layer, same fail-quiet pattern as rail/trails (see index.js
+// loadTrainsData/loadThsrData): registers empty at startup, fed real data via
+// setData() once its tracks.json + schedule.json + rail_lines.json have all
 // landed (first switch-on).
 //
+// createTrainsLayer is a parametrized factory — one call = one network. The
+// TRA (台鐵) instance (index.js's `createTrainsLayer(params)`, 992 trains,
+// scripts/bake_trains.py) was the original/only caller; the THSR (高鐵)
+// instance (`createTrainsLayer(params, { id: 'thsr', ... })`, 212 trains,
+// same bake script's bake_thsr()) reuses every piece of machinery below —
+// see `config` below and its `singleCorridor` flag for the one place their
+// data shapes actually diverge.
+//
 // Data contract (baked by scripts/bake_trains.py — see its header comment):
-//   train_tracks.json  parts[]     index-aligned 1:1 with rail_lines.json's
-//                                  system=='tra' filter (same order, 37
-//                                  entries). Each part carries its
-//                                  station→ratio table (ratio = EPSG:3826 arc-
-//                                  length fraction 0..1 along THAT part's own
-//                                  polyline — see distance_metric in its meta).
-//   train_schedule.json schedules[] one real train per entry: stops[] with
+//   <net>_tracks.json   parts[]     index-aligned 1:1 with rail_lines.json's
+//                                  system==<railNetwork> filter (same order
+//                                  — 37 tra entries, 2 thsr entries). Each
+//                                  part carries its station→ratio table
+//                                  (ratio = EPSG:3826 arc-length fraction
+//                                  0..1 along THAT part's own polyline — see
+//                                  distance_metric in its meta).
+//   <net>_schedule.json schedules[] one real train per entry: stops[] with
 //                                  arr_sec/dep_sec relative to the train's own
 //                                  first departure, + dep_sec_of_day (Asia/
 //                                  Taipei wall-clock seconds-since-midnight
@@ -29,27 +37,36 @@ import * as timeStore from '../state/timeStore.js'
 //
 // Placement pipeline (mirrors bake_trains.py's own leg_progress_at(), which
 // doubles as the reference algorithm — see its docstring):
-//   1. build(): once, per rail_lines.json tra part — reproject every vertex
-//      to EPSG:3826 (same metric the bake script used for its station ratios)
-//      and accumulate arc length, so ratio 0..1 can be converted back to a
-//      lon/lat/elev point by walking the SAME metric. Naive lon/lat Euclidean
-//      distance would NOT reproduce the baked ratios (1° lon != 1° lat in
-//      meters, and both vary with latitude) — the train would run crooked and
-//      at uneven speed along curves.
-//   2. build(): once, per train — resolve each adjacent-stop leg to the
-//      lowest-index part both stations share (mirrors the bake script's
-//      `sorted(common)[0]`) and cache ratio_from/ratio_to. A leg with no
-//      common part (~1.3% of legs, see train_schedule.json meta.leg_coverage)
-//      is left unresolved: the train simply isn't rendered for that leg's
-//      time window rather than guessing a wrong position.
+//   1. build(): once, per rail_lines.json part (this network's railNetwork
+//      filter) — reproject every vertex to EPSG:3826 (same metric the bake
+//      script used for its station ratios) and accumulate arc length, so
+//      ratio 0..1 can be converted back to a lon/lat/elev point by walking
+//      the SAME metric. Naive lon/lat Euclidean distance would NOT reproduce
+//      the baked ratios (1° lon != 1° lat in meters, and both vary with
+//      latitude) — the train would run crooked and at uneven speed along
+//      curves.
+//   2. build(): once, per train — resolve each adjacent-stop leg to a part
+//      index (see `singleCorridor` below for the two resolution strategies)
+//      and cache ratio_from/ratio_to. A leg that can't be resolved is left
+//      unresolved: the train simply isn't rendered for that leg's time
+//      window rather than guessing a wrong position.
 //   3. tickView(): every frame — find which trains are currently in service
-//      (sweep-line index, not a 992-train scan), locate each one's current
+//      (sweep-line index, not a full-roster scan), locate each one's current
 //      leg/ratio, sample the part's arc-length table, project to world space.
 
-const MAX_INSTANCES = 320 // ~3x the observed weekday concurrent peak, margin for safety
+const DEFAULT_MAX_INSTANCES = 320 // TRA default: ~3x the observed weekday concurrent peak, margin for safety
 const DOT_R = 0.11 // world units at fogScale 1
 const LIFT_BASE = 0.08 // sits above the rail line's own 0.05 lift (polyline.js createRailLayer)
 const REBUILD_ON_BACKWARD_JUMP = true
+
+// point-layer styleSchema (size/opacity sliders) — same shape as markers.js's
+// POINT_STYLE, plus the light-dot's own color swatch (trains have no baked
+// per-line color the way rail does, see trains.js's material below).
+const TRAIN_STYLE = {
+  color: { type: 'color', label: '光點顏色 Color' },
+  size: { type: 'slider', label: '大小 Size', min: 0.5, max: 3.0, step: 0.05, format: (v) => v.toFixed(2) },
+  opacity: { type: 'slider', label: '不透明度 Opacity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+}
 
 // ---------------------------------------------------------------- EPSG:3826 (TWD97 TM2 zone 121)
 // Forward transverse-Mercator projection (GRS80 ellipsoid, k0=0.9999, central
@@ -155,19 +172,68 @@ function sampleAlongPart(part, ratio, out) {
   return out
 }
 
-export function createTrainsLayer(params) {
+// resolveCorridorPart: singleCorridor networks only (THSR — a single
+// physical corridor split into 2 full-length mirrored-direction parts, so
+// EVERY station sits on BOTH parts and the TRA-style "lowest common part"
+// search below would always resolve to part 0 regardless of actual travel
+// direction). Resolves the WHOLE train's part once, via the same test
+// bake_trains.py's match_thsr_track_to_part() uses: whichever part has
+// ratio(first stop) < ratio(last stop). Every leg of that train then shares
+// this one partIdx. Returns -1 if no part qualifies (leg left unresolved,
+// same fail-quiet convention as the TRA path).
+function resolveCorridorPart(stops, stationParts) {
+  const mFirst = stationParts.get(stops[0].station)
+  const mLast = stationParts.get(stops[stops.length - 1].station)
+  if (!mFirst || !mLast) return -1
+  for (const [partIdx, rFirst] of mFirst) {
+    const rLast = mLast.get(partIdx)
+    if (rLast !== undefined && rFirst < rLast) return partIdx
+  }
+  return -1
+}
+
+// config (all optional, defaults reproduce the original TRA-only behavior —
+// see module header):
+//   id            param-key prefix — visible/color/size/opacity params are
+//                 `${id}Visible`/`${id}Color`/`${id}Size`/`${id}Opacity`.
+//                 id='trains' (default) derives trainsVisible/trainsColor,
+//                 the pre-existing TRA param names — zero migration.
+//   label         English fallback label (Layers.jsx uses rowLabel first)
+//   rowLabel      Layers panel row label (中文名 English name)
+//   railNetwork   rail_lines.json `system` filter this network's tracks/
+//                 schedule were baked against (see index.js's loader) — used
+//                 here only for the setData() mismatch-warning message
+//   maxInstances  InstancedMesh capacity (concurrent-in-service headroom)
+//   singleCorridor  true for THSR: resolve one part per WHOLE train (see
+//                 resolveCorridorPart) instead of TRA's per-leg lowest-
+//                 common-part search
+export function createTrainsLayer(params, config = {}) {
+  const {
+    id = 'trains',
+    label = 'Trains',
+    rowLabel = '台鐵列車 Trains',
+    railNetwork = 'tra',
+    maxInstances = DEFAULT_MAX_INSTANCES,
+    singleCorridor = false,
+  } = config
+  const visibleKey = `${id}Visible`
+  const colorKey = `${id}Color`
+  const sizeKey = `${id}Size`
+  const opacityKey = `${id}Opacity`
+  const KEY_TO_PARAM = { color: colorKey, size: sizeKey, opacity: opacityKey }
+
   const group = new THREE.Group()
   group.visible = false
 
   const geo = new THREE.IcosahedronGeometry(1, 1)
   const material = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(params.trainsColor),
+    color: new THREE.Color(params[colorKey]),
     transparent: true,
-    opacity: 0.95,
+    opacity: params[opacityKey] ?? 0.95,
     depthWrite: false,
     fog: true,
   })
-  const mesh = new THREE.InstancedMesh(geo, material, MAX_INSTANCES)
+  const mesh = new THREE.InstancedMesh(geo, material, maxInstances)
   mesh.count = 0 // "先空後填": nothing drawn until real schedule data lands (see setData)
   mesh.renderOrder = 5
   group.add(mesh)
@@ -195,7 +261,7 @@ export function createTrainsLayer(params) {
   const _loc = { partIdx: -1, ratio: 0 }
 
   function gate() {
-    return params.source === 'real' && !!hf && params.trainsVisible && dataReady
+    return params.source === 'real' && !!hf && params[visibleKey] && dataReady
   }
 
   // Asia/Taipei wall-clock seconds-since-midnight, driven by the timeline's
@@ -310,9 +376,9 @@ export function createTrainsLayer(params) {
     if (!hf || !parts) return 0
     const proj = hf.projection
     const exaggeration = params.demExaggeration
-    const r = DOT_R * fogScale
+    const r = DOT_R * fogScale * (params[sizeKey] ?? 1)
     let count = 0
-    for (let i = 0; i < active.length && count < MAX_INSTANCES; i++) {
+    for (let i = 0; i < active.length && count < maxInstances; i++) {
       const tr = active[i]
       const elapsed = elapsedFor(tr, lastQueryT)
       if (!locateTrain(tr, elapsed)) continue
@@ -335,17 +401,18 @@ export function createTrainsLayer(params) {
   }
 
   function applyStyle() {
-    material.color.set(params.trainsColor)
+    material.color.set(params[colorKey])
+    material.opacity = params[opacityKey] ?? 0.95
   }
 
   return {
-    id: 'trains',
+    id,
     kind: 'point',
-    label: 'Trains',
-    rowLabel: '台鐵列車 Trains',
+    label,
+    rowLabel,
     object3d: group,
-    visibleParam: 'trainsVisible',
-    paramMap: { visible: 'trainsVisible', color: 'trainsColor' },
+    visibleParam: visibleKey,
+    paramMap: { visible: visibleKey, color: colorKey, size: sizeKey, opacity: opacityKey },
 
     build() {},
 
@@ -370,18 +437,19 @@ export function createTrainsLayer(params) {
     },
 
     setStyle(patch) {
-      if (patch.color !== undefined) params.trainsColor = patch.color
+      for (const k in patch) if (KEY_TO_PARAM[k]) params[KEY_TO_PARAM[k]] = patch[k]
       applyStyle()
     },
 
-    // (re)supply real data once train_tracks.json + train_schedule.json +
-    // rail_lines.json (tra-filtered) have all landed — see index.js
-    // loadTrainsData. Resolves every leg→part ratio ONCE here, never in tick.
-    setData({ tracks, schedules, traLines }) {
-      if (tracks.parts.length !== traLines.length) {
-        console.warn(`[trains] part count mismatch: train_tracks.json=${tracks.parts.length} rail_lines(tra)=${traLines.length}`)
+    // (re)supply real data once <net>_tracks.json + <net>_schedule.json +
+    // rail_lines.json (this network's railNetwork filter) have all landed —
+    // see index.js loadTrainsData/loadThsrData. Resolves every leg→part
+    // ratio ONCE here, never in tick.
+    setData({ tracks, schedules, lines }) {
+      if (tracks.parts.length !== lines.length) {
+        console.warn(`[${id}] part count mismatch: tracks.json parts=${tracks.parts.length} rail_lines(${railNetwork})=${lines.length}`)
       }
-      parts = traLines.map((pts) => buildPartGeometry(pts))
+      parts = lines.map((pts) => buildPartGeometry(pts))
 
       // stationName -> Map(partIdx -> ratio), mirrors bake_trains.py's station_parts
       const stationParts = new Map()
@@ -400,6 +468,10 @@ export function createTrainsLayer(params) {
       for (const sch of schedules) {
         const stops = sch.stops
         if (!stops || stops.length < 2) continue
+        // singleCorridor (THSR): resolve the WHOLE train's part once (see
+        // resolveCorridorPart's docstring for why per-leg lowest-common-part
+        // doesn't work here); every leg below then reuses it.
+        const corridorPartIdx = singleCorridor ? resolveCorridorPart(stops, stationParts) : -1
         const legs = new Array(stops.length - 1)
         for (let i = 0; i < stops.length - 1; i++) {
           const a = stops[i]
@@ -407,7 +479,9 @@ export function createTrainsLayer(params) {
           const ma = stationParts.get(a.station)
           const mb = stationParts.get(b.station)
           let partIdx = -1
-          if (ma && mb) {
+          if (singleCorridor) {
+            partIdx = corridorPartIdx
+          } else if (ma && mb) {
             // lowest common part index — mirrors bake_trains.py's sorted(common)[0]
             for (const k of ma.keys()) {
               if (mb.has(k) && (partIdx === -1 || k < partIdx)) partIdx = k
@@ -415,8 +489,8 @@ export function createTrainsLayer(params) {
           }
           legs[i] = {
             partIdx,
-            ratioFrom: partIdx >= 0 ? ma.get(partIdx) : 0,
-            ratioTo: partIdx >= 0 ? mb.get(partIdx) : 0,
+            ratioFrom: partIdx >= 0 && ma ? ma.get(partIdx) : 0,
+            ratioTo: partIdx >= 0 && mb ? mb.get(partIdx) : 0,
           }
         }
         built.push({
@@ -439,17 +513,17 @@ export function createTrainsLayer(params) {
 
     describe() {
       return {
-        id: 'trains',
+        id,
         kind: 'point',
-        label: 'Trains',
-        rowLabel: '台鐵列車 Trains',
+        label,
+        rowLabel,
         count: lastActiveCount,
-        visible: params.trainsVisible,
-        styleSchema: {
-          color: { type: 'color', label: '光點顏色 Color' },
-        },
+        visible: params[visibleKey],
+        styleSchema: TRAIN_STYLE,
         style: {
-          color: params.trainsColor,
+          color: params[colorKey],
+          size: params[sizeKey] ?? 1,
+          opacity: params[opacityKey] ?? 0.95,
         },
       }
     },
