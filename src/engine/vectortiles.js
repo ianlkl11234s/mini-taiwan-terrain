@@ -1166,6 +1166,23 @@ export function createFtwFieldsLayer(params, { invalidate } = {}) {
 const BUILDINGS_MESH_KEYS = ['fill']
 const BUILDING_DEFAULT_HEIGHT_M = 3
 const BUILDINGS_MIN_ZOOM = 13
+// own (smaller than roads/fields' shared 0.65) tile-radius fraction of
+// fogFar×fogScale — measured with a controlled A/B at the identical viewpoint
+// (121.564,25.033, camDist=8, dense Taipei/Xinyi core): 0.65 held 146 tiles /
+// ~4.47M vertices / ~2.39M triangles resident at once; 0.42 held 65 tiles /
+// ~3.12M vertices / ~1.67M triangles — a ~55% tile-count cut but only a ~30%
+// triangle/vertex cut (tile count scales with radius², but the densest
+// high-rise tiles near the target are retained either way, so per-tile
+// triangle DENSITY is uneven and the geometry total doesn't shrink as fast as
+// tile count — no vertex sharing across wall quads is why a building tile
+// runs far denser than a road/field tile of the same footprint in the first
+// place). z13-16 buildings are inherently a NEAR-view-only layer (fog already
+// hides the far edge at this zoom band), so trimming the streamed radius
+// costs little visible coverage — confirmed no jarring pop-in boundary in the
+// visible midground at this fraction. Kept as its own named constant (not a
+// shared one) specifically so it can be re-tuned again without touching
+// roads/fields.
+const BUILDINGS_RADIUS_FRAC = 0.42
 // CC BY-NC 4.0 requires attribution — surfaced in describe()'s `note` and
 // every pick() popup's 授權 row (the two places a user/maintainer can
 // actually see it; Layers.jsx doesn't render an attribution string today).
@@ -1506,11 +1523,9 @@ export function createBuildingsLayer(params, { invalidate } = {}) {
       manager.update(ctx.dt, {
         targetX: cx,
         targetZ: cz,
-        // same starting fraction as roads/fields (createOsmRoadsLayer.tickView)
-        // — Phase 2 must re-measure against real z13/14 downtown density
-        // (Taipei/Kaohsiung core), which packs far more triangles per tile
-        // than a road/field tile of the same footprint
-        radius: ctx.params.fogFar * ctx.fogScale * 0.65,
+        // own tuned fraction, smaller than roads/fields' 0.65 — see
+        // BUILDINGS_RADIUS_FRAC's own comment for the measured before/after
+        radius: ctx.params.fogFar * ctx.fogScale * BUILDINGS_RADIUS_FRAC,
         lodZoom: ctx.lodZoom ?? 12,
         demLat: ctx.params.demLat,
         demLon: ctx.params.demLon,
