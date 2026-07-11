@@ -58,6 +58,34 @@ const DEFAULT_MAX_INSTANCES = 320 // TRA default: ~3x the observed weekday concu
 const DOT_R = 0.11 // world units at fogScale 1
 const LIFT_BASE = 0.08 // sits above the rail line's own 0.05 lift (polyline.js createRailLayer)
 const REBUILD_ON_BACKWARD_JUMP = true
+// click-to-inspect hit radius, CSS px — same fixed-screen-space rationale as
+// markers.js's PICK_PX (dots are a few px on screen regardless of zoom, via
+// the fogScale-scaled DOT_R; a world-space tolerance wouldn't track that)
+const PICK_PX = 16
+
+// HH:MM (Asia/Taipei) formatter for pick()'s info card — sec is seconds-
+// since-midnight, wrapped so a value that rolled past 86400 (late-night train
+// still running after midnight) still reads correctly.
+function fmtHHMM(sec) {
+  const s = ((Math.round(sec) % 86400) + 86400) % 86400
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+}
+
+// pick()'s "目前區間" (current section): which adjacent stop pair `elapsedSec`
+// (seconds since the train's own first departure) currently sits between —
+// dwelling at a station counts as between that station and the next. Walks
+// stops[] (not legs[]/partIdx like locateTrain) since the info card only
+// needs station names + arr_sec, not track geometry.
+function sectionAt(stops, elapsedSec) {
+  const n = stops.length
+  if (elapsedSec >= stops[n - 1].arr_sec) return { prevIdx: n - 1, nextIdx: n - 1 }
+  for (let i = 0; i < n - 1; i++) {
+    if (elapsedSec <= stops[i + 1].arr_sec) return { prevIdx: i, nextIdx: i + 1 }
+  }
+  return { prevIdx: n - 1, nextIdx: n - 1 }
+}
 
 // point-layer styleSchema (size/opacity sliders) — same shape as markers.js's
 // POINT_STYLE, plus the light-dot's own color swatch (trains have no baked
@@ -207,6 +235,10 @@ function resolveCorridorPart(stops, stationParts) {
 //   singleCorridor  true for THSR: resolve one part per WHOLE train (see
 //                 resolveCorridorPart) instead of TRA's per-leg lowest-
 //                 common-part search
+//   netLabel      short Chinese network name for pick()'s info-card title
+//                 (e.g. "台鐵 1234 自強" / "高鐵 0803" — the type suffix is
+//                 dropped when train_type already equals netLabel, which is
+//                 always true for THSR's single "高鐵" train_type)
 export function createTrainsLayer(params, config = {}) {
   const {
     id = 'trains',
@@ -215,6 +247,7 @@ export function createTrainsLayer(params, config = {}) {
     railNetwork = 'tra',
     maxInstances = DEFAULT_MAX_INSTANCES,
     singleCorridor = false,
+    netLabel = '台鐵',
   } = config
   const visibleKey = `${id}Visible`
   const colorKey = `${id}Color`
@@ -259,6 +292,16 @@ export function createTrainsLayer(params, config = {}) {
   const _dummy = new THREE.Matrix4()
   const _sample = { lon: 0, lat: 0, elev: 0 }
   const _loc = { partIdx: -1, ratio: 0 }
+  const _pickWorld = new THREE.Vector3()
+  const _pickProj = new THREE.Vector3()
+
+  // click-to-inspect candidates (pick() below), refreshed every layout() call
+  // — one entry per instance actually drawn this pass, carrying the train ref
+  // + elapsed (for the info card) alongside its rendered world position
+  // (markers.js's proximity-pick pattern: dots are a few px on screen, too
+  // small for a true raycast, so pick() projects these with the raycaster's
+  // own camera and compares to the click's screen pixel).
+  let lastHits = []
 
   function gate() {
     return params.source === 'real' && !!hf && params[visibleKey] && dataReady
@@ -378,6 +421,7 @@ export function createTrainsLayer(params, config = {}) {
     const exaggeration = params.demExaggeration
     const r = DOT_R * fogScale * (params[sizeKey] ?? 1)
     let count = 0
+    lastHits.length = 0
     for (let i = 0; i < active.length && count < maxInstances; i++) {
       const tr = active[i]
       const elapsed = elapsedFor(tr, lastQueryT)
@@ -390,6 +434,7 @@ export function createTrainsLayer(params, config = {}) {
       _dummy.makeScale(r, r, r)
       _dummy.setPosition(w.x, y, w.z)
       mesh.setMatrixAt(count, _dummy)
+      lastHits.push({ train: tr, elapsed, x: w.x, y, z: w.z })
       count++
     }
     mesh.count = count
@@ -439,6 +484,56 @@ export function createTrainsLayer(params, config = {}) {
     setStyle(patch) {
       for (const k in patch) if (KEY_TO_PARAM[k]) params[KEY_TO_PARAM[k]] = patch[k]
       applyStyle()
+    },
+
+    // click-to-inspect (see index.js pointerup handler / layers.pickAll).
+    // Same proximity-pick approach as markers.js's pick(): the dots are only
+    // a few px on screen (DOT_R), too small for a real raycast, so this
+    // projects every currently-drawn train's world position (lastHits, kept
+    // fresh by layout() above) with the raycaster's own camera and compares
+    // to the click's screen pixel. The card's content is a snapshot of
+    // whichever train was nearest at click time — it does not keep tracking
+    // the moving train afterward (that's the future camera-follow feature,
+    // see docs/HANDOFF.md backlog #2), and if the timeline is later scrubbed
+    // past that train's service window the already-open card just keeps its
+    // existing content (index.js only recomputes on the next click).
+    pick(raycaster) {
+      if (!group.visible || lastHits.length === 0) return null
+      const camera = raycaster.camera
+      const clickPx = raycaster.pickPx
+      if (!camera || !clickPx) return null
+      const w = window.innerWidth
+      const h = window.innerHeight
+      let best = null
+      for (const hit of lastHits) {
+        _pickWorld.set(hit.x, hit.y, hit.z)
+        _pickProj.copy(_pickWorld).project(camera)
+        if (_pickProj.z < -1 || _pickProj.z > 1) continue // behind camera / clipped
+        const sx = (_pickProj.x * 0.5 + 0.5) * w
+        const sy = (-_pickProj.y * 0.5 + 0.5) * h
+        const d = Math.hypot(sx - clickPx.x, sy - clickPx.y)
+        if (d < PICK_PX && (!best || d < best.d)) best = { d, hit }
+      }
+      if (!best) return null
+      const { train, elapsed, x, y, z } = best.hit
+      const { prevIdx, nextIdx } = sectionAt(train.stops, elapsed)
+      const sectionStr =
+        prevIdx === nextIdx ? train.stops[prevIdx].station : `${train.stops[prevIdx].station} → ${train.stops[nextIdx].station}`
+      const nextEtaSec = train.firstDep + train.stops[nextIdx].arr_sec
+      const sameAsNetLabel = train.trainType === netLabel
+      const title = sameAsNetLabel ? `${netLabel} ${train.trainNo}` : `${netLabel} ${train.trainNo} ${train.trainType || ''}`.trim()
+      return {
+        title,
+        rows: [
+          ['車次 No.', train.trainNo],
+          ['車種 Type', train.trainType || '—'],
+          ['方向 Direction', train.direction || '—'],
+          ['目前區間 Section', sectionStr],
+          ['下一站到達 Next ETA', fmtHHMM(nextEtaSec)],
+          ['發車時刻 Departure', fmtHHMM(train.firstDep)],
+        ],
+        worldPos: new THREE.Vector3(x, y, z),
+      }
     },
 
     // (re)supply real data once <net>_tracks.json + <net>_schedule.json +
@@ -496,6 +591,7 @@ export function createTrainsLayer(params, config = {}) {
         built.push({
           trainNo: sch.train_no,
           trainType: sch.train_type,
+          direction: sch.direction, // pick()'s "方向 Direction" row (already "A→B" formatted by bake_trains.py)
           firstDep: sch.dep_sec_of_day,
           lastArr: stops[stops.length - 1].arr_sec,
           stops,
@@ -508,6 +604,7 @@ export function createTrainsLayer(params, config = {}) {
       startPtr = 0
       lastQueryT = null
       lastActiveCount = 0
+      lastHits = []
       dataReady = trainsByStart.length > 0
     },
 

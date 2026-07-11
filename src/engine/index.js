@@ -587,6 +587,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       railNetwork: 'thsr',
       maxInstances: 64,
       singleCorridor: true,
+      netLabel: '高鐵', // pick()'s info-card title prefix (see trains.js createTrainsLayer's netLabel doc)
     }),
     osmRoadsLayer,
     createTrailsLayer(params),
