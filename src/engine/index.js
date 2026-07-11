@@ -452,7 +452,6 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   let idle = false
   let idleFrameAcc = 0 // idle 2 Hz 'frame' throttle
   let pixelBumped = false // whether the idle freeze raised the pixel ratio
-  let preIdleRatio = 0 // ratio captured at bump time, so exitIdle restores exactly what was active (params.pixelRatio normally, but robust if ambient had already lowered it)
   let renderCount = 0 // DEV verify hook: +1 per real composer.render
 
   // 顯示效能提升包 killswitch: flip to false to fully disable both the 30fps
@@ -2223,12 +2222,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // buffers, so this cost lands once per idle transition — never mid-interaction.
   // Compares against the renderer's actual current ratio (not params.pixelRatio)
   // because ambient playback (perf pack b, below) may have already parked it at
-  // ANIM_PIXEL_RATIO — idle always wins the max either way, and exitIdle below
-  // restores exactly whatever was active before the bump.
+  // ANIM_PIXEL_RATIO — idle always wins the max either way. exitIdle below
+  // restores params.pixelRatio read LIVE (not a bump-time snapshot) so a
+  // Settings-panel pixelRatio change made while parked in idle takes effect on
+  // wake instead of being clobbered by a stale value (regression found in
+  // review: a preIdleRatio snapshot here would re-assert the ratio that was
+  // active at bump time, silently overwriting whatever the user just set).
   function enterIdle(dt) {
     const current = stage.renderer.getPixelRatio()
     if (IDLE_PIXEL_RATIO > current + 1e-3) {
-      preIdleRatio = current
       stage.setPixelRatio(IDLE_PIXEL_RATIO)
       pixelBumped = true
     }
@@ -2240,9 +2242,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
 
   // Thaw on the next invalidate: restore the interactive (lower) pixel ratio so
   // live frames stay cheap. The active tick that follows renders at that ratio.
+  // Reads params.pixelRatio live so a mid-idle Settings change wins on wake.
+  // The ambientPixelDropped branch is defensive, not the common path: by the
+  // time idle is reached, ambient-drop bookkeeping (further down in tick())
+  // has always already restored params.pixelRatio and cleared the flag — see
+  // that block's own comment — so this ternary normally just resolves to
+  // params.pixelRatio. It's kept in case that invariant ever breaks, so a
+  // stale idle-exit doesn't silently re-bump DPR past an active ambient drop.
   function exitIdle() {
     if (pixelBumped) {
-      stage.setPixelRatio(preIdleRatio)
+      stage.setPixelRatio(ambientPixelDropped ? Math.min(ANIM_PIXEL_RATIO, params.pixelRatio) : params.pixelRatio)
       pixelBumped = false
     }
     idle = false
