@@ -1,10 +1,13 @@
 import * as THREE from 'three'
 import { metersToWorldY, zFightLift } from './geo.js'
+import * as timeStore from '../state/timeStore.js'
 
 // Trains: real TRA (台鐵) timetable (992 trains, scripts/bake_trains.py) —
 // InstancedMesh light dots gliding along rail_lines.json's tra polylines,
-// driven by the live Asia/Taipei wall clock (+ a debug-only offset). Manifest-
-// driven deferred layer, same fail-quiet pattern as rail/trails (see index.js
+// driven by the timeline's time store (src/state/timeStore.js, see
+// docs/TIMELINE_DESIGN.md) instead of the live wall clock — play/pause/seek/
+// speed all flow through timeStore.getDaySeconds(). Manifest-driven deferred
+// layer, same fail-quiet pattern as rail/trails (see index.js
 // loadTrainsData): registers empty at startup, fed real data via setData()
 // once train_tracks.json + train_schedule.json + rail_lines.json have all
 // landed (first switch-on).
@@ -46,7 +49,6 @@ import { metersToWorldY, zFightLift } from './geo.js'
 const MAX_INSTANCES = 320 // ~3x the observed weekday concurrent peak, margin for safety
 const DOT_R = 0.11 // world units at fogScale 1
 const LIFT_BASE = 0.08 // sits above the rail line's own 0.05 lift (polyline.js createRailLayer)
-const TAIPEI_OFFSET_MS = 8 * 3600 * 1000 // Asia/Taipei = UTC+8, no DST
 const REBUILD_ON_BACKWARD_JUMP = true
 
 // ---------------------------------------------------------------- EPSG:3826 (TWD97 TM2 zone 121)
@@ -196,14 +198,14 @@ export function createTrainsLayer(params) {
     return params.source === 'real' && !!hf && params.trainsVisible && dataReady
   }
 
-  // Asia/Taipei wall-clock seconds-since-midnight, + the debug offset. Built
-  // from a UTC-shifted Date's own UTC getters (no Intl timezone formatting) —
-  // cheap enough to call once per frame.
+  // Asia/Taipei wall-clock seconds-since-midnight, driven by the timeline's
+  // time store instead of the live wall clock — the Taipei conversion now
+  // lives there as the single definition source (see
+  // docs/TIMELINE_DESIGN.md §2.3). getDaySeconds() reads getTime() fresh
+  // every call, so this stays correct through play/pause/seek/speed changes
+  // with zero extra bookkeeping here.
   function currentDaySeconds() {
-    const d = new Date(Date.now() + TAIPEI_OFFSET_MS)
-    const raw = d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds() + d.getUTCMilliseconds() / 1000
-    const withOffset = raw + (params.trainsTimeOffset || 0)
-    return ((withOffset % 86400) + 86400) % 86400
+    return timeStore.getDaySeconds()
   }
 
   // elapsed seconds since a train's first departure, wrapped into [0, 86400)
@@ -354,9 +356,10 @@ export function createTrainsLayer(params) {
       group.visible = show
     },
 
-    // per-frame: advance the sweep-line active set against the live wall
-    // clock and re-place every in-service train. The engine keeps the render
-    // loop non-idle while this layer is visible (see index.js isAnimating).
+    // per-frame: advance the sweep-line active set against the timeline
+    // clock (timeStore.getDaySeconds()) and re-place every in-service train.
+    // The engine keeps the render loop non-idle while this layer is visible
+    // AND the timeline is playing (see index.js isAnimating).
     tickView(ctx) {
       fogScale = ctx.fogScale
       lift = zFightLift(LIFT_BASE, ctx.fogScale)

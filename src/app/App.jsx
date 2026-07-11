@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { createEngine } from '../engine/index.js'
-import { T, FONT_DATA, glass } from './theme.js'
+import { T, FONT_DATA, glass, RAIL_LEFT, RAIL_WIDTH } from './theme.js'
 import IconRailSidebar from './components/IconRailSidebar.jsx'
 import TitleBlock from './components/TitleBlock.jsx'
 import Telemetry from './components/Telemetry.jsx'
+import TimelineBar from './components/TimelineBar.jsx'
 import PoiTags from './components/PoiTags.jsx'
 import LayerPickCard from './components/LayerPickCard.jsx'
 
@@ -58,7 +59,24 @@ export default function App() {
       {engine && (
         <>
           <div ref={hudRootRef}>
-            <Telemetry engine={engine} />
+            {/* Telemetry(收合 chip) 疊在 TimelineBar 上方，左下同一個 fixed
+                容器裡用 flex column 堆疊 —— 高度全交給內容自己撐開，不用猜
+                TimelineBar 實際高度去手算第二個 bottom 偏移量 */}
+            <div
+              style={{
+                position: 'fixed',
+                left: RAIL_LEFT + RAIL_WIDTH + 12,
+                bottom: 20,
+                zIndex: 10,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'flex-start',
+                gap: 10,
+              }}
+            >
+              <Telemetry engine={engine} />
+              <TimelineBar />
+            </div>
             <PoiTags engine={engine} />
           </div>
           <TitleBlock engine={engine} />

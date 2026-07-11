@@ -134,17 +134,6 @@ export function createDebugPanel(engine, hud2) {
   fMap.add(params, 'countiesOpacity', 0, 1, 0.02).name('county opacity').onChange(set('countiesOpacity'))
   fMap.addColor(params, 'countiesColor').name('county color').onChange(set('countiesColor'))
 
-  // Trains: debug-only clock offset (src/engine/trains.js) — NOT surfaced in
-  // the Layers panel (that only exposes trainsVisible/trainsColor via
-  // styleSchema). Lets a developer jump the live Asia/Taipei wall clock the
-  // train positions are driven by, e.g. to verify peak-hour density (~08:30)
-  // or the overnight lull (~03:00) without waiting for real time to get there.
-  const fTrains = gui.addFolder('Trains (debug)')
-  fTrains
-    .add(params, 'trainsTimeOffset', -43200, 43200, 60)
-    .name('clock offset (s)')
-    .onChange(set('trainsTimeOffset'))
-
   const fLook = gui.addFolder('Look')
   fLook.add(params, 'exposure', 0.2, 3, 0.02).onChange(set('exposure'))
   fLook.add(params, 'contrast', -0.2, 0.5, 0.01).onChange(set('contrast'))

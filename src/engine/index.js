@@ -11,6 +11,7 @@ import { createLabelsLayer } from './labels.js'
 import { createOsmRoadsLayer, createFtwFieldsLayer } from './vectortiles.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
+import * as timeStore from '../state/timeStore.js'
 import { makeProjection, HeightField, TAIWAN_BBOX, worldYScale, metersToWorldY } from './geo.js'
 import { ChunkManager } from './chunks.js'
 import { findRealPeaks } from './peaks.js'
@@ -132,16 +133,14 @@ export const DEFAULT_PARAMS = {
   railOpacity: 0.9,
   // trains: manifest-driven deferred layer — real TRA (台鐵) timetable (992
   // trains, scripts/bake_trains.py) animated as light dots gliding along the
-  // rail_lines.json tra polylines using live Asia/Taipei wall-clock time (see
-  // src/engine/trains.js). Default off; toggling it on keeps the render loop
-  // non-idle (isAnimating), same as typhoon, since positions advance every
-  // second even with the camera parked. trainsTimeOffset is a DEBUG-only knob
-  // (lil-gui only, no Layers-panel exposure — see ui/debugPanel.js) that
-  // adds/subtracts seconds from the live clock so a developer can jump to
-  // peak hours (~08:30) or the dead of night (~03:00) without waiting.
+  // rail_lines.json tra polylines, driven by the timeline's time store (see
+  // src/state/timeStore.js, docs/TIMELINE_DESIGN.md) instead of the live wall
+  // clock. Default off; toggling it on keeps the render loop non-idle
+  // (isAnimating), same as typhoon, but only while the timeline is ALSO
+  // playing (see isAnimating() below) — positions only advance when
+  // timeStore.getPlaying() is true.
   trainsVisible: false,
   trainsColor: '#ffcf40',
-  trainsTimeOffset: 0,
   // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
   // — NOT a manifest-driven JSON fetch like rail/trails; the manager
   // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
@@ -396,6 +395,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   controls.addEventListener('end', invalidate)
   const onResize = () => invalidate() // scene.js owns the actual resize handler
   window.addEventListener('resize', onResize)
+  // timeline: every discrete change (seek/play/pause/setSpeed) reopens the
+  // render window so trains (and future time-aware layers) redraw at the new
+  // time before parking again — see docs/TIMELINE_DESIGN.md §2.2. Playback
+  // itself doesn't spam this (timeStore.subscribe only fires on discrete
+  // changes, not per notifier tick), so this never fights isAnimating().
+  const offTimeStore = timeStore.subscribe(() => invalidate())
 
   const terrain = new Terrain(params)
   scene.add(terrain.group)
@@ -1584,8 +1589,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     railWidth: () => layers.get('rail').update(layerCtx()),
     railOpacity: () => layers.get('rail').update(layerCtx()),
     // trains: first switch-on triggers the deferred fetch (loadTrainsData
-    // no-ops once loaded/in-flight); trainsTimeOffset needs no handler here —
-    // trains.js reads it fresh every tickView, no update()/rebuild required.
+    // no-ops once loaded/in-flight); the timeline clock needs no handler
+    // here — trains.js reads timeStore.getDaySeconds() fresh every tickView,
+    // no update()/rebuild required.
     trainsVisible: (v) => {
       if (v) loadTrainsData()
       layers.get('trains').update(layerCtx())
@@ -1844,7 +1850,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (params.source !== 'real' || !heightField) return true
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
-      params.trainsVisible || // light dots advance every second along the live wall clock
+      (params.trainsVisible && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||
@@ -2199,6 +2205,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       window.removeEventListener('resize', onResize)
       window.removeEventListener('pointerdown', onPickPointerDown)
       window.removeEventListener('pointerup', onPickPointerUp)
+      offTimeStore()
       keyPan.dispose()
       controls.dispose()
       stage.renderer.dispose()
