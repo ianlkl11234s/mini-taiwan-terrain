@@ -7,3 +7,4 @@ public/tiles
 .env
 __pycache__/
 .claude/worktrees/
+scripts/.cache/
