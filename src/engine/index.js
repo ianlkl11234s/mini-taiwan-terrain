@@ -7,6 +7,7 @@ import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
 import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
+import { createCurrentsLayer } from './currents.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
 import { createOsmRoadsLayer, createTrailsLayer, createFtwFieldsLayer, createBuildingsLayer } from './vectortiles.js'
@@ -183,6 +184,14 @@ export const DEFAULT_PARAMS = {
   shipsColor: '#3a6ea5',
   shipsSize: 1.0,
   shipsOpacity: 0.95,
+  // ocean currents: CPU-advected particle streaklines (src/engine/currents.js)
+  // over a baked CMEMS surface-current snapshot (CDN PNG+JSON, fetched once
+  // on first switch-on — see loadCurrentsData/currentsVisible HANDLER and
+  // docs/OCEAN_CURRENTS_DESIGN.md). Ambient, wall-clock animation like the
+  // typhoon/sea-ripple layers — not gated on the timeline (see isAnimating()).
+  currentsVisible: false,
+  currentsOpacity: 0.7,
+  currentsSpeed: 1.0,
   // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
   // — NOT a manifest-driven JSON fetch like rail; the manager (vectortiles.js
   // VectorTileManager) streams tiles from the R2-hosted osm_road_drive.pmtiles
@@ -726,6 +735,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const powerTowersLayer = createPowerTowersLayer(params)
   const windTurbinesLayer = createWindTurbinesLayer(params)
   const shipsLayer = createShipsLayer(params)
+  const currentsLayer = createCurrentsLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
   // whatever meta.group/subgroup it's registered with through to describe(),
@@ -766,6 +776,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     stations: { group: GROUP_MOVE },
     osm_roads: { group: GROUP_MOVE },
     ships: { group: GROUP_MOVE },
+    // ocean currents (src/engine/currents.js) — grouped with ships, the other
+    // marine overlay in this theme (sea-ripple is a toggle inside 周邊 Region,
+    // GROUP_BASE, not a standalone panel row, so ships is the closest actual
+    // "same group" match for the brief's "面板分組跟 ships/海面同組")
+    currents: { group: GROUP_MOVE },
     // basic POI packs (bake_poi_layers.py) — airports/ports are transport
     // infrastructure like stations/ships above
     airports: { group: GROUP_MOVE },
@@ -801,12 +816,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // registration order = draw / update order (coastline → counties →
   // buildings → airspace → rail → trains → thsr → trails → rivers →
   // reservoirs → farm sim → irrigation → typhoon → markers → stations →
-  // ships → trail signs → airports/ports → fire/hospitals/medical/police → power
-  // towers → wind turbines → labels). thsr
+  // ships → ocean currents → trail signs → airports/ports →
+  // fire/hospitals/medical/police → power towers → wind turbines → labels). thsr
   // registers right after trains so it lands directly below 台鐵列車 Trains,
-  // and ships registers right after stations, both in the Layers panel's
-  // 交通 Move group (Layers.jsx preserves registration order within a group
-  // — see groupLayers()). airspace registers right after buildings (same
+  // and ships (then currents right after it) register right after stations,
+  // all in the Layers panel's 交通 Move group (Layers.jsx preserves
+  // registration order within a group — see groupLayers()). airspace
+  // registers right after buildings (same
   // low-pick-priority reasoning); power towers/wind turbines register late
   // (high pick-priority for their small near-view silhouettes) just before
   // labels.
@@ -856,6 +872,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     pointLayer,
     stationsLayer,
     shipsLayer,
+    currentsLayer,
     trailSignsLayer,
     airportsLayer,
     portsLayer,
@@ -1780,6 +1797,46 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
   let shipsActivated = false // onActivate: first switch-on loads today + subscribes to future date changes (once — see shipsVisible HANDLER)
 
+  // ocean currents: CDN PNG+JSON snapshot (docs/OCEAN_CURRENTS_DESIGN.md) —
+  // fetch-once-on-first-switch-on, same {loading,loaded} guard as
+  // loadRailData. Decodes the PNG via an offscreen canvas (same approach as
+  // mini-taiwan-pulse's loadClimateRaster — see currents.js header) into an
+  // ImageData the layer's setData() reads R/G/alpha channels out of. A
+  // fetch/decode failure just leaves the layer gated empty (currents.js's
+  // dataLoaded stays false) — never throws past this function.
+  let currentsFetch = { loading: false, loaded: false }
+  async function loadCurrentsData() {
+    if (currentsFetch.loading || currentsFetch.loaded) return
+    currentsFetch.loading = true
+    try {
+      const metaRes = await fetch(`${SHIPS_TILE_BASE}/climate/currents_latest.json`)
+      if (!metaRes.ok) throw new Error(`currents_latest.json ${metaRes.status}`)
+      const meta = await metaRes.json()
+      const img = await new Promise((resolve, reject) => {
+        const el = new Image()
+        el.crossOrigin = 'anonymous'
+        el.onload = () => resolve(el)
+        el.onerror = () => reject(new Error('currents_latest.png load failed'))
+        el.src = `${SHIPS_TILE_BASE}/climate/currents_latest.png`
+      })
+      const canvas = document.createElement('canvas')
+      canvas.width = meta.width
+      canvas.height = meta.height
+      const ctx2d = canvas.getContext('2d', { willReadFrequently: true })
+      ctx2d.drawImage(img, 0, 0, meta.width, meta.height)
+      const imageData = ctx2d.getImageData(0, 0, meta.width, meta.height)
+      currentsLayer.setData(meta, imageData)
+      currentsFetch.loaded = true
+      currentsLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] ocean currents fetch failed', err)
+    } finally {
+      currentsFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
   // stationsLayer.onActivate — grouped one marker set per transit system.
   // Never rejects: a fetch failure just leaves the layer showing no sets
   // (console.warn + graceful "NO MARKER SETS" panel state), matching rail's
@@ -2164,6 +2221,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     shipsColor: () => layers.get('ships').update(layerCtx()),
     shipsSize: () => layers.get('ships').update(layerCtx()),
     shipsOpacity: () => layers.get('ships').update(layerCtx()),
+    // ocean currents: first switch-on triggers the deferred CDN fetch
+    // (loadCurrentsData no-ops once loaded/in-flight); opacity/speed just
+    // re-apply — the advection itself reads params.currentsSpeed fresh every
+    // tickView, no rebuild needed (see currents.js's step()).
+    currentsVisible: (v) => {
+      if (v) loadCurrentsData()
+      layers.get('currents').update(layerCtx())
+    },
+    currentsOpacity: () => layers.get('currents').update(layerCtx()),
+    currentsSpeed: () => layers.get('currents').update(layerCtx()),
     // OSM roads: no deferred JSON fetch to kick — the PMTiles manager streams
     // tiles itself once switched on (see vectortiles.js). update() just
     // (re)applies the gate/style; the manager's own setEnabled starts/stops
@@ -2450,6 +2517,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
+      params.currentsVisible || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below)
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
       motion.tourActive ||
       motion.tweenActive ||
