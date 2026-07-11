@@ -393,43 +393,21 @@ export function createRailLayer(params) {
   )
 }
 
-// Trails: manifest-driven deferred layer (see index.js) — registers empty at
-// startup and is fed real polylines via setData() once
-// public/layers/trails.json has been fetched (first time the layer is
-// switched on). Unlike rail, every trail in the data shares ONE baked color
-// (#5a8f3d), so this uses the normal single paramMap.color swatch (draped,
-// like counties) instead of per-line vertexColors — no lineColors passed in.
-export function createTrailsLayer(params) {
-  return createPolylineLayer(
-    {
-      id: 'trails',
-      label: 'Trails',
-      rowLabel: '步道 Trails',
-      mode: 'draped',
-      polylines: [],
-      liftBase: 0.05,
-      paramMap: { visible: 'trailsVisible', color: 'trailsColor', width: 'trailsWidth', opacity: 'trailsOpacity' },
-      styleSchema: POLYLINE_STYLE(6),
-      // click-to-inspect (see index.js loadTrailsData, which feeds the 3rd
-      // setData arg with one {name,county,lengthKm,ascentM} per trail)
-      pickTitle: (meta) => meta.name,
-      pickRows: (meta) => [
-        ['步道 Trail', meta.name || '—'],
-        ['縣市 County', meta.county || '—'],
-        ['長度 Length', `${meta.lengthKm.toFixed(2)} km`],
-        ['爬升 Ascent', `${meta.ascentM} m`],
-      ],
-    },
-    params
-  )
-}
+// Trails (the original 49-trail Forestry Bureau baked-JSON version) used to
+// live here as createTrailsLayer, sharing this module's createPolylineLayer
+// base. Superseded 2026-07-12 by a PMTiles/VectorTileManager stream over the
+// far larger 7,339-line hiking_trails.pmtiles (6 merged sources) — see
+// vectortiles.js createTrailsLayer, registered under the SAME id/rowLabel
+// ('trails' / '步道 Trails') in index.js. bake_trails.py's trail-LINE output
+// (public/layers/trails.json) is now unused; its trail-SIGN output
+// (trail_signs.json) is still active (markers.js createPointLayer).
 
 // Irrigation canals: manifest-driven deferred layer (see index.js) — registers
 // empty at startup and is fed real polylines via setData() once
 // public/layers/irrigation.json has been fetched (first time the layer is
 // switched on). The bake's color lives at data.meta.color (ONE value for the
 // whole network, not per-canal) — same single paramMap.color swatch as
-// trails (no lineColors array passed to setData).
+// coastline/counties (no lineColors array passed to setData).
 export function createIrrigationLayer(params) {
   return createPolylineLayer(
     {

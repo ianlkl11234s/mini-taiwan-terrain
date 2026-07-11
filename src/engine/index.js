@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import { Terrain } from './terrain.js'
 import { LayerManager } from './layers.js'
-import { createCoastlineLayer, createCountiesLayer, createRailLayer, createTrailsLayer, createRiversLayer, createIrrigationLayer } from './polyline.js'
+import { createCoastlineLayer, createCountiesLayer, createRailLayer, createRiversLayer, createIrrigationLayer } from './polyline.js'
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
@@ -9,7 +9,7 @@ import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
-import { createOsmRoadsLayer, createFtwFieldsLayer, createBuildingsLayer } from './vectortiles.js'
+import { createOsmRoadsLayer, createTrailsLayer, createFtwFieldsLayer, createBuildingsLayer } from './vectortiles.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
 import * as timeStore from '../state/timeStore.js'
@@ -181,23 +181,24 @@ export const DEFAULT_PARAMS = {
   shipsSize: 1.0,
   shipsOpacity: 0.95,
   // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
-  // — NOT a manifest-driven JSON fetch like rail/trails; the manager
-  // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
-  // osm_road_drive.pmtiles archive as the camera pans, only once switched on.
-  // Phase 2: highway-class width/color buckets baked per-class into
-  // vertexColors (see vectortiles.js ROAD_STYLE) — no single color swatch;
-  // width/opacity stay as global multipliers on top of the buckets.
+  // — NOT a manifest-driven JSON fetch like rail; the manager (vectortiles.js
+  // VectorTileManager) streams tiles from the R2-hosted osm_road_drive.pmtiles
+  // archive as the camera pans, only once switched on. Phase 2: highway-class
+  // width/color buckets baked per-class into vertexColors (see vectortiles.js
+  // ROAD_STYLE) — no single color swatch; width/opacity stay as global
+  // multipliers on top of the buckets.
   osmRoadsVisible: false,
   osmRoadsWidth: 1.5,
   osmRoadsOpacity: 0.85,
-  // trails: manifest-driven deferred layer (public/layers/trails.json, fetched
-  // on first trailsVisible:true), same fail-quiet pattern as rail. Every trail
-  // shares one baked color (see polyline.js createTrailsLayer) so — unlike
-  // rail — there IS a color param.
+  // trails: PMTiles-streamed vector-tile line layer, same pattern as osmRoads
+  // above (vectortiles.js createTrailsLayer, hiking_trails.pmtiles — 7,339
+  // lines from 6 merged sources, superseding the 2026-07-10 49-trail baked-
+  // JSON version). Unlike roads there's no per-class bucketing, so — like the
+  // old baked layer — every trail shares ONE color param.
   trailsVisible: false,
   trailsWidth: 2,
   trailsOpacity: 0.9,
-  trailsColor: '#5a8f3d',
+  trailsColor: '#ff7a1a',
   // point-layer styleSchema defaults (markers.js createPointLayer's size/
   // opacity sliders — POINT_STYLE). Key names are derived from each layer's
   // id (${id}Size/${id}Opacity — see createPointLayer). 1.0/0.9 match the
@@ -587,6 +588,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const labelsLayer = createLabelsLayer(params)
   const reservoirsLayer = createReservoirLayer(params)
   const osmRoadsLayer = createOsmRoadsLayer(params, { invalidate })
+  const trailsLayer = createTrailsLayer(params, { invalidate })
   const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
   const buildingsLayer = createBuildingsLayer(params, { invalidate })
   const shipsLayer = createShipsLayer(params)
@@ -679,7 +681,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       heightM: 4,
     }),
     osmRoadsLayer,
-    createTrailsLayer(params),
+    trailsLayer,
     createRiversLayer(params),
     reservoirsLayer,
     createFarmSimLayer(params),
@@ -717,6 +719,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     stage.shadowNeedsUpdate()
     invalidate() // a chunk appeared/vanished (incl. after DEM tiles finish loading)
     osmRoadsLayer.markDemDirty() // coalesced redrape — see vectortiles.js VectorTileManager.markDemDirty
+    trailsLayer.markDemDirty()
     ftwFieldsLayer.markDemDirty()
     buildingsLayer.markDemDirty()
   }
@@ -1190,37 +1193,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     railSystem: 'thsr',
   })
 
-  // trails: same deferred fetch-once pattern as rail (baked polylines, no
-  // per-line official colors — see polyline.js createTrailsLayer). setData's
-  // 2nd arg (lineColors) is null — the single trailsColor swatch drives the
-  // style — but the 3rd arg carries one {name,county,lengthKm,ascentM} per
-  // trail (parallel to the points arrays) for the click-to-inspect popup
-  // (polyline.js pick(), gated on config.pickRows).
-  let trailsFetch = { loading: false, loaded: false }
-  async function loadTrailsData() {
-    if (trailsFetch.loading || trailsFetch.loaded) return
-    trailsFetch.loading = true
-    try {
-      const res = await fetch(await manifestUrl('trails', '/layers/trails.json'))
-      if (!res.ok) throw new Error(`trails.json ${res.status}`)
-      const data = await res.json()
-      layers.get('trails').setData(
-        data.lines.map((l) => l.points),
-        null,
-        data.lines.map((l) => ({ name: l.name, county: l.county, lengthKm: l.lengthKm, ascentM: l.ascentM }))
-      )
-      trailsFetch.loaded = true
-      layers.get('trails').update(layerCtx())
-    } catch (err) {
-      console.warn('[layers] trails fetch failed', err)
-    } finally {
-      trailsFetch.loading = false
-      invalidate()
-      emit('layers')
-    }
-  }
-
-  // irrigation: same deferred fetch-once pattern as trails (baked polylines).
+  // irrigation: same deferred fetch-once pattern as the OLD trails baked-JSON
+  // layer used to be (see git history — 2026-07-12 superseded trails with a
+  // PMTiles/VectorTileManager stream, vectortiles.js createTrailsLayer; no
+  // manifest fetch needed there anymore, matching osm_roads/ftw_fields).
   // data.meta.color is ONE color for the whole canal network (not per-canal
   // like rail's lineColors array) — setData's 2nd arg stays null and the
   // single irrigationColor swatch drives the style. 3rd arg carries one
@@ -1905,12 +1881,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     osmRoadsVisible: () => layers.get('osm_roads').update(layerCtx()),
     osmRoadsWidth: () => layers.get('osm_roads').update(layerCtx()),
     osmRoadsOpacity: () => layers.get('osm_roads').update(layerCtx()),
-    // trails: same deferred-fetch pattern as rail; unlike rail this one has a
-    // color param (every trail shares one baked color, no per-line override)
-    trailsVisible: (v) => {
-      if (v) loadTrailsData()
-      layers.get('trails').update(layerCtx())
-    },
+    // trails: PMTiles/VectorTileManager stream (vectortiles.js createTrailsLayer)
+    // — same streamed-not-manifest pattern as osmRoadsVisible above, no fetch
+    // call here; update() re-evaluates its own gate() and (re)starts streaming.
+    trailsVisible: () => layers.get('trails').update(layerCtx()),
     trailsWidth: () => layers.get('trails').update(layerCtx()),
     trailsOpacity: () => layers.get('trails').update(layerCtx()),
     trailsColor: () => layers.get('trails').update(layerCtx()),

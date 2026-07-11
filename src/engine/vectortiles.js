@@ -1578,3 +1578,283 @@ export function createBuildingsLayer(params, { invalidate } = {}) {
     },
   }
 }
+
+// ==================================================================== trails (2026-07-12)
+
+// hiking_trails.pmtiles (mini-taiwan-pulse/public/forestry, tippecanoe z0-13,
+// 7,339 LineString features merged from 6 sources — Forestry & Nature
+// Conservation Agency, national-park authorities, Sports Administration,
+// Taipei/New Taipei city trail offices, Kinmen NP, etc — see the archive's
+// own tilestats for the source/main_sys/region value lists). Supersedes the
+// OLD 49-trail Forestry-Bureau-only baked-JSON layer (polyline.js's retired
+// createTrailsLayer, public/layers/trails.json) under the SAME id/rowLabel —
+// a flat bake of this much bigger network would blow well past the repo's
+// 2MB git budget (the old 49-trail/3,373-vertex bake was already 91 KB;
+// scaling that ~150x would land near 13 MB), so this one streams from R2 via
+// VectorTileManager instead, same as roads/fields/buildings above. Single
+// bucket (no width-class buckets like roads — every trail reads the same,
+// unlike a road network's motorway-vs-alley hierarchy), so color is a normal
+// user-adjustable paramMap.color swatch (LineMaterial.color), not baked
+// per-class vertexColors.
+const TRAILS_MESH_KEYS = ['line']
+// slightly above OSM_ROADS_LIFT_BASE (0.05) so a trail that runs alongside a
+// road (rare but real — e.g. a riverside path beside a county road) draws on
+// top rather than z-fighting underneath it
+const TRAILS_LIFT_BASE = 0.06
+// starting point = same tuned fraction as roads/fields (createOsmRoadsLayer's
+// own comment) — re-measure against real z12-13 trail density in a dense
+// mountain-trail area (Yushan/Xueshan clusters) during verification rather
+// than assumed; trails are a MUCH sparser network than roads per tile so this
+// may end up able to go wider without a tile-count blowup
+const TRAILS_RADIUS_FRAC = 0.65
+
+// per-tile trail decode: walks every LineString feature — no highway-class
+// bucketing like roads (TRAILS_MESH_KEYS has only 'line'), so this is roughly
+// decodeRoadLayer with the bucket dimension removed. features holds one
+// {name,region,main_sys,source} record per LineString (source_id/url/
+// in_national_park/is_dup_of_A/overlap_ratio_A are source-side QA metadata,
+// dropped — not shown anywhere in the current UI). segFeature maps a baked
+// SEGMENT back to its source LineString for pick().
+function decodeTrailLayer(layer, { proj, center, hf }) {
+  const features = []
+  const xz = []
+  const featArr = []
+  for (let i = 0; i < layer.length; i++) {
+    const feature = layer.feature(i)
+    if (feature.type !== LINESTRING_TYPE) continue
+    const props = feature.properties || {}
+    const featIdx = features.length
+    features.push({ name: props.name, region: props.region, main_sys: props.main_sys, source: props.source })
+    const extent = feature.extent
+    const s = proj.tileWorldSize / extent
+    const parts = feature.loadGeometry()
+    for (const part of parts) {
+      for (let j = 0; j < part.length - 1; j++) {
+        const p0 = part[j]
+        const p1 = part[j + 1]
+        xz.push(
+          center.x + (p0.x - extent / 2) * s,
+          center.z + (p0.y - extent / 2) * s,
+          center.x + (p1.x - extent / 2) * s,
+          center.z + (p1.y - extent / 2) * s
+        )
+        featArr.push(featIdx)
+      }
+    }
+  }
+  const nSeg = xz.length / 4
+  if (!nSeg) return null // "先空後填" — a tile with no trail LineStrings just gets no mesh
+  const seg = new Float32Array(nSeg * 6)
+  const elev = new Float32Array(nSeg * 2)
+  for (let s = 0; s < nSeg; s++) {
+    const x0 = xz[s * 4]
+    const z0 = xz[s * 4 + 1]
+    const x1 = xz[s * 4 + 2]
+    const z1 = xz[s * 4 + 3]
+    seg[s * 6] = x0
+    seg[s * 6 + 2] = z0
+    seg[s * 6 + 3] = x1
+    seg[s * 6 + 5] = z1
+    elev[s * 2] = hf ? hf.heightAtWorld(x0, z0) : 0
+    elev[s * 2 + 1] = hf ? hf.heightAtWorld(x1, z1) : 0
+  }
+  return { buckets: { line: { seg, elev, segFeature: new Int32Array(featArr), nSeg } }, features }
+}
+
+// materialize the trail bucket — same elevation-write + LineSegments2 build as
+// buildRoadMesh, minus the vertex-color path (this layer has no per-class
+// baked colors; material.color is the single user-adjustable swatch).
+function buildTrailMesh(material, bd, hf, exaggeration) {
+  if (hf) {
+    for (let s = 0; s < bd.nSeg; s++) {
+      bd.seg[s * 6 + 1] = metersToWorldY(hf, bd.elev[s * 2], exaggeration)
+      bd.seg[s * 6 + 4] = metersToWorldY(hf, bd.elev[s * 2 + 1], exaggeration)
+    }
+  }
+  const geo = new LineSegmentsGeometry()
+  geo.setPositions(bd.seg)
+  const mesh = new LineSegments2(geo, material)
+  mesh.userData.segFeature = bd.segFeature
+  return mesh
+}
+
+// in-place y rewrite for a live trail bucket — no geometry rebuild, same
+// pattern as redrapeRoadBucket (kept as its own copy rather than a shared
+// call so this layer's evolution never depends on roads' bucket shape).
+function redrapeTrailBucket(bd, mesh, heightField, exaggeration) {
+  for (let s = 0; s < bd.nSeg; s++) {
+    const x0 = bd.seg[s * 6]
+    const z0 = bd.seg[s * 6 + 2]
+    const x1 = bd.seg[s * 6 + 3]
+    const z1 = bd.seg[s * 6 + 5]
+    bd.elev[s * 2] = heightField.heightAtWorld(x0, z0)
+    bd.elev[s * 2 + 1] = heightField.heightAtWorld(x1, z1)
+    bd.seg[s * 6 + 1] = metersToWorldY(heightField, bd.elev[s * 2], exaggeration)
+    bd.seg[s * 6 + 4] = metersToWorldY(heightField, bd.elev[s * 2 + 1], exaggeration)
+  }
+  mesh.geometry.attributes.instanceStart.data.needsUpdate = true
+  mesh.geometry.computeBoundingBox()
+  mesh.geometry.computeBoundingSphere()
+}
+
+// §5 pick — 名稱/區域/系統/來源 (name/region/main_sys/source), per spec.
+function trailPickResult(feat, worldPos) {
+  const name = feat.name || '步道 Trail'
+  const rows = [
+    ['名稱 Name', feat.name || '—'],
+    ['區域 Region', feat.region || '—'],
+    ['系統 System', feat.main_sys || '—'],
+    ['來源 Source', feat.source || '—'],
+  ]
+  return { title: name, rows, worldPos }
+}
+
+function resolveTrailHit(hit) {
+  const segFeature = hit.object.userData.segFeature
+  const features = hit.object.userData.features
+  if (!segFeature || !features) return null
+  const feat = features[segFeature[hit.faceIndex]]
+  if (!feat) return null
+  return trailPickResult(feat, hit.point.clone())
+}
+
+// width/opacity/color are all normal user-adjustable params here (unlike
+// roads, which bakes color per highway-class bucket) — every trail shares
+// ONE LineMaterial.
+function applyTrailStyle(materials, { width, opacity, color } = {}) {
+  const mat = materials.line
+  if (width !== undefined) mat.linewidth = width
+  if (opacity !== undefined) mat.opacity = opacity
+  if (color !== undefined) mat.color.set(color)
+}
+
+const TRAILS_STYLE_SCHEMA = {
+  width: { type: 'slider', label: '線寬 Width', min: 0.5, max: 6, step: 0.1, format: (v) => v.toFixed(1) },
+  opacity: { type: 'slider', label: '不透明度 Opacity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+  color: { type: 'color', label: '顏色 Color' },
+}
+
+const TRAILS_URL = `${VECTOR_BASE}/hiking_trails.pmtiles`
+
+// LayerManager adapter — registers with an empty, invisible group; the
+// manager only starts streaming once the panel switches this layer on
+// (gate() below), matching "先空後填" (same as roads/fields/buildings).
+export function createTrailsLayer(params, { invalidate } = {}) {
+  const materials = {
+    line: new LineMaterial({
+      color: new THREE.Color(params.trailsColor),
+      vertexColors: false,
+      linewidth: params.trailsWidth,
+      transparent: true,
+      opacity: params.trailsOpacity,
+      fog: true,
+    }),
+  }
+  const manager = new VectorTileManager({
+    url: TRAILS_URL,
+    layerName: 'hiking_trails',
+    meshKeys: TRAILS_MESH_KEYS,
+    materials,
+    decodeLayer: decodeTrailLayer,
+    buildMesh: (key, bd, hf, exaggeration) => buildTrailMesh(materials[key], bd, hf, exaggeration),
+    redrapeBucket: redrapeTrailBucket,
+    resolveHit: resolveTrailHit,
+    applyStyle: applyTrailStyle,
+  })
+  manager.setStyle({ width: params.trailsWidth, opacity: params.trailsOpacity, color: params.trailsColor })
+  manager.onTilesChanged = invalidate // a tile finished building — repaint (on-demand render, design §6)
+
+  function gate(ctx) {
+    return params.source === 'real' && !!ctx.heightField && !!params.trailsVisible
+  }
+
+  return {
+    id: 'trails',
+    kind: 'line',
+    label: 'Trails',
+    rowLabel: '步道 Trails',
+    object3d: manager.group,
+    visibleParam: 'trailsVisible',
+    paramMap: {
+      visible: 'trailsVisible',
+      width: 'trailsWidth',
+      opacity: 'trailsOpacity',
+      color: 'trailsColor',
+    },
+
+    build(ctx) {
+      if (ctx.lineResolution) manager.setLineResolution(ctx.lineResolution)
+    },
+
+    // style/visibility path (setParams → HANDLERS.trails* → this.update)
+    update(ctx) {
+      const show = gate(ctx)
+      manager.setStyle({ width: params.trailsWidth, opacity: params.trailsOpacity, color: params.trailsColor })
+      manager.group.visible = show
+      manager.setEnabled(show)
+    },
+
+    // per-frame streaming (desired-set recompute + throttled build pump) —
+    // same piggyback on layers.tickAll as roads/fields (see createOsmRoadsLayer).
+    tickView(ctx) {
+      if (!manager.enabled || !ctx.heightField) return
+      manager.setLift(zFightLift(TRAILS_LIFT_BASE, ctx.fogScale))
+      const cx = ctx.labelCenter ? ctx.labelCenter.x : ctx.camera.position.x
+      const cz = ctx.labelCenter ? ctx.labelCenter.z : ctx.camera.position.z
+      manager.update(ctx.dt, {
+        targetX: cx,
+        targetZ: cz,
+        radius: ctx.params.fogFar * ctx.fogScale * TRAILS_RADIUS_FRAC,
+        lodZoom: ctx.lodZoom ?? 12,
+        demLat: ctx.params.demLat,
+        demLon: ctx.params.demLon,
+        exaggeration: ctx.params.demExaggeration,
+        heightField: ctx.heightField,
+      })
+    },
+
+    setVisible(v) {
+      params.trailsVisible = v
+      manager.group.visible = v
+      manager.setEnabled(v)
+    },
+
+    setStyle(patch) {
+      for (const k in patch) if (this.paramMap[k]) params[this.paramMap[k]] = patch[k]
+      manager.setStyle({ width: params.trailsWidth, opacity: params.trailsOpacity, color: params.trailsColor })
+    },
+
+    // click-to-inspect — delegates to the manager, which only ever raycasts
+    // against live (materialized) tile meshes.
+    pick(raycaster) {
+      return manager.pick(raycaster)
+    },
+
+    // chunkManager.onChunksChanged hook (index.js) — coalesced redrape, see
+    // VectorTileManager.markDemDirty
+    markDemDirty() {
+      manager.markDemDirty()
+    },
+
+    describe() {
+      return {
+        id: 'trails',
+        kind: 'line',
+        label: 'Trails',
+        rowLabel: '步道 Trails',
+        count: manager.tiles.size, // live tile count, not feature count (matches roads/fields/buildings' describe convention)
+        visible: params.trailsVisible,
+        styleSchema: TRAILS_STYLE_SCHEMA,
+        style: {
+          width: params.trailsWidth,
+          opacity: params.trailsOpacity,
+          color: params.trailsColor,
+        },
+      }
+    },
+
+    dispose() {
+      manager.dispose()
+    },
+  }
+}

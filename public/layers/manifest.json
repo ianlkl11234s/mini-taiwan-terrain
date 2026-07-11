@@ -51,15 +51,6 @@
       "visible": false
     },
     {
-      "id": "trails",
-      "kind": "line",
-      "label": "Trails",
-      "rowLabel": "步道 Trails",
-      "url": "/layers/trails.json",
-      "visible": false,
-      "style": { "width": 2, "opacity": 0.9 }
-    },
-    {
       "id": "trail_signs",
       "kind": "point",
       "label": "Trail Signs",
