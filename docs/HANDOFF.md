@@ -25,7 +25,7 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 |---|------|------|
 | 1 | ~~時間軸~~ ✅ 2026-07-11 完成 | 見上節；設計 `docs/TIMELINE_DESIGN.md` |
 | 2 | 列車二期：~~點選班次資訊卡~~✅、3D 車廂、**跟隨鏡頭** | 資訊卡 2026-07-11 完成；跟隨鏡頭無範本（v3/pulse 都沒做），需從零設計且不與 tour.js 打架 |
-| 3 | rail_lines.json 切段點維護 | 切段點不在真轉乘站 → 16% 班次無法全段映射（桃園↔板橋、羅東↔花蓮等）；修好整班涵蓋 84%→~98%（`scripts/bake_trains.py` 會回報涵蓋率） |
+| 3 | ~~rail_lines.json 切段點維護~~ ✅ 2026-07-11 完成 | `scripts/fix_rail_cuts.py` 簡單路徑分解重縫，全段涵蓋 **84%→100%**、leg 98.7%→100%；幾何聯集不變（`verify_rail_geometry.py` 可重驗）、thsr byte-identical |
 | 4 | OSM 步道圖層 | 需上游 analytics 從 PBF 重抽全台 walk network（path/footway/steps/track ~19 萬邊，現有萃取只有 9 城市）；OSM 無 sac_scale 難度標籤 |
 | 5 | Cloudflare `.pmtiles` Cache Rule | **用戶手動**：dashboard 對 tiles.itsmigu.com 加 Cache Rule，否則每個 Range 請求回源（現況 cf-cache-status: DYNAMIC） |
 | 6 | Worker 逃生艙（向量瓦片） | z14 密集瓦片解碼移 Web Worker；壓測 56-84fps 暫不需要，設計 §3 有方案 |
@@ -44,6 +44,6 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 - **會動 `src/engine` 的實作棒走 git worktree 隔離**（用戶常開著自己的 dev server，HMR 會吃到中間狀態）；worktree 環境設置見 `.claude/skills/verify/SKILL.md`（tiles 為實體目錄含 bathy symlink——相對 symlink 深度不夠時用絕對路徑）
 - 驗證分級：shader/部署/跨 repo 才雙道（實作自驗+opus 終審），一般圖層煙霧測試即可；截圖抓到證據即停
 - 用戶 dev server 慣用 port 6015（`gis-up` 清單目前登記 6007，尚未改）
-- 列車資料契約：`train_tracks.json` 弧長度量=EPSG:3826 真實公尺；part key=`tra_00..36`（rail_lines 篩 tra 後的 index）；`dep_sec_of_day`=Asia/Taipei 當日秒
+- 列車資料契約：`train_tracks.json` 弧長度量=EPSG:3826 真實公尺；part key=`tra_00..30`（rail_lines 篩 tra 後的 index；2026-07-11 切段點重縫後 37→31 parts）；`dep_sec_of_day`=Asia/Taipei 當日秒；`rail_lines.json` 的 `meta.partCount/vertexCount` 已過期（無程式讀取，純資訊性）
 - 高鐵資料契約：`thsr_tracks/thsr_schedule.json` schema 同台鐵；part=`thsr_00` 南下/`thsr_01` 北上（鏡射走廊）；**方向判定=整班「起點 ratio < 終點 ratio」**（bake 的 `match_thsr_track_to_part()` 與前端 `resolveCorridorPart()` 同一套規則，改一邊必改另一邊）；時刻表源=pulse 快照 2026-02-18（212 班）
 - 圖層列格式鐵則已入 `/new-layer` skill §4b：rowLabel 嚴格「中文名 英文名」、禁動態數字、新圖層必須有 styleSchema（點層 size+opacity 起跳，範本=markers.js POINT_STYLE / trains.js TRAIN_STYLE）
