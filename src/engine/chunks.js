@@ -148,6 +148,16 @@ export class ChunkManager {
       }
     }
 
+    // dynamic tile-cache sizing (see geo.js HeightField.setMaxTiles): a fixed
+    // 300-tile cap starts evicting-and-refetching tiles still needed by live
+    // chunks once the desired set outgrows it (large View distance × zoomed
+    // out). desired.size IS the current demand — cap every LOD level's cache
+    // to it (×1.5 headroom); applying the combined total to each level is a
+    // safe over-provision (any one level's actual share is a subset), and the
+    // extra memory is cheap next to the eviction thrash it fixes.
+    const tileCap = Math.max(300, Math.ceil(desired.size * 1.5))
+    for (const hf of fields.values()) hf.setMaxTiles(tileCap)
+
     for (const [k, e] of desired) {
       const queued = this.queued.get(k)
       if (queued) {

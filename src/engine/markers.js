@@ -27,6 +27,16 @@ import { metersToWorldY, drapeAt } from './geo.js'
 const MAX_LABELS = 8
 const DOT_R = 0.14 // world units at fogScale 1 (~4–5 px on screen)
 const TAG_PX = 22 // tag height in screen pixels
+// click-to-inspect hit radius, in CSS px (see pick() below). Deliberately a
+// FIXED screen-space value, not a world-unit one scaled off dotRadius: dense
+// point sets (3,407 trail signs, ~13–90 m apart — bake_trails.py) sit close
+// enough in world units that a generous world-space tolerance would make
+// neighbouring points ambiguous, or even swallow clicks meant for the trail
+// LINE running alongside them. A small, constant pixel radius stays roughly
+// matched to the dot's own ~4–5 px apparent size (which itself already holds
+// steady across zoom via the fogScale-scaled dotRadius) regardless of how
+// close together the underlying points are in world space.
+const PICK_PX = 14
 // tag palette leans darker/opaquer than the DOM peak tags: sprites live in the
 // 3D frame, so the ACES tone map + grain wash them out a little
 const INK = '#0d0f11'
@@ -60,7 +70,16 @@ function tagTexture(name) {
   return { tex, aspect: w / h }
 }
 
-export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } = {}) {
+// point-layer styleSchema (createPointLayer's size/opacity sliders) — shape
+// mirrors polyline.js's POLYLINE_STYLE. size is a multiplier on the layer's
+// baked dotRadius (1.0 = current default); opacity feeds the dot material
+// directly (0.9 = current hardcoded default).
+const POINT_STYLE = {
+  size: { type: 'slider', label: '大小 Size', min: 0.5, max: 3.0, step: 0.05, format: (v) => v.toFixed(2) },
+  opacity: { type: 'slider', label: '不透明度 Opacity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+}
+
+export function createMarkers(params, { dotRadius = DOT_R, showLabels = true, size = 1, opacity = 0.9 } = {}) {
   const group = new THREE.Group() // master: visible only in real mode with a world
   group.visible = false
   const sets = new Map() // id → entry
@@ -69,10 +88,17 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } =
   let builtFog = 1
   let refreshAcc = 0
   let labelAcc = 0
+  // live-adjustable via createPointLayer's styleSchema (size/opacity sliders —
+  // see setSize/setOpacity below). sizeMul is a multiplier on dotRadius (1.0 =
+  // baked default); dotOpacity feeds every set's dot material directly.
+  let sizeMul = size
+  let dotOpacity = opacity
 
   const _dotGeo = new THREE.CircleGeometry(1, 24).rotateX(-Math.PI / 2)
   const _m = new THREE.Matrix4()
   const _p = new THREE.Vector3()
+  const _pickWorld = new THREE.Vector3()
+  const _pickProj = new THREE.Vector3()
 
   function pointY(pt) {
     // baked elev → exact placement; otherwise live-drape (unstreamed tiles read
@@ -85,7 +111,7 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } =
   // (re)compute world positions + instance matrices for one set
   function layout(entry) {
     if (!heightField || !entry.dots) return
-    const r = dotRadius * fogScale
+    const r = dotRadius * fogScale * sizeMul
     entry.def.points.forEach((pt, i) => {
       if (pt._x === undefined) {
         const w = heightField.projection.lonLatToWorld(pt.lon, pt.lat)
@@ -138,7 +164,7 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } =
     entry.dotMat = new THREE.MeshBasicMaterial({
       color: new THREE.Color(entry.def.color),
       transparent: true,
-      opacity: 0.9,
+      opacity: dotOpacity,
       depthTest: false, // map-symbol ink: draws over the terrain skin, never z-fights
       depthWrite: false,
       fog: true,
@@ -265,6 +291,52 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } =
     setFogScale(v) {
       fogScale = v
     },
+    // live style controls (createPointLayer's size/opacity styleSchema
+    // sliders). Both re-apply immediately across every set — no 2 s tick
+    // throttle wait — so dragging reads as instant feedback.
+    setSize(v) {
+      sizeMul = v
+      for (const entry of sets.values()) layout(entry)
+    },
+    setOpacity(v) {
+      dotOpacity = v
+      for (const entry of sets.values()) if (entry.dotMat) entry.dotMat.opacity = v
+    },
+    // click-to-inspect (opt-in — see createPointLayer's pickTitle/pickRows).
+    // No InstancedMesh raycast here: the dots are ~4–5 px on screen (DOT_R
+    // comment above), far too small to hit reliably via true ray-triangle
+    // intersection. Instead project every visible point with the raycaster's
+    // own camera (set by Raycaster.setFromCamera) and compare to the click's
+    // screen pixel (raycaster.pickPx, stashed by index.js) — see PICK_PX.
+    pick(raycaster, { pickTitle, pickRows } = {}) {
+      if (!group.visible) return null
+      const camera = raycaster.camera
+      const clickPx = raycaster.pickPx
+      if (!camera || !clickPx) return null
+      const w = window.innerWidth
+      const h = window.innerHeight
+      let best = null
+      for (const [setId, entry] of sets) {
+        if (!entry.def.visible || !entry.dots) continue
+        for (const pt of entry.def.points) {
+          if (pt._x === undefined) continue
+          _pickWorld.set(pt._x, pointY(pt) + 0.02, pt._z)
+          _pickProj.copy(_pickWorld).project(camera)
+          if (_pickProj.z < -1 || _pickProj.z > 1) continue // behind camera / clipped
+          const sx = (_pickProj.x * 0.5 + 0.5) * w
+          const sy = (-_pickProj.y * 0.5 + 0.5) * h
+          const d = Math.hypot(sx - clickPx.x, sy - clickPx.y)
+          if (d < PICK_PX && (!best || d < best.d)) best = { d, pt, setId }
+        }
+      }
+      if (!best) return null
+      const { pt, setId } = best
+      return {
+        title: (pickTitle ? pickTitle(pt, setId) : pt.name) ?? '',
+        rows: pickRows ? pickRows(pt, setId) : [['Name', pt.name ?? '']],
+        worldPos: new THREE.Vector3(pt._x, pointY(pt) + 0.02, pt._z),
+      }
+    },
   }
 }
 
@@ -292,8 +364,34 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true } =
 // same visual language as stations otherwise. dotRadius lets that dense set
 // use a smaller mark than the default DOT_R so it doesn't read as a solid
 // tube that swallows the thinner trail line drawn at the same positions.
-export function createPointLayer(params, { id = 'markers', label = 'Markers', rowLabel, onActivate, dotRadius, showLabels } = {}) {
-  const markers = createMarkers(params, { dotRadius, showLabels })
+export function createPointLayer(
+  params,
+  {
+    id = 'markers',
+    label = 'Markers',
+    rowLabel,
+    onActivate,
+    dotRadius,
+    showLabels,
+    pickTitle,
+    pickRows,
+    sizeParam,
+    opacityParam,
+    hidden = false, // omit this layer's row from the Layers panel (see Layers.jsx) — layer stays fully functional, just not panel-listed (e.g. the console-only generic 'markers' scaffold)
+  } = {}
+) {
+  // style params: explicit override (sizeParam/opacityParam) or derived from
+  // id (stations -> stationsSize/stationsOpacity) — every createPointLayer
+  // instance gets its own pair, so sharing this factory across stations/
+  // markers/trail signs never collides.
+  const sizeKey = sizeParam ?? `${id}Size`
+  const opacityKey = opacityParam ?? `${id}Opacity`
+  const markers = createMarkers(params, {
+    dotRadius,
+    showLabels,
+    size: params[sizeKey] ?? 1,
+    opacity: params[opacityKey] ?? 0.9,
+  })
   let activated = false
   return {
     id,
@@ -322,7 +420,23 @@ export function createPointLayer(params, { id = 'markers', label = 'Markers', ro
         activated = false
       })
     },
-    setStyle() {}, // per-set only
+    // size/opacity styleSchema sliders (POINT_STYLE below); no paramMap on
+    // this layer, so engine.setLayerStyle calls this directly and invalidates
+    // itself (see index.js setLayerStyle's no-paramMap branch) — per-set
+    // color/visibility stays out-of-band via setSet/pickRows, not here.
+    setStyle(patch) {
+      if (patch.size !== undefined) {
+        params[sizeKey] = patch.size
+        markers.setSize(patch.size)
+      }
+      if (patch.opacity !== undefined) {
+        params[opacityKey] = patch.opacity
+        markers.setOpacity(patch.opacity)
+      }
+    },
+    // click-to-inspect: opt-in via pickRows (stations/trail signs pass one;
+    // the generic 'markers' demo layer doesn't, so it stays unclickable).
+    ...(pickRows ? { pick: (raycaster) => markers.pick(raycaster, { pickTitle, pickRows }) } : {}),
     describe() {
       const sets = markers.listSets()
       return {
@@ -332,9 +446,13 @@ export function createPointLayer(params, { id = 'markers', label = 'Markers', ro
         rowLabel,
         count: sets.reduce((n, s) => n + s.count, 0),
         visible: sets.some((s) => s.visible),
-        styleSchema: null,
-        style: null,
+        styleSchema: POINT_STYLE,
+        style: {
+          size: params[sizeKey] ?? 1,
+          opacity: params[opacityKey] ?? 0.9,
+        },
         sets: sets.length > 0 || activated ? sets : undefined,
+        hidden,
       }
     },
     dispose() {},

@@ -13,6 +13,7 @@ const ICON_PATHS = {
   x: ['M18 6 6 18', 'm6 6 12 12'],
   play: ['m7 4 13 8-13 8V4z'],
   stop: ['M6 6h12v12H6z'],
+  chevronDown: ['m6 9 6 6 6-6'],
 }
 
 export function Icon({ name, size = 20, color = 'currentColor', strokeWidth = 1.7 }) {
@@ -60,8 +61,21 @@ export function Row({ label, children, onClick, active }) {
         background: active ? T.rowActive : 'transparent',
       }}
     >
-      <span style={{ fontFamily: FONT_CJK, fontSize: T.fs.md, color: T.textDefault, whiteSpace: 'nowrap' }}>{label}</span>
-      {children}
+      <span
+        title={label}
+        style={{
+          fontFamily: FONT_CJK,
+          fontSize: T.fs.md,
+          color: T.textDefault,
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          minWidth: 0,
+        }}
+      >
+        {label}
+      </span>
+      <span style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>{children}</span>
     </div>
   )
 }

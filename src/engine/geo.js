@@ -19,12 +19,17 @@ const K_ANCHOR_UNITS = 56 // legacy TERRAIN_SIZE
 
 // Coverage of the self-hosted tile set. No tile requests happen outside this
 // box (it's all open sea / 404s) and the pan clamp keeps the target inside it.
-export const TAIWAN_BBOX = { minLon: 119.9, maxLon: 122.1, minLat: 21.8, maxLat: 25.4 }
+export const TAIWAN_BBOX = { minLon: 117.8, maxLon: 123.5, minLat: 21.0, maxLat: 26.5 }
 
 // Fixed island-wide elevation range: the hypsometric ramp and vertex tint must
 // normalize against ONE range or chunks built at different times would color
 // differently (a visible seam). Sea level → Yushan.
-const TAIWAN_MIN_M = 0
+// GEBCO 2025 bathymetry (baked into the tiles alongside the NLSC land DTM —
+// see docs/BATHYMETRY_DESIGN.md §1): the Taiwan bbox bottoms out ~-6788 m
+// (measured). -7000 gives a safety margin so bilinear resampling across tile
+// borders can never dip below the encoded floor (avoids the hn<0 →
+// pow(negative) NaN case terrain.js used to clamp against — see addChunk).
+const TAIWAN_SEA_MIN_M = -7000
 const TAIWAN_MAX_M = 3952
 
 const lonToTileX = (lon, n) => Math.floor(((lon + 180) / 360) * n)
@@ -90,13 +95,17 @@ export class HeightField {
   constructor(projection, { maxTiles = 300 } = {}) {
     this.projection = projection
     this.zoom = projection.zoom
-    this.maxTiles = maxTiles // ~300 × 256² × 4B ≈ 75 MB ceiling
+    this.maxTiles = maxTiles // ~300 × 256² × 4B ≈ 75 MB ceiling; initial floor — see setMaxTiles
     // key "tx,ty" → { data: Float32Array | null, mean } — null = open sea (0 m).
     // Map insertion order doubles as the LRU order; ensureTiles re-inserts to touch.
     this.tiles = new Map()
     this.pending = new Map() // key → in-flight fetch promise (dedupes requests)
     this.datumM = 0 // vertical datum (meters), frozen once at initial load
-    this.minM = TAIWAN_MIN_M
+    // fixed island-wide range for hypsometric tint/ramp normalization — always
+    // spans the full sea-floor-to-summit domain now that tiles always carry
+    // real GEBCO depth (terrain.js's bathymetry toggle switches SHADING only,
+    // never this; see terrain.js applyBathymetryShading)
+    this.minM = TAIWAN_SEA_MIN_M
     this.maxM = TAIWAN_MAX_M
     this.stats = { fetched: 0, sea: 0, hit: 0, miss: 0, evicted: 0 }
     const n = 2 ** this.zoom
@@ -218,10 +227,26 @@ export class HeightField {
     this.tiles.set(k, { data, mean })
     this._mtx = NaN
     this._mtile = null
+    this._evictToCap()
+  }
+
+  _evictToCap() {
     while (this.tiles.size > this.maxTiles) {
       this.tiles.delete(this.tiles.keys().next().value)
       this.stats.evicted++
     }
+  }
+
+  // Dynamic cap: chunks.js recomputes this from the actual desired chunk
+  // count every ~200ms recompute tick (view distance/fogFar/zoom all fold
+  // into that number already) and pushes it here — a fixed 300-tile cap was
+  // sized for the original streaming radius and started evicting tiles out
+  // from under still-visible chunks once View distance ~2.5× pushed the
+  // desired set past it (eviction/re-fetch thrash). Raising the cap never
+  // evicts; only shrinking it does.
+  setMaxTiles(n) {
+    this.maxTiles = n
+    this._evictToCap()
   }
 
   // Freeze the vertical datum off whatever is cached right now (the initial

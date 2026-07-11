@@ -7,6 +7,11 @@ export const BASIN_RADIUS = 6.6 // flat excavation floor
 export const BASIN_BLEND = 9.0 // where flat floor blends back into mountains
 export const FLOOR_Y = -0.35
 
+// ramp-texture coordinate 0 m (sea level) is pinned to when bathymetry shading
+// is on (see rebuildRamp / applyBathymetryShading below) — sea occupies
+// [0, SEA_RAMP_SPLIT] of the ramp, land [SEA_RAMP_SPLIT, 1]
+const SEA_RAMP_SPLIT = 0.35
+
 // CPU-generated terrain: multi-scale FBM + ridged multifractal + domain warping,
 // with real vertex normals so PBR lighting and DOF read the actual relief.
 export class Terrain {
@@ -28,6 +33,12 @@ export class Terrain {
       uGridStep: { value: params.gridStep },
       uGridOpacity: { value: params.gridOpacity },
       uHeightRange: { value: new THREE.Vector2(-0.5, 2) },
+      // bathymetry two-stage ramp remap (see the fragment shader below):
+      // uSeaLevelY is world-Y for 0 m; uSeaSplit is the ramp coordinate it's
+      // pinned to. uSeaSplit 0 collapses the remap to the original
+      // single-stage formula exactly — applyBathymetryShading sets both.
+      uSeaLevelY: { value: 0 },
+      uSeaSplit: { value: 0 },
       uRampTex: { value: null },
       uHeightContrast: { value: params.heightContrast },
       uHeightPivot: { value: params.heightPivot },
@@ -51,6 +62,18 @@ export class Terrain {
       uRiverBounds: { value: new THREE.Vector4(0, 0, 0, 0) },
       uRiverSimOpacity: { value: 0 },
       uRiverSimColor: { value: new THREE.Color(params.riversColor) },
+      // physics-derived farmland-presence bake (scripts/bake_farm_sim.py) —
+      // same shader-drape pattern as the river sim above: uFarmTex holds a
+      // binary presence mask (scripts/bake_farm_sim.py), uFarmBounds is that
+      // bake's own world-XZ footprint (NOT the same numeric bounds as the
+      // river bake — different source dataset — but the same tile-pixel grid
+      // convention, so the UV math is identical code). uFarmOpacity 0 = layer
+      // off (branch skipped, uFarmTex never sampled — zero cost while hidden).
+      // An INDEPENDENT overlay (agriculture, not hydrology) — own toggle/color.
+      uFarmTex: { value: null },
+      uFarmBounds: { value: new THREE.Vector4(0, 0, 0, 0) },
+      uFarmOpacity: { value: 0 },
+      uFarmColor: { value: new THREE.Color(params.farmColor) },
     }
     this.rebuildRamp(params)
     this.material.onBeforeCompile = (shader) => {
@@ -92,6 +115,8 @@ uniform float uContourOpacity;
 uniform float uGridStep;
 uniform float uGridOpacity;
 uniform vec2 uHeightRange;
+uniform float uSeaLevelY;
+uniform float uSeaSplit;
 uniform sampler2D uRampTex;
 uniform float uHeightContrast;
 uniform float uHeightPivot;
@@ -106,15 +131,42 @@ uniform float uScanBlur;
 uniform sampler2D uRiverTex;
 uniform vec4 uRiverBounds;
 uniform float uRiverSimOpacity;
-uniform vec3 uRiverSimColor;`
+uniform vec3 uRiverSimColor;
+uniform sampler2D uFarmTex;
+uniform vec4 uFarmBounds;
+uniform float uFarmOpacity;
+uniform vec3 uFarmColor;`
         )
         .replace(
           '#include <color_fragment>',
           `#include <color_fragment>
 {
-  // --- hypsometric tint: user gradient sampled by height, contrast expanded around a pivot
-  float hNorm = clamp((vWorldPos.y - uHeightRange.x) / max(uHeightRange.y - uHeightRange.x, 1e-4), 0.0, 1.0);
-  float rampT = clamp(0.5 + (hNorm - uHeightPivot) * uHeightContrast, 0.0, 1.0);
+  // --- hypsometric tint: two-stage remap so bathymetry gets its own ramp
+  // budget without disturbing the land gradient's contrast. uSeaLevelY is
+  // world-Y for 0 m; uSeaSplit is the ramp coordinate 0 m is pinned to (0 when
+  // bathymetry shading is off — see rebuildRamp/applyBathymetryShading —
+  // which collapses this exactly to the original single-stage formula: the
+  // land branch's hNorm/rampT below is bit-identical to the pre-bathymetry
+  // code once uHeightRange.x == uSeaLevelY).
+  float rampT;
+  if (vWorldPos.y < uSeaLevelY) {
+    // below sea level: [sea floor, sea level] into [0, uSeaSplit]. Real
+    // continental-shelf depths (Taiwan Strait/Penghu channel, tens of metres)
+    // are a tiny sliver of the full -7000 m domain and would read as almost
+    // pure white on a linear scale — gamma-expand so shallow water gets its
+    // own visible pale-blue band (same pow<1 boost the land vertex tint uses
+    // for pow(hn, 0.85) — brightens/spreads out the low end).
+    float seaT = clamp((vWorldPos.y - uHeightRange.x) / max(uSeaLevelY - uHeightRange.x, 1e-4), 0.0, 1.0);
+    float depthT = pow(1.0 - seaT, 0.4);
+    rampT = (1.0 - depthT) * uSeaSplit;
+  } else {
+    // at/above sea level: the ORIGINAL hNorm/contrast/pivot formula across
+    // [sea level, summit], rescaled into [uSeaSplit, 1] — same land colors,
+    // just budgeted a smaller slice of the ramp texture
+    float hNorm = clamp((vWorldPos.y - uSeaLevelY) / max(uHeightRange.y - uSeaLevelY, 1e-4), 0.0, 1.0);
+    float landT = clamp(0.5 + (hNorm - uHeightPivot) * uHeightContrast, 0.0, 1.0);
+    rampT = uSeaSplit + landT * (1.0 - uSeaSplit);
+  }
   vec3 ramp = texture2D(uRampTex, vec2(rampT, 0.5)).rgb;
   // smooth interpolated normal (world space) — screen-space derivatives look blotchy
   vec3 wN = inverseTransformDirection(normalize(vNormal), viewMatrix);
@@ -138,6 +190,24 @@ uniform vec3 uRiverSimColor;`
       float rInt = texture2D(uRiverTex, ruv).r;
       float rw = smoothstep(0.02, 0.20, rInt) * uRiverSimOpacity;
       diffuseColor.rgb = mix(diffuseColor.rgb, uRiverSimColor, clamp(rw, 0.0, 0.95));
+    }
+  }
+
+  // --- farmland-presence tint: sample the binary farm-field bake in its own
+  // footprint and paint the plains green. Gated by uFarmOpacity (0 → branch
+  // skipped, uFarmTex never sampled) and by the world-XZ bounds; the bake is a
+  // hard 0/255 mask but LinearFilter interpolation gives soft texel edges, so
+  // a narrow smoothstep around the mid-point antialiases the field boundary
+  // instead of a hard-edged rectangle grid.
+  if (uFarmOpacity > 0.0) {
+    vec2 fmin = uFarmBounds.xy;
+    vec2 fmax = uFarmBounds.zw;
+    if (vWorldPos.x >= fmin.x && vWorldPos.x <= fmax.x && vWorldPos.z >= fmin.y && vWorldPos.z <= fmax.y) {
+      vec2 fuv = vec2((vWorldPos.x - fmin.x) / max(fmax.x - fmin.x, 1e-4),
+                      (vWorldPos.z - fmin.y) / max(fmax.y - fmin.y, 1e-4));
+      float fInt = texture2D(uFarmTex, fuv).r;
+      float fw = smoothstep(0.3, 0.6, fInt) * uFarmOpacity;
+      diffuseColor.rgb = mix(diffuseColor.rgb, uFarmColor, clamp(fw, 0.0, 0.95));
     }
   }
 
@@ -346,9 +416,12 @@ if (uScanT >= 0.0) {
   // must normalize hypsometric tint identically or borders would seam.
   _prepareChunkShading(params) {
     const hf = this.heightField
+    // permanent extended domain (sea floor → summit) — baked into every
+    // chunk's vertex tint below the instant it's built, independent of the
+    // bathymetry toggle (vertex colors can't un-bake on a later toggle flip)
     const minH = metersToWorldY(hf, hf.minM, params.demExaggeration)
     const maxH = metersToWorldY(hf, hf.maxM, params.demExaggeration)
-    this.mapUniforms.uHeightRange.value.set(minH, maxH)
+    this.applyBathymetryShading(params) // toggle-aware uHeightRange/uSeaLevelY/uSeaSplit + ramp
     // P2: one sampler per LOD zoom — a chunk built at zoom z reads z's tile
     // pyramid level (this.sample stays the primary-zoom sampler for labels,
     // peaks and tours)
@@ -362,6 +435,29 @@ if (uScanT >= 0.0) {
       span: Math.max(1e-5, maxH - minH),
       sTint: new Simplex2(mulberry32(params.seed + 101)),
     }
+  }
+
+  // Toggle-aware ramp/height-range for the ocean band (index.js's
+  // bathymetryVisible switch calls this directly — no chunk rebuild, no
+  // re-fetch, just a uniform + canvas-texture swap, per
+  // docs/BATHYMETRY_DESIGN.md §2.6). hf.minM/maxM are the PERMANENT extended
+  // domain (see _prepareChunkShading above) — this method only decides how
+  // much of that domain the ramp texture treats as "ocean" vs "land". With
+  // bathymetryVisible false, uHeightRange.x collapses to sea level and
+  // uSeaSplit to 0, which makes the fragment shader's two-stage remap exactly
+  // reproduce the original pre-bathymetry single-stage formula.
+  applyBathymetryShading(params) {
+    const hf = this.heightField
+    if (!hf) return
+    const exagg = params.demExaggeration
+    const seaLevelY = metersToWorldY(hf, 0, exagg)
+    const maxY = metersToWorldY(hf, hf.maxM, exagg)
+    const on = params.source === 'real' && !!params.bathymetryVisible
+    const seaMinY = on ? metersToWorldY(hf, hf.minM, exagg) : seaLevelY
+    this.mapUniforms.uHeightRange.value.set(seaMinY, maxY)
+    this.mapUniforms.uSeaLevelY.value = seaLevelY
+    this.mapUniforms.uSeaSplit.value = on ? SEA_RAMP_SPLIT : 0
+    this.rebuildRamp(params)
   }
 
   // Build one chunk mesh for map tile (tx, ty) at `zoom` with a res² grid.
@@ -412,10 +508,14 @@ if (uScanT >= 0.0) {
         normals[i * 3 + 2] = nz * inv
 
         // vertex tint: height-graded value + slope darkening + grain jitter
-        // (world-coherent, so it too runs continuously across chunks).
-        // hn clamped ≥ 0: coastal DEM data dips a few meters BELOW the fixed
-        // 0 m floor, and pow(negative, 0.85) is NaN → black fog-proof shards.
-        const hn = Math.max(0, (h - minH) / span)
+        // (world-coherent, so it too runs continuously across chunks). minH
+        // now extends down to the GEBCO sea floor (geo.js TAIWAN_SEA_MIN_M),
+        // so real depths land naturally in [0,1] — no clamp needed (the old
+        // Math.max(0,…) papered over coastal DEM data dipping a few meters
+        // BELOW the then-fixed 0 m floor; pow(negative, 0.85) is NaN → black
+        // fog-proof shards. That floor is now a safely-buffered -7000 m, well
+        // below any real sample, so the underflow this guarded against can't happen).
+        const hn = (h - minH) / span
         let v = lerp(0.62, 0.95, Math.pow(hn, 0.85))
         v *= lerp(0.78, 1.0, Math.pow(Math.max(0, normals[i * 3 + 1]), 0.6))
         v += fbm(sTint, wx * 1.7, wz * 1.7, 2, 2.2, 0.5) * 0.05
@@ -555,22 +655,54 @@ if (uScanT >= 0.0) {
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3))
 
     this.mapUniforms.uHeightRange.value.set(minH, maxH)
+    // procedural: no bathymetry concept — collapse the fragment shader's
+    // two-stage remap to a no-op (uSeaSplit 0 = pure land, single-stage,
+    // exactly like before this feature existed) and keep the ramp canvas in
+    // sync (no ocean band) in case a bathymetry-ON real session ran earlier
+    this.mapUniforms.uSeaLevelY.value = minH
+    this.mapUniforms.uSeaSplit.value = 0
+    this.rebuildRamp(params)
 
     this.mesh.geometry.dispose()
     this.mesh.geometry = geo
   }
 
-  // Bake the 4-stop elevation gradient into a 1D ramp texture the shader samples.
+  // Bake the elevation gradient into a 1D ramp texture the shader samples.
+  // With bathymetry shading on, the canvas gets an extra ocean band in
+  // [0, SEA_RAMP_SPLIT] and the same 4 land stops are rescaled into
+  // [SEA_RAMP_SPLIT, 1] — same land colors at the same RELATIVE positions, so
+  // sampling them (via the fragment shader's rescaled landT, see above) gives
+  // the identical color the classic layout gave at that land-relative
+  // position. Off (or procedural — see applyBathymetryShading/
+  // _rebuildSinglePlane), it's the original 4-stop gradient spanning the
+  // whole canvas, unchanged.
   rebuildRamp(params) {
     const c = document.createElement('canvas')
     c.width = 256
     c.height = 1
     const ctx = c.getContext('2d')
     const grad = ctx.createLinearGradient(0, 0, 256, 0)
-    grad.addColorStop(0, params.gradLow)
-    grad.addColorStop(THREE.MathUtils.clamp(params.gradMid1Pos, 0.01, 0.98), params.gradMid1)
-    grad.addColorStop(THREE.MathUtils.clamp(params.gradMid2Pos, 0.02, 0.99), params.gradMid2)
-    grad.addColorStop(1, params.gradHigh)
+    const bathyOn = params.source === 'real' && !!params.bathymetryVisible
+    if (bathyOn) {
+      const toRamp = (t) => SEA_RAMP_SPLIT + t * (1 - SEA_RAMP_SPLIT)
+      grad.addColorStop(0, params.bathyDeepColor)
+      grad.addColorStop(SEA_RAMP_SPLIT * 0.55, params.bathyShallowColor)
+      // coastal band: the fragment shader's depthT = (-depth/7000)^0.4 remap
+      // means rampT 0.9×SEA_RAMP_SPLIT is only ~-22 m (solve depthT=0.1) — a
+      // deliberately narrow sliver right next to the 0 m pin below, so this
+      // pale-green stop reads as a coastline ring, not a wash over the whole
+      // bathyShallowColor band further out to sea.
+      grad.addColorStop(SEA_RAMP_SPLIT * 0.9, params.bathyCoastColor)
+      grad.addColorStop(SEA_RAMP_SPLIT, params.gradLow) // 0 m pin — shoreline hands off to the land ramp's own start color, so the seam is seamless
+      grad.addColorStop(toRamp(THREE.MathUtils.clamp(params.gradMid1Pos, 0.01, 0.98)), params.gradMid1)
+      grad.addColorStop(toRamp(THREE.MathUtils.clamp(params.gradMid2Pos, 0.02, 0.99)), params.gradMid2)
+      grad.addColorStop(1, params.gradHigh)
+    } else {
+      grad.addColorStop(0, params.gradLow)
+      grad.addColorStop(THREE.MathUtils.clamp(params.gradMid1Pos, 0.01, 0.98), params.gradMid1)
+      grad.addColorStop(THREE.MathUtils.clamp(params.gradMid2Pos, 0.02, 0.99), params.gradMid2)
+      grad.addColorStop(1, params.gradHigh)
+    }
     ctx.fillStyle = grad
     ctx.fillRect(0, 0, 256, 1)
     const tex = new THREE.CanvasTexture(c)

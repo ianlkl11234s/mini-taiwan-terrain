@@ -49,6 +49,12 @@ function createPolylineLayer(config, params) {
   // paramMap.color swatch — official rail-line colors, not user-tintable.
   let polylines = config.polylines ?? []
   let lineColors = config.lineColors ?? null
+  // pick support (draped only, opt-in via config.pickRows — see trails below):
+  // one metadata object per polyline (parallel to `polylines`), fed alongside
+  // it via setData's 3rd arg. segLine maps a baked SEGMENT index back to its
+  // source polyline index — the merged LineSegmentsGeometry has no other way
+  // to recover "which trail was this" once everything is one draw call.
+  let lineMeta = config.lineMeta ?? null
 
   const material = new LineMaterial({
     color: new THREE.Color(paramMap.color ? params[paramMap.color] : 0xffffff),
@@ -78,6 +84,7 @@ function createPolylineLayer(config, params) {
   let seg = null
   let elev = null
   let col = null
+  let segLine = null // Int32Array, one entry per segment → source polyline index (pick only)
   let nSeg = 0
   let geomInit = false
   let lastVScale = NaN
@@ -87,6 +94,7 @@ function createPolylineLayer(config, params) {
     seg = new Float32Array(nSeg * 6)
     elev = new Float32Array(nSeg * 2)
     col = lineColors ? new Float32Array(nSeg * 6) : null
+    segLine = lineMeta ? new Int32Array(nSeg) : null
     const c = new THREE.Color()
     let s = 0
     for (let li = 0; li < polylines.length; li++) {
@@ -109,6 +117,7 @@ function createPolylineLayer(config, params) {
           col[s * 6 + 4] = c.g
           col[s * 6 + 5] = c.b
         }
+        if (segLine) segLine[s] = li
         s++
       }
     }
@@ -227,13 +236,18 @@ function createPolylineLayer(config, params) {
     // draped only: (re)supply the polylines once deferred data has fetched —
     // resets the baked buffers so the next update()/ensureBuilt rebakes from
     // scratch. Vertex colors (one hex per polyline) rebake alongside.
-    setData(newPolylines, newLineColors = null) {
+    // newLineMeta (opt-in — see config.pickRows): one metadata object per
+    // polyline, parallel to newPolylines, kept for pick()'s segment→line
+    // lookup; layers that don't pick (rail, counties) never pass it.
+    setData(newPolylines, newLineColors = null, newLineMeta = null) {
       polylines = newPolylines ?? []
       lineColors = newLineColors
+      lineMeta = newLineMeta
       pointCount = computePointCount()
       seg = null
       elev = null
       col = null
+      segLine = null
       nSeg = 0
       geomInit = false
       lastVScale = NaN
@@ -244,6 +258,29 @@ function createPolylineLayer(config, params) {
       object3d.geometry.dispose()
       object3d.geometry = new LineSegmentsGeometry()
     },
+
+    // click-to-inspect (draped only, opt-in — see config.pickRows/pickTitle on
+    // trails below). Reuses LineSegments2's own screen-space raycast (the
+    // engine pre-sets raycaster.params.Line2.threshold once, in index.js) —
+    // faceIndex on a hit is the segment index into the merged geometry, which
+    // segLine maps back to the source polyline for its metadata row.
+    ...(config.pickRows
+      ? {
+          pick(raycaster) {
+            if (!object3d.visible || !nSeg) return null
+            const hits = raycaster.intersectObject(object3d, false)
+            if (!hits.length) return null
+            const li = segLine ? segLine[hits[0].faceIndex] : -1
+            const meta = lineMeta && li >= 0 ? lineMeta[li] : null
+            if (!meta) return null
+            return {
+              title: config.pickTitle ? config.pickTitle(meta) : meta.name,
+              rows: config.pickRows(meta),
+              worldPos: hits[0].point.clone(),
+            }
+          },
+        }
+      : {}),
 
     describe() {
       return {
@@ -277,20 +314,34 @@ const POLYLINE_STYLE = (widthMax) => ({
 
 // Taiwan main-island coastline: one closed sea-level ring (county boundaries
 // unioned, largest polygon's exterior, simplified to 100 m — 1,289 points).
+// Rendered in 'draped' mode (LineSegments2, one baked elevation of 0 per
+// vertex) rather than 'flat' Line2 — not because the ring needs draping (it's
+// still a flat sea-level plane), but so the outlying-island rings (Penghu /
+// Kinmen / Matsu / China coast / Taiwan's own outlying islands —
+// public/layers/coastlines_extended.json) can share the SAME draw call and
+// the SAME toggle: draped mode's LineSegmentsGeometry holds any number of
+// disjoint polylines, unlike flat mode's Line2 (one single continuous line —
+// concatenating disjoint rings into it would draw stray connecting segments
+// between them). The extension rings are merged in lazily (see index.js
+// loadCoastlineExtendedData) via setExtraRings(), which rebakes setData()
+// with [mainRing, ...extraRings] — no separate layer, no separate toggle.
 export function createCoastlineLayer(params) {
-  return createPolylineLayer(
+  const mainRing = RING.map(([lon, lat]) => [lon, lat, 0])
+  const layer = createPolylineLayer(
     {
       id: 'coastline',
       label: 'Coastline',
       rowLabel: '海岸線 Coastline',
-      mode: 'flat',
-      polylines: RING,
+      mode: 'draped',
+      polylines: [mainRing],
       liftBase: 0.03,
       paramMap: { visible: 'coastline', color: 'coastlineColor', width: 'coastlineWidth', opacity: 'coastlineOpacity' },
       styleSchema: POLYLINE_STYLE(8),
     },
     params
   )
+  layer.setExtraRings = (extraRings) => layer.setData([mainRing, ...extraRings])
+  return layer
 }
 
 // County borders: the main island's INTERNAL county boundaries (33 polylines,
@@ -359,6 +410,44 @@ export function createTrailsLayer(params) {
       liftBase: 0.05,
       paramMap: { visible: 'trailsVisible', color: 'trailsColor', width: 'trailsWidth', opacity: 'trailsOpacity' },
       styleSchema: POLYLINE_STYLE(6),
+      // click-to-inspect (see index.js loadTrailsData, which feeds the 3rd
+      // setData arg with one {name,county,lengthKm,ascentM} per trail)
+      pickTitle: (meta) => meta.name,
+      pickRows: (meta) => [
+        ['步道 Trail', meta.name || '—'],
+        ['縣市 County', meta.county || '—'],
+        ['長度 Length', `${meta.lengthKm.toFixed(2)} km`],
+        ['爬升 Ascent', `${meta.ascentM} m`],
+      ],
+    },
+    params
+  )
+}
+
+// Irrigation canals: manifest-driven deferred layer (see index.js) — registers
+// empty at startup and is fed real polylines via setData() once
+// public/layers/irrigation.json has been fetched (first time the layer is
+// switched on). The bake's color lives at data.meta.color (ONE value for the
+// whole network, not per-canal) — same single paramMap.color swatch as
+// trails (no lineColors array passed to setData).
+export function createIrrigationLayer(params) {
+  return createPolylineLayer(
+    {
+      id: 'irrigation',
+      label: 'Irrigation',
+      rowLabel: '灌溉渠道 Irrigation',
+      mode: 'draped',
+      polylines: [],
+      liftBase: 0.05,
+      paramMap: { visible: 'irrigationVisible', color: 'irrigationColor', width: 'irrigationWidth', opacity: 'irrigationOpacity' },
+      styleSchema: POLYLINE_STYLE(6),
+      // click-to-inspect (see index.js loadIrrigationData, which feeds the 3rd
+      // setData arg with one {name,office} per canal)
+      pickTitle: (meta) => meta.name,
+      pickRows: (meta) => [
+        ['渠道 Canal', meta.name || '—'],
+        ['管理處 Office', meta.office || '—'],
+      ],
     },
     params
   )

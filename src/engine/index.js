@@ -1,19 +1,24 @@
 import * as THREE from 'three'
 import { Terrain } from './terrain.js'
 import { LayerManager } from './layers.js'
-import { createCoastlineLayer, createCountiesLayer, createRailLayer, createTrailsLayer, createRiversLayer } from './polyline.js'
+import { createCoastlineLayer, createCountiesLayer, createRailLayer, createTrailsLayer, createRiversLayer, createIrrigationLayer } from './polyline.js'
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
+import { createTrainsLayer } from './trains.js'
+import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
+import { createOsmRoadsLayer, createFtwFieldsLayer } from './vectortiles.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
-import { makeProjection, HeightField, TAIWAN_BBOX } from './geo.js'
+import * as timeStore from '../state/timeStore.js'
+import { makeProjection, HeightField, TAIWAN_BBOX, worldYScale, metersToWorldY } from './geo.js'
 import { ChunkManager } from './chunks.js'
 import { findRealPeaks } from './peaks.js'
-import { createStage, LOD_MIN, LOD_MAX } from './scene.js'
+import { createStage, LOD_MIN, LOD_MAX, LOD_D0 } from './scene.js'
 import { createMotion } from './tour.js'
+import { createFollow } from './follow.js'
 import { createKeyPan } from './keypan.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
@@ -25,7 +30,11 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 //   - createEngine({ container, params }) → engine
 //   - engine.setParams(patch) / getParams()  — parameter dispatch table
 //   - engine.flyTo / startTour / stopTour / selectPoi / deselect / triggerScan
-//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params'
+//   - engine.followEntity(layerId, entityId) / stopFollow() — camera follow
+//     (src/engine/follow.js, docs/FOLLOW_CAMERA_DESIGN.md); a layer opts in by
+//     implementing getEntityPosition(entityId) and returning `followable:
+//     {layerId, entityId}` from its pick() payload (see trains.js)
+//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params' 'follow'
 // UI never reaches into scene internals; debug/verify scripts use engine.debug.
 
 // Taiwan presets: [lat, lon, zoom]. P1: one streamed world locked to z12 —
@@ -49,7 +58,12 @@ export const DEFAULT_PARAMS = {
   demLat: 23.47,
   demLon: 120.9575,
   demZoom: 12,
-  demExaggeration: 1.6,
+  // real-world scale by default: horizontal and vertical share ONE world
+  // unit (≈ 480.78 m — see geo.js's K_ANCHOR comment) — 2026-07-11 user-
+  // specified default (docs/MARINE_DESIGN.md §0, was 1.6/exaggerated). The
+  // Settings 垂直放大 slider (0.5–5) still goes up to the old look, one drag
+  // away — this default only changes what loads on boot.
+  demExaggeration: 1.0,
   chunkRes: 128, // per-chunk grid density (real mode; 25 chunks share it)
   detailBias: 0, // 0|1 — lifts the distance-LOD ladder one zoom (Settings 精緻度; read by scene.tickView)
   outerChunkRes: 64, // grid density for outer LOD-ring chunks (64 標準/高, 128 超高)
@@ -91,6 +105,22 @@ export const DEFAULT_PARAMS = {
   gradHigh: '#ffa861',
   gradMid1Pos: 0.35,
   gradMid2Pos: 0.36,
+  // bathymetry: z10-13 tiles always carry real GEBCO depth now (see
+  // docs/BATHYMETRY_DESIGN.md) — this toggle only switches SHADING (ramp +
+  // uHeightRange/uSeaLevelY/uSeaSplit + the region sea plane's opacity, see
+  // terrain.js applyBathymetryShading / index.js's bathymetryVisible HANDLER).
+  // No re-fetch, no chunk rebuild. Default ON (2026-07-11 user default) —
+  // open ocean shows the (white-shaded) seafloor relief immediately on load;
+  // land rendering is unaffected either way since depth is baked into the
+  // mesh regardless of this toggle. See regionSeaOpacity below: its default
+  // is kept in sync with what this toggle's HANDLER would set, so boot state
+  // matches post-toggle state without needing to flip it once.
+  bathymetryVisible: true,
+  bathyDeepColor: '#0b1f36',
+  bathyShallowColor: '#4a90c2',
+  // very pale green coastal band (~0 to -15~-25 m) between bathyShallowColor
+  // and the 0 m shoreline handoff — see terrain.js rebuildRamp
+  bathyCoastColor: '#d8e8cf',
   slopeTint: 0.5,
   contourInterval: 0.11,
   contourOpacity: 1,
@@ -115,6 +145,51 @@ export const DEFAULT_PARAMS = {
   railVisible: false,
   railWidth: 2,
   railOpacity: 0.9,
+  // trains: manifest-driven deferred layer — real TRA (台鐵) timetable (992
+  // trains, scripts/bake_trains.py) animated as light dots gliding along the
+  // rail_lines.json tra polylines, driven by the timeline's time store (see
+  // src/state/timeStore.js, docs/TIMELINE_DESIGN.md) instead of the live wall
+  // clock. Default off; toggling it on keeps the render loop non-idle
+  // (isAnimating), same as typhoon, but only while the timeline is ALSO
+  // playing (see isAnimating() below) — positions only advance when
+  // timeStore.getPlaying() is true.
+  trainsVisible: false,
+  trainsColor: '#ffcf40',
+  trainsSize: 1.0,
+  trainsOpacity: 0.95,
+  // thsr: second createTrainsLayer instance (src/engine/trains.js — the
+  // factory is parametrized by id/rowLabel/railNetwork/maxInstances/
+  // singleCorridor) — same manifest-driven deferred + timeline-clock pattern
+  // as trains above, fed thsr_tracks.json/thsr_schedule.json (212 trains,
+  // scripts/bake_trains.py's bake_thsr()) filtered to rail_lines.json's
+  // system=='thsr' polylines instead of 'tra'. THSR orange keeps it visually
+  // distinct from TRA's yellow at a glance.
+  thsrVisible: false,
+  thsrColor: '#ff7f2a',
+  thsrSize: 1.0,
+  thsrOpacity: 0.95,
+  // ships: AIS-tracked light dots (src/engine/ships.js) — a third timeline-
+  // driven track layer alongside trains/thsr, but keyed on absolute unix-
+  // epoch seconds (one calendar day's real trail) instead of a daily-
+  // repeating schedule. Deferred: first switch-on loads the current
+  // timeline date's trails (CDN snapshot → RPC fallback) and subscribes to
+  // future date changes — see docs/MARINE_DESIGN.md §1.2 and the
+  // shipsVisible HANDLER below. Navy-blue default keeps it visually distinct
+  // from TRA yellow / THSR orange.
+  shipsVisible: false,
+  shipsColor: '#3a6ea5',
+  shipsSize: 1.0,
+  shipsOpacity: 0.95,
+  // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
+  // — NOT a manifest-driven JSON fetch like rail/trails; the manager
+  // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
+  // osm_road_drive.pmtiles archive as the camera pans, only once switched on.
+  // Phase 2: highway-class width/color buckets baked per-class into
+  // vertexColors (see vectortiles.js ROAD_STYLE) — no single color swatch;
+  // width/opacity stay as global multipliers on top of the buckets.
+  osmRoadsVisible: false,
+  osmRoadsWidth: 1.5,
+  osmRoadsOpacity: 0.85,
   // trails: manifest-driven deferred layer (public/layers/trails.json, fetched
   // on first trailsVisible:true), same fail-quiet pattern as rail. Every trail
   // shares one baked color (see polyline.js createTrailsLayer) so — unlike
@@ -123,6 +198,15 @@ export const DEFAULT_PARAMS = {
   trailsWidth: 2,
   trailsOpacity: 0.9,
   trailsColor: '#5a8f3d',
+  // point-layer styleSchema defaults (markers.js createPointLayer's size/
+  // opacity sliders — POINT_STYLE). Key names are derived from each layer's
+  // id (${id}Size/${id}Opacity — see createPointLayer). 1.0/0.9 match the
+  // hardcoded pre-slider defaults (DOT_R multiplier / dot material opacity),
+  // so adding these sliders is a no-op on first load.
+  stationsSize: 1.0,
+  stationsOpacity: 0.9,
+  markersSize: 1.0,
+  markersOpacity: 0.9,
   // rivers: the river layer's BODY is a physics-derived flow-accumulation tint
   // painted into the terrain shader (terrain.js uRiverTex, whole-island bake
   // public/layers/river_sim.png — the retired vector centerlines are gone). ONE
@@ -144,16 +228,58 @@ export const DEFAULT_PARAMS = {
   reservoirsRatio: 100,
   reservoirsOpacity: 0.55,
   reservoirsColor: '#2f8fd0',
+  // farm: whole-island physics-derived farmland-presence tint painted into
+  // the terrain shader (terrain.js uFarmTex, bake public/layers/farm_sim.png)
+  // — same shader-drape mechanism as the river sim, but an INDEPENDENT layer
+  // (farmland is agriculture, not hydrology — see loadFarmSim/applyFarmSim
+  // below and the farm_sim LayerManager entry). 農田濃度 drives uFarmOpacity;
+  // farmColor drives uFarmColor (Chianan Plain green).
+  farmVisible: false,
+  farmOpacity: 0.7,
+  farmColor: '#7a9e4f',
+  // irrigation: manifest-driven deferred polyline layer (public/layers/irrigation.json,
+  // fetched on first irrigationVisible:true), same deferred pattern as trails.
+  // Every canal shares ONE baked color (data.meta.color — see loadIrrigationData
+  // / polyline.js createIrrigationLayer), so — like trails — there IS a single
+  // color param (not per-line vertexColors like rail).
+  irrigationVisible: false,
+  irrigationWidth: 1.5,
+  irrigationOpacity: 0.85,
+  irrigationColor: '#3d7a9e',
+  // ftw fields: PMTiles-streamed vector-tile POLYGON layer (docs/VECTOR_TILES_DESIGN.md
+  // Phase 3) — same streamed-not-manifest pattern as osmRoadsVisible above, but
+  // triangulated farmland parcels instead of lines (see vectortiles.js
+  // createFtwFieldsLayer). A near-field, per-parcel-clickable companion to the
+  // farmVisible whole-island tint above — NOT a replacement for it (see the
+  // layer's own rowLabel/describe for the distinction). Fill color is fixed
+  // (design §4); 濃度 (opacity) is the only style param.
+  ftwFieldsVisible: false,
+  ftwFieldsOpacity: 0.6,
   // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
   // S Japan, S Korea, SE China) as flat strokes over a sea-coloured plane —
   // geographic context beyond the Taiwan DEM footprint (src/engine/region.js).
   // Deferred: public/layers/region_coast.json fetched on first switch-on.
   regionVisible: false,
   regionSeaColor: '#c2e0ff', // light blue sea (user default, RGB 194 224 255)
-  regionSeaOpacity: 1.0,
+  // 0.5 to match bathymetryVisible's default-on state (the bathymetryVisible
+  // HANDLER sets the same 0.5 whenever it's toggled on, so the semi-
+  // transparent plane reveals the relief beneath it — see
+  // docs/BATHYMETRY_DESIGN.md §2.5); toggling bathymetry off flips this back
+  // to 1.0 via that same HANDLER.
+  regionSeaOpacity: 0.5,
   regionLineColor: '#303030', // dark-grey coastline (user default, RGB 48 48 48)
   regionLineWidth: 1.3,
   regionLineOpacity: 0.9,
+  // sea ripple decoration (docs/MARINE_DESIGN.md §2): fragment-only
+  // onBeforeCompile injection on the region sea plane's OWN MeshBasicMaterial
+  // (region.js) — fresnel sky-tint + faint specular glint from a few
+  // scrolling analytic sine fields, no vertex displacement (this repo's
+  // ~480 m/world-unit scale makes real wave amplitude sub-pixel). seaAnimated
+  // keeps the render loop non-idle while on (isAnimating() below) — a
+  // wall-clock decoration, NOT gated on the timeline, same as typhoon.
+  seaAnimated: true,
+  seaRippleStrength: 0.3,
+  seaRippleSpeed: 1.0,
   // typhoon: a purely procedural vortex cloud sheet high above the terrain
   // (src/engine/typhoon.js) — no data, animated entirely in the fragment shader.
   // The eye defaults to just off the SE coast so the rainbands sweep the island;
@@ -282,6 +408,20 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const params = { ...DEFAULT_PARAMS, ...overrides }
   const layerManifest = loadLayerManifest() // fired now; awaited lazily by loadRailData/loadStationsData
   const manifestUrl = async (id, fallback) => (await layerManifest).find((l) => l.id === id)?.url ?? fallback
+  // ships' CDN snapshot base — same build-time env var + local-dev fallback
+  // as dem.js's TILE_BASE (VITE_TILE_BASE unset in dev → '/tiles', which
+  // 404s locally since no snapshot has been baked there yet, correctly
+  // falling through to the RPC path below — see loadShipsForDate).
+  const SHIPS_TILE_BASE = import.meta.env.VITE_TILE_BASE ?? '/tiles'
+
+  // shared Supabase anon-key access (mini-taiwan-pulse's project,
+  // read-only public.* RPCs only — repo rule: never realtime.* from the
+  // frontend). Originally reservoirs-only, private to that block; hoisted
+  // here (2026-07-11, docs/MARINE_DESIGN.md §1.1) so ships' RPC fallback
+  // reuses it too instead of a second declaration.
+  const SUPABASE_URL = 'https://utcmcikhvxnohbxchbrs.supabase.co'
+  const SUPABASE_ANON =
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0Y21jaWtodnhub2hieGNoYnJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ1NjgyMDMsImV4cCI6MjA5MDE0NDIwM30.rQSjJ6WD53p9tRZ6M7xleDelktVHfKeZFGPC2ItULVQ'
 
   // ---------------------------------------------------------------- events
   const listeners = new Map()
@@ -328,6 +468,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   controls.addEventListener('end', invalidate)
   const onResize = () => invalidate() // scene.js owns the actual resize handler
   window.addEventListener('resize', onResize)
+  // timeline: every discrete change (seek/play/pause/setSpeed) reopens the
+  // render window so trains (and future time-aware layers) redraw at the new
+  // time before parking again — see docs/TIMELINE_DESIGN.md §2.2. Playback
+  // itself doesn't spam this (timeStore.subscribe only fires on discrete
+  // changes, not per notifier tick), so this never fights isAnimating().
+  const offTimeStore = timeStore.subscribe(() => invalidate())
 
   const terrain = new Terrain(params)
   scene.add(terrain.group)
@@ -343,6 +489,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   let heightField = null // real-world height source (geo.js) — set on first DEM load
   let demBusy = false
   const toFeetFn = (h) => terrain.heightToFeet(h)
+  // raw camera-target distance (world units), refreshed once per tick() —
+  // see its computation below at the P2 distance-LOD block. Separate from
+  // fogScale because fogScale clamps to 1 across the whole near range (see
+  // scene.js), too coarse for trains.js's near-view car-chain LOD to use.
+  // Layers that only run inside tick() (tickAll) always see the current
+  // frame's value; the rarer update()-only call sites just see the last one.
+  let lastCamDist = LOD_D0
 
   // fresh per-call snapshot of the live world state every layer reads from
   function layerCtx(dt = 0) {
@@ -352,6 +505,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       projection: heightField ? heightField.projection : null,
       camera,
       fogScale: stage.fogScale,
+      camDist: lastCamDist,
       dt,
       lineResolution: stage.lineResolution,
       // label-specific: fictional cartography in noise mode, real spot heights
@@ -362,11 +516,28 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       toFeet: toFeetFn,
       labelCenter: params.source === 'real' ? { x: controls.target.x, z: controls.target.z } : undefined,
       spots: stage.lodZoom >= 12, // P2: no spot elevations in far views
+      lodZoom: stage.lodZoom, // vectortiles.js VectorTileManager derives its MVT zoom from this
     }
   }
 
   const layers = new LayerManager(scene)
-  const pointLayer = createPointLayer(params) // marker sets — imperative set API preserved
+  // hidden: true — no UI ever calls setMarkerSet (console/scripting escape
+  // hatch only, see engine.setMarkerSet/removeMarkerSet/listMarkerSets below),
+  // so the Layers panel omits its row entirely (see Layers.jsx's hidden
+  // filter). The layer itself stays fully registered/functional — build/
+  // update/tickView still run and setMarkerSet still creates real 3D markers.
+  const pointLayer = createPointLayer(params, { hidden: true }) // marker sets — imperative set API preserved
+  // display labels for the station marker systems (see stationsLayer pickRows
+  // below) — the baked stations.json carries only the bare system id
+  const STATION_SYSTEM_LABELS = {
+    tra: '台鐵 TRA',
+    trtc: '台北捷運 TRTC',
+    krtc: '高雄捷運 KRTC',
+    klrt: '高雄輕軌 KLRT',
+    tmrt: '台中捷運 TMRT',
+    thsr: '台灣高鐵 THSR',
+    aklrt: '安坑輕軌 AKLRT',
+  }
   // stations: a second marker-set collection, grouped one set per transit
   // system (see loadStationsData below). onActivate fires once, on the
   // panel's first toggle-on, and fetches public/layers/stations.json.
@@ -375,6 +546,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     label: 'Stations',
     rowLabel: '車站 Stations',
     onActivate: () => loadStationsData(),
+    // click-to-inspect (see layers.pickAll / index.js pointerup handler)
+    pickRows: (pt, setId) => [
+      ['站名 Name', pt.name || '—'],
+      ['系統 System', STATION_SYSTEM_LABELS[setId] ?? setId.toUpperCase()],
+    ],
   })
   // trail signs: a third marker-set collection (one set — 'signs' — 3,407
   // points), same deferred onActivate pattern as stations. Unlike stations,
@@ -393,26 +569,111 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     onActivate: () => loadTrailSignsData(),
     showLabels: false,
     dotRadius: 0.05,
+    // click-to-inspect (see layers.pickAll / index.js pointerup handler)
+    pickRows: (pt) => [
+      ['名稱 Name', pt.name || '—'],
+      ['分署 Department', pt.dept || '—'],
+    ],
   })
   const labelsLayer = createLabelsLayer(params)
   const reservoirsLayer = createReservoirLayer(params)
+  const osmRoadsLayer = createOsmRoadsLayer(params, { invalidate })
+  const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
+  const shipsLayer = createShipsLayer(params)
+  // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
+  // decided — layer modules stay presentation-agnostic, layers.js just carries
+  // whatever meta.group/subgroup it's registered with through to describe(),
+  // and Layers.jsx renders purely off that. Adding a new overlay to an
+  // existing theme is one entry here, no Layers.jsx edit. Anything left out
+  // falls back to LayerManager's UNGROUPED ("其他 Other") bucket instead of
+  // disappearing from the panel — every registered layer below has a home so
+  // that bucket stays empty in normal use.
+  const GROUP_BASE = { id: 'base', label: '底圖 Base', order: 0 }
+  const GROUP_MOVE = { id: 'move', label: '交通 Move', order: 1 }
+  const GROUP_WATER = { id: 'water', label: '水文 Water', order: 2 }
+  const GROUP_AGRI = { id: 'agri', label: '農業 Agriculture', order: 3 }
+  const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 4 }
+  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 5 }
+  const LAYER_GROUPS = {
+    region: { group: GROUP_BASE },
+    coastline: { group: GROUP_BASE },
+    counties: { group: GROUP_BASE },
+    // generic marker-set scaffold (setMarkerSet/removeMarkerSet/listMarkerSets
+    // — a console/scripting escape hatch, not a themed dataset: no default
+    // sets are ever registered from the UI, so it never carries real data in
+    // normal use). Not tied to any theme (transport/water/outdoor); parked
+    // under Base as a generic overlay utility rather than left in "其他".
+    markers: { group: GROUP_BASE },
+    rail: { group: GROUP_MOVE },
+    trains: { group: GROUP_MOVE },
+    thsr: { group: GROUP_MOVE },
+    stations: { group: GROUP_MOVE },
+    osm_roads: { group: GROUP_MOVE },
+    ships: { group: GROUP_MOVE },
+    rivers: { group: GROUP_WATER },
+    reservoirs: { group: GROUP_WATER },
+    // farmland tint + irrigation canals: agriculture, not hydrology — its own
+    // theme even though both share the water-adjacent shader-drape/polyline
+    // machinery (see loadFarmSim/applyFarmSim and createIrrigationLayer)
+    farm_sim: { group: GROUP_AGRI },
+    ftw_fields: { group: GROUP_AGRI },
+    irrigation: { group: GROUP_AGRI },
+    trails: { group: GROUP_OUTDOOR },
+    trail_signs: { group: GROUP_OUTDOOR },
+    // peak spot-elevation / place-name labels (labels.js) — cartography tied
+    // to the same mountain/hiking context as trails, so it sits alongside them
+    labels: { group: GROUP_OUTDOOR },
+    typhoon: { group: GROUP_FX },
+  }
   // registration order = draw / update order (coastline → counties → rail →
-  // trails → rivers → reservoirs → markers → stations → trail signs → labels)
+  // trains → thsr → trails → rivers → reservoirs → farm sim → irrigation →
+  // typhoon → markers → stations → ships → trail signs → labels). thsr
+  // registers right after trains so it lands directly below 台鐵列車 Trains,
+  // and ships registers right after stations, both in the Layers panel's
+  // 交通 Move group (Layers.jsx preserves registration order within a group
+  // — see groupLayers()).
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
     createCountiesLayer(params),
     createRailLayer(params),
+    createTrainsLayer(params, {
+      // near-view car-chain LOD (see trains.js module header) — real TRA EMU
+      // dimensions: ~20m/car, 6 cars/train. 320 × 6 = 1920 car instances.
+      carLenM: 20,
+      carCount: 6,
+      widthM: 3,
+      heightM: 4,
+    }),
+    createTrainsLayer(params, {
+      id: 'thsr',
+      label: 'THSR',
+      rowLabel: '高鐵列車 THSR',
+      railNetwork: 'thsr',
+      maxInstances: 64,
+      singleCorridor: true,
+      netLabel: '高鐵', // pick()'s info-card title prefix (see trains.js createTrainsLayer's netLabel doc)
+      // real THSR 700T dimensions: ~25m/car, 12 cars/train. 64 × 12 = 768 car instances.
+      carLenM: 25,
+      carCount: 12,
+      widthM: 3.4,
+      heightM: 4,
+    }),
+    osmRoadsLayer,
     createTrailsLayer(params),
     createRiversLayer(params),
     reservoirsLayer,
+    createFarmSimLayer(params),
+    ftwFieldsLayer,
+    createIrrigationLayer(params),
     createTyphoonLayer(params),
     pointLayer,
     stationsLayer,
+    shipsLayer,
     trailSignsLayer,
     labelsLayer,
   ]) {
-    layers.register(layer, layerCtx())
+    layers.register(layer, layerCtx(), LAYER_GROUPS[layer.id])
   }
   const regenerateLabels = () => labelsLayer.update(layerCtx())
   // param keys that map to a layer's visibility/style — a setParams touching any
@@ -436,6 +697,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   chunkManager.onChunksChanged = () => {
     stage.shadowNeedsUpdate()
     invalidate() // a chunk appeared/vanished (incl. after DEM tiles finish loading)
+    osmRoadsLayer.markDemDirty() // coalesced redrape — see vectortiles.js VectorTileManager.markDemDirty
+    ftwFieldsLayer.markDemDirty()
   }
 
   const cone = createCone()
@@ -532,6 +795,22 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     worldPerMeter: () => (heightField ? heightField.projection.K * params.demExaggeration : 0),
   })
 
+  // follow camera: the fifth motion source (see src/engine/follow.js header +
+  // docs/FOLLOW_CAMERA_DESIGN.md). This module never decides WHO cancels it —
+  // it just reacts to followEntity()/stopFollow() and polls motion/controls
+  // state each tick. The mutex wiring (who calls stopFollow) is below, at
+  // every OTHER motion-source entry point (keyPan.onEngage, selectPoi,
+  // deselect, flyToLonLat, startTour) — never on controls 'start' (would kill
+  // rotate/zoom too, see design doc §3).
+  const follow = createFollow({
+    camera,
+    controls,
+    motion,
+    layers,
+    invalidate,
+    onChange: (s) => emit('follow', s),
+  })
+
   // ---------------------------------------------------------------- tour path preview
   // A translucent accent line of the planned route, rebuilt whenever the panel
   // changes from/to/mode/offset. Removed the instant a tour starts and cleared
@@ -601,6 +880,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     controls,
     onEngage: () => {
       motion.cancel()
+      follow.stopFollow() // keyPan writes target directly, not via controls.state — can't be caught by follow's own pan detector
       invalidate()
     },
   })
@@ -614,6 +894,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function selectPoi(i) {
     const p = pois[i]
     if (!p) return
+    follow.stopFollow() // POI focus and follow both own the tween — POI wins on click
     invalidate()
     if (selectedPoi === -1) {
       returnPose.pos.copy(camera.position)
@@ -622,14 +903,35 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
     selectedPoi = i
     emit('selection', { index: i, poi: p })
+
+    // p.h can be a stale throttled-refresh cache (poiAcc block below /
+    // computePois) baked in before this peak's DEM tile finished streaming —
+    // heightAtWorld() reports a phantom "0 m" for a not-yet-resident tile
+    // (geo.js heightAtWorld), which used to fly the camera underground until
+    // the next POI refresh caught up (peaks.js:34,42-48). Re-sample live at
+    // click time instead of trusting the cache.
+    let h = terrain.sample(p.x, p.z)
+    if (params.source === 'real' && heightField) {
+      const scale = worldYScale(heightField, params.demExaggeration)
+      const missY = (0 - heightField.datumM) * scale // heightAtWorld's tile-miss signature
+      if (Math.abs(h - missY) < 1e-6 && Number.isFinite(p.elevM)) {
+        // still not streamed even now — trust the peaks catalogue elevation
+        // (peaks.js elevM) rather than the phantom sea-level sample: better
+        // to fly high over the mountain than to clip into it
+        h = metersToWorldY(heightField, p.elevM, params.demExaggeration)
+      }
+    }
+    h = Math.max(h, p.h) // never settle lower than whatever the cached POI already had
+
     const dir = new THREE.Vector3(p.x, 0, p.z).normalize()
     motion.flyTo(
-      new THREE.Vector3(p.x + dir.x * 6.5, p.h + 4.2, p.z + dir.z * 6.5),
-      new THREE.Vector3(p.x, p.h + 0.6, p.z)
+      new THREE.Vector3(p.x + dir.x * 6.5, h + 4.2, p.z + dir.z * 6.5),
+      new THREE.Vector3(p.x, h + 0.6, p.z)
     )
   }
 
   function deselect() {
+    follow.stopFollow() // the return-flight tween below must not fight delta-carry (design doc §3)
     invalidate()
     selectedPoi = -1
     emit('selection', { index: -1, poi: null })
@@ -690,6 +992,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function regenerateTerrain() {
     if (rebuildPending) return
     invalidate()
+    clearPick() // a rebuild can move/replace baked geometry — drop any pinned popup rather than leave it at a stale position
     rebuildPending = true
     emit('loading', { active: true, message: 'generating terrain…' })
     // let the indicator paint before the synchronous rebuild blocks the thread
@@ -727,6 +1030,36 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     poiAnchor.set(controls.target.x, controls.target.z)
   }
 
+  // coastline's outlying-island rings (Penghu/Kinmen/Matsu/China coast/
+  // Taiwan's own outlying islands — scripts/bake_coastlines.py) are ADDITIVE
+  // to the existing main-island ring, not a separate layer/toggle (see
+  // polyline.js createCoastlineLayer). Deferred fetch, same fail-quiet
+  // pattern as rail/trails below; unlike those, coastline defaults to
+  // visible so this is also kicked once unconditionally right after layer
+  // registration (see the `if (params.coastline)` call below), since
+  // HANDLERS.coastline's own toggle-on path only fires on an explicit
+  // off→on setParams call, which never happens for an already-true default.
+  let coastlineExtFetch = { loading: false, loaded: false }
+  async function loadCoastlineExtendedData() {
+    if (coastlineExtFetch.loading || coastlineExtFetch.loaded) return
+    coastlineExtFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('coastlines_extended', '/layers/coastlines_extended.json'))
+      if (!res.ok) throw new Error(`coastlines_extended.json ${res.status}`)
+      const data = await res.json()
+      layers.get('coastline').setExtraRings(data.rings.map((r) => r.points.map(([lon, lat]) => [lon, lat, 0])))
+      coastlineExtFetch.loaded = true
+      layers.get('coastline').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] coastlines_extended fetch failed', err)
+    } finally {
+      coastlineExtFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+  if (params.coastline) loadCoastlineExtendedData()
+
   // ---------------------------------------------------------------- deferred GIS layers (rail / stations)
   // Both public/layers/*.json are baked offline (scripts/bake_layer_elevations.py)
   // with per-vertex elevation already baked in — no DEM sampling needed here,
@@ -756,9 +1089,93 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
   }
 
+  // shared rail_lines.json fetch cache for the trains/thsr loaders below —
+  // both need the SAME file (filtered client-side to a different `system`),
+  // so switching both light-dot layers on in one session doesn't double-
+  // fetch it. Separate from loadRailData's own fetch above (the rail line
+  // layer's setData wants a different {points,color} shape) — this cache
+  // holds the raw {lines:[...]} payload. A failed fetch clears the cache so
+  // the next toggle-on retries instead of replaying the same failure forever
+  // (mirrors railFetch/trainsFetch's loaded-only-on-success convention).
+  let railLinesCache = null
+  async function fetchRailLines() {
+    if (railLinesCache) return railLinesCache
+    const req = (async () => {
+      const res = await fetch(await manifestUrl('rail', '/layers/rail_lines.json'))
+      if (!res.ok) throw new Error(`rail_lines.json ${res.status}`)
+      return res.json()
+    })()
+    railLinesCache = req
+    try {
+      return await req
+    } catch (err) {
+      railLinesCache = null
+      throw err
+    }
+  }
+
+  // trains / thsr: real timetable-driven light dots (see src/engine/
+  // trains.js's parametrized createTrainsLayer) — each instance needs THREE
+  // sources landed together: <net>_tracks.json (per-part station ratios),
+  // <net>_schedule.json (real train roster) and rail_lines.json itself (via
+  // fetchRailLines() above, filtered client-side to this network's
+  // `system`) for the raw lon/lat/elev polylines the ratio tables are
+  // index-aligned against — see trains.js header. Same fail-quiet deferred
+  // pattern as rail/trails; a partial failure (any one of the three) drops
+  // the whole activation rather than rendering trains against mismatched/
+  // missing track geometry. One loader factory drives both the TRA and THSR
+  // instances — trains.js's own setData handles the one place their leg→
+  // part resolution actually diverges (singleCorridor).
+  function makeTrainLoader({ layerId, tracksKey, tracksFallback, scheduleKey, scheduleFallback, railSystem }) {
+    const fetchState = { loading: false, loaded: false }
+    return async function load() {
+      if (fetchState.loading || fetchState.loaded) return
+      fetchState.loading = true
+      try {
+        const [tracksRes, scheduleRes, rail] = await Promise.all([
+          fetch(await manifestUrl(tracksKey, tracksFallback)),
+          fetch(await manifestUrl(scheduleKey, scheduleFallback)),
+          fetchRailLines(),
+        ])
+        if (!tracksRes.ok) throw new Error(`${tracksKey}.json ${tracksRes.status}`)
+        if (!scheduleRes.ok) throw new Error(`${scheduleKey}.json ${scheduleRes.status}`)
+        const [tracks, schedule] = await Promise.all([tracksRes.json(), scheduleRes.json()])
+        const lines = rail.lines.filter((l) => l.system === railSystem).map((l) => l.points)
+        layers.get(layerId).setData({ tracks, schedules: schedule.schedules, lines })
+        fetchState.loaded = true
+        layers.get(layerId).update(layerCtx())
+      } catch (err) {
+        console.warn(`[layers] ${layerId} fetch failed`, err)
+      } finally {
+        fetchState.loading = false
+        invalidate()
+        emit('layers')
+      }
+    }
+  }
+  const loadTrainsData = makeTrainLoader({
+    layerId: 'trains',
+    tracksKey: 'train_tracks',
+    tracksFallback: '/layers/train_tracks.json',
+    scheduleKey: 'train_schedule',
+    scheduleFallback: '/layers/train_schedule.json',
+    railSystem: 'tra',
+  })
+  const loadThsrData = makeTrainLoader({
+    layerId: 'thsr',
+    tracksKey: 'thsr_tracks',
+    tracksFallback: '/layers/thsr_tracks.json',
+    scheduleKey: 'thsr_schedule',
+    scheduleFallback: '/layers/thsr_schedule.json',
+    railSystem: 'thsr',
+  })
+
   // trails: same deferred fetch-once pattern as rail (baked polylines, no
-  // per-line official colors — see polyline.js createTrailsLayer). setData
-  // takes no lineColors arg so the single trailsColor swatch drives the style.
+  // per-line official colors — see polyline.js createTrailsLayer). setData's
+  // 2nd arg (lineColors) is null — the single trailsColor swatch drives the
+  // style — but the 3rd arg carries one {name,county,lengthKm,ascentM} per
+  // trail (parallel to the points arrays) for the click-to-inspect popup
+  // (polyline.js pick(), gated on config.pickRows).
   let trailsFetch = { loading: false, loaded: false }
   async function loadTrailsData() {
     if (trailsFetch.loading || trailsFetch.loaded) return
@@ -767,13 +1184,47 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       const res = await fetch(await manifestUrl('trails', '/layers/trails.json'))
       if (!res.ok) throw new Error(`trails.json ${res.status}`)
       const data = await res.json()
-      layers.get('trails').setData(data.lines.map((l) => l.points))
+      layers.get('trails').setData(
+        data.lines.map((l) => l.points),
+        null,
+        data.lines.map((l) => ({ name: l.name, county: l.county, lengthKm: l.lengthKm, ascentM: l.ascentM }))
+      )
       trailsFetch.loaded = true
       layers.get('trails').update(layerCtx())
     } catch (err) {
       console.warn('[layers] trails fetch failed', err)
     } finally {
       trailsFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // irrigation: same deferred fetch-once pattern as trails (baked polylines).
+  // data.meta.color is ONE color for the whole canal network (not per-canal
+  // like rail's lineColors array) — setData's 2nd arg stays null and the
+  // single irrigationColor swatch drives the style. 3rd arg carries one
+  // {name,office} per canal (parallel to the points arrays) for the
+  // click-to-inspect popup (polyline.js pick(), gated on config.pickRows).
+  let irrigationFetch = { loading: false, loaded: false }
+  async function loadIrrigationData() {
+    if (irrigationFetch.loading || irrigationFetch.loaded) return
+    irrigationFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('irrigation', '/layers/irrigation.json'))
+      if (!res.ok) throw new Error(`irrigation.json ${res.status}`)
+      const data = await res.json()
+      layers.get('irrigation').setData(
+        data.lines.map((l) => l.points),
+        null,
+        data.lines.map((l) => ({ name: l.name, office: l.office }))
+      )
+      irrigationFetch.loaded = true
+      layers.get('irrigation').update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] irrigation fetch failed', err)
+    } finally {
+      irrigationFetch.loading = false
       invalidate()
       emit('layers')
     }
@@ -930,13 +1381,111 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     invalidate()
   }
 
+  // farm sim: whole-island physics-derived farmland-presence tint, painted
+  // straight into the terrain shader from a binary presence bake — same
+  // texture-load conventions as the river sim above (LinearFilter, no sRGB,
+  // flipY false, row 0 = north). Own bbox (public/layers/farm_sim.json) — NOT
+  // the same numeric bounds as river_sim (different source dataset), but the
+  // same tile-pixel grid convention (z13, out_stride 2), so the UV mapping
+  // code is identical, just parameterized by this bake's own bbox. Race
+  // guard: uFarmTex/uFarmBounds are only wired up AFTER the texture has
+  // finished decoding, and the opacity uniform stays 0 until then.
+  let farmSimTex = null
+  let farmSimMeta = null
+  const farmSimFetch = { loading: false, loaded: false }
+  function applyFarmSimBounds() {
+    if (!farmSimTex || !farmSimMeta || !heightField) return
+    const b = farmSimMeta.bbox
+    const nw = heightField.projection.lonLatToWorld(b.minLon, b.maxLat) // west / north
+    const se = heightField.projection.lonLatToWorld(b.maxLon, b.minLat) // east / south
+    terrain.mapUniforms.uFarmBounds.value.set(nw.x, nw.z, se.x, se.z)
+    terrain.mapUniforms.uFarmTex.value = farmSimTex
+  }
+  async function loadFarmSim() {
+    if (farmSimFetch.loading || farmSimFetch.loaded) return
+    farmSimFetch.loading = true
+    try {
+      const metaRes = await fetch(await manifestUrl('farm_sim', '/layers/farm_sim.json'))
+      if (!metaRes.ok) throw new Error(`farm_sim.json ${metaRes.status}`)
+      farmSimMeta = await metaRes.json()
+      const pngUrl = farmSimMeta.png ?? '/layers/farm_sim.png'
+      const tex = await new Promise((resolve, reject) =>
+        new THREE.TextureLoader().load(pngUrl, resolve, undefined, reject)
+      )
+      // intensity data (binary presence mask), not color: no sRGB decode,
+      // linear filter, no mipmaps; flipY false matches the bake's row-0-is-
+      // north convention (see the shader's UV math)
+      tex.flipY = false
+      tex.colorSpace = THREE.NoColorSpace
+      tex.minFilter = THREE.LinearFilter
+      tex.magFilter = THREE.LinearFilter
+      tex.generateMipmaps = false
+      tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping
+      tex.needsUpdate = true
+      farmSimTex = tex
+      farmSimFetch.loaded = true
+    } catch (err) {
+      console.warn('[layers] farm sim fetch failed', err)
+    } finally {
+      farmSimFetch.loading = false
+      applyFarmSim() // now that the texture (or its failure) has landed
+    }
+  }
+  // Set the shader uniforms from the farmVisible toggle / 農田濃度. Kicks the
+  // deferred fetch on the first farm switch-on; keeps the opacity uniform at
+  // 0 (branch skipped in the shader) until the texture is bound — so the
+  // layer is truly zero-cost while off.
+  function applyFarmSim() {
+    const on = !!params.farmVisible
+    if (on && !farmSimFetch.loaded && !farmSimFetch.loading) loadFarmSim()
+    const active = on && farmSimFetch.loaded
+    if (active) applyFarmSimBounds()
+    terrain.mapUniforms.uFarmColor.value.set(params.farmColor)
+    terrain.mapUniforms.uFarmOpacity.value = active ? params.farmOpacity : 0
+    invalidate()
+  }
+
+  // farm_sim LayerManager entry: unlike rivers (which owns a surface mesh +
+  // name labels alongside the sim tint), the farm layer's ENTIRE visual IS
+  // the terrain-shader tint above — no object3d, no geometry. Registered as
+  // its own INDEPENDENT layer (agriculture, not hydrology) purely so it gets
+  // a row in the Layers panel; paramMap/visibleParam route every control
+  // through setParams → HANDLERS.farmVisible/farmOpacity/farmColor → applyFarmSim().
+  function createFarmSimLayer(params) {
+    return {
+      id: 'farm_sim',
+      kind: 'raster',
+      label: 'Farm Sim',
+      rowLabel: '農田 Farmland',
+      visibleParam: 'farmVisible',
+      paramMap: { visible: 'farmVisible', opacity: 'farmOpacity', color: 'farmColor' },
+      build() {},
+      update() {}, // no-op: applyFarmSim() owns every uniform this layer drives
+      describe() {
+        return {
+          id: 'farm_sim',
+          kind: 'raster',
+          label: 'Farm Sim',
+          rowLabel: '農田 Farmland',
+          count: 0,
+          visible: params.farmVisible,
+          styleSchema: {
+            opacity: { type: 'slider', label: '農田濃度 Intensity', min: 0, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
+            color: { type: 'color', label: '顏色 Color' },
+          },
+          style: { opacity: params.farmOpacity, color: params.farmColor },
+        }
+      },
+      dispose() {},
+    }
+  }
+
   // reservoirs: fetch the baked basin polygons + dam markers, then the LIVE
-  // storage ratios from the mini-taiwan-pulse Supabase RPC (anon read-only key).
-  // A live-fetch failure is non-fatal: every basin falls back to ratio 1.0
-  // (full pool) with a console.warn, so the water surfaces still render.
-  const SUPABASE_URL = 'https://utcmcikhvxnohbxchbrs.supabase.co'
-  const SUPABASE_ANON =
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InV0Y21jaWtodnhub2hieGNoYnJzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ1NjgyMDMsImV4cCI6MjA5MDE0NDIwM30.rQSjJ6WD53p9tRZ6M7xleDelktVHfKeZFGPC2ItULVQ'
+  // storage ratios from the mini-taiwan-pulse Supabase RPC (anon read-only key,
+  // SUPABASE_URL/SUPABASE_ANON declared near the top of createEngine — shared
+  // with ships' RPC fallback below). A live-fetch failure is non-fatal: every
+  // basin falls back to ratio 1.0 (full pool) with a console.warn, so the
+  // water surfaces still render.
   async function fetchReservoirRatios() {
     try {
       const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_reservoir_status_latest`, {
@@ -987,6 +1536,80 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       emit('layers')
     }
   }
+
+  // ships: RPC fallback for whichever date's CDN snapshot 404s (not baked
+  // yet / today-before-first-bake-run — see docs/MARINE_DESIGN.md §1.1).
+  // Parses the "lat,lng,ts;..." trail column + applies the >40kt GPS filter
+  // (both ported into ships.js from pulse's shipLoader.ts — see its
+  // parseTrailString/filterGpsAnomalies). Never throws: an RPC failure
+  // resolves an empty trail list, same fail-quiet contract as the CDN path.
+  async function fetchShipsFromRpc(dateKey) {
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/rpc/get_ship_trails`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_ANON,
+          Authorization: `Bearer ${SUPABASE_ANON}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ target_date: dateKey }),
+      })
+      if (!res.ok) throw new Error(`get_ship_trails ${res.status}`)
+      const rows = await res.json()
+      return rows.map((r) => ({
+        mmsi: String(r.mmsi),
+        name: null,
+        shipType: r.ship_type || null,
+        points: filterGpsAnomalies(parseTrailString(r.trail)),
+      }))
+    } catch (err) {
+      console.warn(`[layers] ships RPC fallback failed for ${dateKey}`, err)
+      return []
+    }
+  }
+
+  // ships: CDN snapshot first, RPC fallback on 404 (docs/MARINE_DESIGN.md
+  // §1.1) — the timeline's FIRST subscribeDate consumer (§1.2). shipsCurrentDate
+  // is a race guard: subscribeDate's callback can fire again (scrub to a new
+  // day) while an earlier date's fetch is still in flight — whichever
+  // response lands with a stale dateKey (not the latest one requested) is
+  // discarded rather than clobbering the newer selection. trails=[] (either
+  // path) is a legitimate "this day has no ship data" result — setData still
+  // runs so the layer shows correctly-empty instead of staying gated off.
+  let shipsCurrentDate = null
+  async function loadShipsForDate(dateKey) {
+    shipsCurrentDate = dateKey
+    let trails = null // null = CDN path didn't produce usable trails; triggers RPC fallback below
+    try {
+      const res = await fetch(`${SHIPS_TILE_BASE}/ships/trails/${dateKey}.json`)
+      if (res.ok) {
+        // dev-server gotcha (same one dem.js's TILE_URL comment documents for
+        // DEM tiles): an unmatched path under the LOCAL '/tiles' base returns
+        // Vite's SPA-fallback index.html with status 200, not a real 404 —
+        // res.json() throws on it, caught below, same as a real miss. In
+        // production SHIPS_TILE_BASE is a different origin (R2/CDN), where a
+        // missing snapshot is a genuine 404 and lands in the `else` below.
+        const data = await res.json()
+        trails = (data.trails || []).map((t) => ({
+          mmsi: String(t.mmsi),
+          name: t.name || null,
+          shipType: t.ship_type || null,
+          points: t.points || [],
+        }))
+      }
+      // any other status (404 or otherwise) falls through to the RPC
+      // fallback below, same as a JSON-parse failure caught here
+    } catch (err) {
+      console.warn(`[layers] ships snapshot fetch failed for ${dateKey} — falling back to RPC`, err)
+    }
+    if (trails === null) trails = await fetchShipsFromRpc(dateKey)
+    if (dateKey !== shipsCurrentDate) return // stale — a newer date was requested meanwhile
+    shipsLayer.setData(trails)
+    shipsLayer.update(layerCtx())
+    invalidate()
+    emit('layers')
+  }
+  let shipsActivated = false // onActivate: first switch-on loads today + subscribes to future date changes (once — see shipsVisible HANDLER)
 
   // stationsLayer.onActivate — grouped one marker set per transit system.
   // Never rejects: a fetch failure just leaves the layer showing no sets
@@ -1098,10 +1721,18 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       setTimeout(() => emit('loading', { active: false, message: 'generating terrain…' }), 2600)
       return false
     }
+    follow.stopFollow() // covers flyTo/applyPreset/custom-coordinate callers alike (design doc §3)
     invalidate()
     const { x, z } = heightField.projection.lonLatToWorld(lon, lat)
     _flyOffset.subVectors(camera.position, controls.target) // keep the current view offset
-    const target = new THREE.Vector3(x, controls.target.y, z)
+    // resample ground height AT THE DESTINATION — reusing controls.target.y
+    // (the departure altitude) stranded the camera over blank sea/tiles when
+    // flying between very different elevations (e.g. 玉山 → 澎湖). If the
+    // destination tile hasn't streamed yet terrain.sample() reports 0, which
+    // is a safe underestimate: the anti-penetration floor in tick() (index.js
+    // ~1609-1613) only ever raises target.y/camera.y, never lowers it.
+    const y = terrain.sample ? terrain.sample(x, z) : controls.target.y
+    const target = new THREE.Vector3(x, y, z)
     motion.flyTo(target.clone().add(_flyOffset), target)
     emit('params') // refresh the SECTOR location name
     return true
@@ -1168,13 +1799,33 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     gradHigh: () => terrain.rebuildRamp(params),
     gradMid1Pos: () => terrain.rebuildRamp(params),
     gradMid2Pos: () => terrain.rebuildRamp(params),
+    bathyDeepColor: () => terrain.rebuildRamp(params),
+    bathyShallowColor: () => terrain.rebuildRamp(params),
+    bathyCoastColor: () => terrain.rebuildRamp(params),
+    // bathymetry: shading-only switch — terrain.js rebakes nothing (same
+    // tiles, same chunk geometry always carries real GEBCO depth). Flips the
+    // ramp canvas + uHeightRange/uSeaLevelY/uSeaSplit uniforms and nudges the
+    // region sea-plane's opacity so it hides (off) or reveals (on) the
+    // seafloor relief beyond the coastline. No chunk rebuild, no re-fetch.
+    bathymetryVisible: (v) => {
+      terrain.applyBathymetryShading(params)
+      params.regionSeaOpacity = v ? 0.5 : 1.0
+      layers.get('region').update(layerCtx())
+      emit('layers') // refresh the Region panel's opacity slider to the new value
+    },
     peakLimit: () => regenerateHud(),
     peakMinElev: () => regenerateHud(),
     peakRadiusKm: () => regenerateHud(),
     // overlay layers: visibility toggle just flips the group; style/geometry
     // params re-run the layer's full update (lazy build + vertical + material)
     labels: (v) => labelsLayer.setVisible(v),
-    coastline: () => layers.get('coastline').update(layerCtx()),
+    // coastline: off→on also kicks the outlying-island rings' deferred fetch
+    // (loadCoastlineExtendedData no-ops once loaded/in-flight) — the layer
+    // shows its (possibly still main-ring-only) geometry immediately either way.
+    coastline: (v) => {
+      if (v) loadCoastlineExtendedData()
+      layers.get('coastline').update(layerCtx())
+    },
     coastlineWidth: () => layers.get('coastline').update(layerCtx()),
     coastlineOpacity: () => layers.get('coastline').update(layerCtx()),
     coastlineColor: () => layers.get('coastline').update(layerCtx()),
@@ -1191,6 +1842,49 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     },
     railWidth: () => layers.get('rail').update(layerCtx()),
     railOpacity: () => layers.get('rail').update(layerCtx()),
+    // trains: first switch-on triggers the deferred fetch (loadTrainsData
+    // no-ops once loaded/in-flight); the timeline clock needs no handler
+    // here — trains.js reads timeStore.getDaySeconds() fresh every tickView,
+    // no update()/rebuild required.
+    trainsVisible: (v) => {
+      if (v) loadTrainsData()
+      layers.get('trains').update(layerCtx())
+    },
+    trainsColor: () => layers.get('trains').update(layerCtx()),
+    trainsSize: () => layers.get('trains').update(layerCtx()),
+    trainsOpacity: () => layers.get('trains').update(layerCtx()),
+    // thsr: second createTrainsLayer instance (src/engine/trains.js) — same
+    // deferred-fetch-on-first-toggle-on pattern as trains above.
+    thsrVisible: (v) => {
+      if (v) loadThsrData()
+      layers.get('thsr').update(layerCtx())
+    },
+    thsrColor: () => layers.get('thsr').update(layerCtx()),
+    thsrSize: () => layers.get('thsr').update(layerCtx()),
+    thsrOpacity: () => layers.get('thsr').update(layerCtx()),
+    // ships: onActivate (docs/MARINE_DESIGN.md §1.2) — first switch-on loads
+    // the timeline's CURRENT date immediately (subscribeDate's callback only
+    // fires on FUTURE changes, never on subscribe itself) and subscribes to
+    // subsequent date changes (scrub/seek/play across midnight) exactly
+    // once; later toggles just re-apply gate/style like trains/thsr above.
+    shipsVisible: (v) => {
+      if (v && !shipsActivated) {
+        shipsActivated = true
+        loadShipsForDate(timeStore.getDateKey())
+        timeStore.subscribeDate((dateKey) => loadShipsForDate(dateKey))
+      }
+      layers.get('ships').update(layerCtx())
+    },
+    shipsColor: () => layers.get('ships').update(layerCtx()),
+    shipsSize: () => layers.get('ships').update(layerCtx()),
+    shipsOpacity: () => layers.get('ships').update(layerCtx()),
+    // OSM roads: no deferred JSON fetch to kick — the PMTiles manager streams
+    // tiles itself once switched on (see vectortiles.js). update() just
+    // (re)applies the gate/style; the manager's own setEnabled starts/stops
+    // the per-frame tile streaming (layers.get('osm_roads').tickView).
+    osmRoadsVisible: () => layers.get('osm_roads').update(layerCtx()),
+    osmRoadsWidth: () => layers.get('osm_roads').update(layerCtx()),
+    osmRoadsOpacity: () => layers.get('osm_roads').update(layerCtx()),
     // trails: same deferred-fetch pattern as rail; unlike rail this one has a
     // color param (every trail shares one baked color, no per-line override)
     trailsVisible: (v) => {
@@ -1228,6 +1922,27 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     reservoirsRatio: (v) => reservoirsLayer.setManualRatio(v / 100),
     reservoirsOpacity: () => reservoirsLayer.update(layerCtx()),
     reservoirsColor: () => reservoirsLayer.update(layerCtx()),
+    // farm: whole-island physics-derived farmland tint (terrain.js uFarmTex).
+    // INDEPENDENT of rivers/reservoirs — agriculture, not hydrology. First
+    // switch-on triggers the deferred PNG fetch (applyFarmSim no-ops the
+    // uniform until it lands); style params just re-apply the uniforms.
+    farmVisible: () => applyFarmSim(),
+    farmOpacity: () => applyFarmSim(),
+    farmColor: () => applyFarmSim(),
+    // irrigation: manifest-driven deferred polyline layer, same deferred-fetch
+    // pattern as trails; one shared baked color (no per-line vertexColors —
+    // see loadIrrigationData / polyline.js createIrrigationLayer)
+    irrigationVisible: (v) => {
+      if (v) loadIrrigationData()
+      layers.get('irrigation').update(layerCtx())
+    },
+    irrigationWidth: () => layers.get('irrigation').update(layerCtx()),
+    irrigationOpacity: () => layers.get('irrigation').update(layerCtx()),
+    irrigationColor: () => layers.get('irrigation').update(layerCtx()),
+    // ftw fields: no deferred JSON fetch — same PMTiles-streams-itself pattern
+    // as osmRoadsVisible above (see vectortiles.js createFtwFieldsLayer)
+    ftwFieldsVisible: () => ftwFieldsLayer.update(layerCtx()),
+    ftwFieldsOpacity: () => ftwFieldsLayer.update(layerCtx()),
     // region: first switch-on fetches the neighbouring coastlines (deferred);
     // the sea plane + style params re-run the layer's update
     regionVisible: (v) => {
@@ -1239,6 +1954,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     regionLineColor: () => layers.get('region').update(layerCtx()),
     regionLineWidth: () => layers.get('region').update(layerCtx()),
     regionLineOpacity: () => layers.get('region').update(layerCtx()),
+    seaAnimated: () => layers.get('region').update(layerCtx()),
+    seaRippleStrength: () => layers.get('region').update(layerCtx()),
+    seaRippleSpeed: () => layers.get('region').update(layerCtx()),
     // typhoon: procedural vortex cloud sheet — every param just re-runs the
     // layer's update (visibility gate + place/scale + shader-uniform style)
     typhoonVisible: () => layers.get('typhoon').update(layerCtx()),
@@ -1295,7 +2013,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       else HANDLERS[k]?.(params[k])
     }
     if (rebuild) regenerateTerrain()
-    if (keys.some((k) => LAYER_KEYS.has(k))) emit('layers') // dynamic panel refresh
+    if (keys.some((k) => LAYER_KEYS.has(k))) {
+      emit('layers') // dynamic panel refresh
+      if (activePick) closePickIfLayerHidden(activePick.layerId) // e.g. trailsVisible:false while its popup is open
+    }
     invalidate() // any settings change must repaint, even from a frozen idle frame
   }
 
@@ -1314,6 +2035,63 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     mouse.set(nx, ny)
   }
   window.addEventListener('pointermove', onPointerMove)
+
+  // ---------------------------------------------------------------- layer pick (click popup)
+  // Click-only feature picking (never hover — an on-demand render app can't
+  // afford a per-frame raycast). pointerdown/up are measured for drag
+  // distance so an OrbitControls orbit/pan never fires a pick; only a
+  // pointerdown that STARTED on the canvas (not a UI panel) is a candidate.
+  // A hit walks the LayerManager's registered layers via layers.pickAll (see
+  // layers.js for the raycaster conventions — camera/params.Line2/pickPx) and
+  // opens the React popup card; a miss (empty-canvas click) closes it.
+  const pickRaycaster = new THREE.Raycaster()
+  pickRaycaster.params.Line2 = { threshold: 10 } // px, added to the line's own linewidth (draped lines render 0.5–6px wide — too thin to click as-is)
+  const _pickNdc = new THREE.Vector2()
+  const PICK_DRAG_TOLERANCE_PX = 5 // pointerdown→up movement above this reads as a camera drag, not a click
+  let pickDownPos = null
+  let pickDownOnCanvas = false
+  let activePick = null // { title, rows, worldPos, layerId } | null — the popup's current content
+
+  function clearPick() {
+    if (!activePick) return
+    activePick = null
+    emit('pick', null)
+    invalidate()
+  }
+  // closes the popup if it belongs to a layer that just got hidden (toggle
+  // off in the Layers panel, "ALL OFF", or a theme master switch) — checked
+  // generically off describe().visible so it works for both param-backed
+  // layers (setLayerVisible/setParams) and marker-set layers (setLayerSet)
+  function closePickIfLayerHidden(id) {
+    if (!activePick || !id || activePick.layerId !== id) return
+    const layer = layers.get(id)
+    if (!layer || !layer.describe().visible) clearPick()
+  }
+  function onPickPointerDown(e) {
+    pickDownOnCanvas = e.target === stage.renderer.domElement
+    pickDownPos = { x: e.clientX, y: e.clientY }
+  }
+  function onPickPointerUp(e) {
+    if (!pickDownOnCanvas || !pickDownPos) return
+    const dx = e.clientX - pickDownPos.x
+    const dy = e.clientY - pickDownPos.y
+    pickDownPos = null
+    if (Math.hypot(dx, dy) > PICK_DRAG_TOLERANCE_PX) return // camera drag, not a click
+    _pickNdc.set((e.clientX / window.innerWidth) * 2 - 1, -((e.clientY / window.innerHeight) * 2 - 1))
+    pickRaycaster.setFromCamera(_pickNdc, camera) // also sets pickRaycaster.camera (used by Line2 + markers.pick)
+    pickRaycaster.pickPx = { x: e.clientX, y: e.clientY } // markers.js pick(): screen-space hit test for tiny instanced dots
+    const hit = layers.pickAll(pickRaycaster)
+    if (hit) {
+      activePick = { title: hit.title, rows: hit.rows, worldPos: hit.worldPos.clone(), layerId: hit.layerId, followable: hit.followable }
+      emit('pick', { title: hit.title, rows: hit.rows, layerId: hit.layerId, followable: hit.followable })
+    } else {
+      activePick = null
+      emit('pick', null)
+    }
+    invalidate()
+  }
+  window.addEventListener('pointerdown', onPickPointerDown)
+  window.addEventListener('pointerup', onPickPointerUp)
 
   // ---------------------------------------------------------------- stats
 
@@ -1356,6 +2134,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (params.source !== 'real' || !heightField) return true
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
+      (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
+      ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||
@@ -1378,6 +2158,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       dt,
       reticle: project(cone.getFocusPoint(), w, h),
       poiScreens: pois.map((p) => project(p.top, w, h)),
+      // layer-pick popup screen anchor (see 'layer pick' section above) — a
+      // cheap re-project each frame, exactly like reticle/poiScreens, so the
+      // React card tracks the world position as the camera moves/idles
+      pick: activePick ? project(activePick.worldPos, w, h) : null,
       selected: selectedPoi,
       az: THREE.MathUtils.radToDeg(_sph.theta),
       el: 90 - THREE.MathUtils.radToDeg(_sph.phi),
@@ -1452,10 +2236,18 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       // anti-penetration: floor the camera to the ground sample right below it
       // + a small margin, so dollying/panning close to a slope can't dig into
       // the mesh. Cheap XZ-only check (no ray march) — good enough since the
-      // camera moves continuously and this runs every frame.
+      // camera moves continuously and this runs every frame. Also floors
+      // controls.target: a flyTo (e.g. selectPoi) that ends with a bad target
+      // altitude — pos and target are set once at flyTo() time, not touched
+      // again until here — gets caught the very first free-nav frame after
+      // the tween ends (motion.tick() starts returning false again). This
+      // block only runs outside tour/fly-to (guarded by `!motion.tick(dt)`
+      // above), so it never fights Tour's self-managed path.
       if (terrain.sample) {
         const minY = terrain.sample(camera.position.x, camera.position.z) + CAMERA_GROUND_MARGIN
         if (camera.position.y < minY) camera.position.y = minY
+        const minTy = terrain.sample(controls.target.x, controls.target.z) + CAMERA_GROUND_MARGIN
+        if (controls.target.y < minTy) controls.target.y = minTy
       }
     } else {
       keyPan.reset() // no residual glide fighting an active tour/fly-to
@@ -1478,12 +2270,18 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // the new scale), fades the shadows, and re-targets the LOD rings through
     // the hysteresis.
     const camDist = camera.position.distanceTo(controls.target)
+    lastCamDist = camDist // trains.js near-view car-chain LOD reads this via layerCtx().camDist
     const realMode = params.source === 'real' && heightField
     const lodChanged = stage.tickView(camDist, !!realMode)
     const fogScale = stage.fogScale
     terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
     terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
     layers.tickAll(layerCtx(dt)) // anti-z-fight lift tracks the view scale; marker dot rescale / tag crowd control
+    // follow camera: delta-carry off the entity's JUST-updated position above
+    // — must run after layers.tickAll() (this frame's placement) and before
+    // chunkManager.update() below (so DEM streaming follows the carried
+    // target) and camera.updateMatrixWorld() (see design doc §4)
+    follow.tick()
     if (lodChanged && !rebuildPending) {
       // far/near label policies changed — re-sow peaks + spot elevations now
       refreshPoiAnchor()
@@ -1577,6 +2375,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     layer.update?.(layerCtx()) // builds now if the world exists
     invalidate()
     emit('layers') // set list/visibility changed → refresh the panel
+    closePickIfLayerHidden(layerId) // e.g. the popup's station system just got toggled off
   }
 
   const engine = {
@@ -1601,6 +2400,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // spline, then commit. Emits 'tour' {planning:true} up front so the panel can
     // show a loading state; the tick's edge-detect emits {active} on begin/finish.
     async startTour(opts = {}) {
+      follow.stopFollow() // design doc §3 — tour owns the camera outright
       if (opts.from !== undefined) params.tourFrom = opts.from
       if (opts.to !== undefined) params.tourTo = opts.to
       if (opts.mode !== undefined) params.tourMode = opts.mode
@@ -1633,6 +2433,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     selectPoi,
     deselect,
     triggerScan,
+    // camera follow (src/engine/follow.js) — LayerPickCard's Follow button /
+    // App.jsx's corner chip. followEntity returns false without side effects
+    // if the layer/entity can't be resolved right now.
+    followEntity: follow.followEntity,
+    stopFollow: follow.stopFollow,
     // generic marker sets (pure display layer — see markers.js). Same id
     // with `points` replaces the set; without `points` patches color/visible.
     setMarkerSet(id, def) {
@@ -1661,11 +2466,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     setLayerVisible(id, v) {
       const layer = layers.get(id)
       if (!layer) return
+      // param-backed layers route through setParams (which already closes a
+      // matching popup — see LAYER_KEYS check above); the marker-set branch
+      // below has no bulk visibility of its own (setVisible only triggers the
+      // one-shot onActivate fetch) but checks too, for symmetry
       if (layer.visibleParam) setParams({ [layer.visibleParam]: v })
       else {
         layer.setVisible?.(v)
         emit('layers')
         invalidate()
+        closePickIfLayerHidden(id)
       }
     },
     setLayerStyle(id, patch) {
@@ -1681,11 +2491,18 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
         invalidate()
       }
     },
+    // layer-pick popup: X button / any other explicit close (see LayerPickCard.jsx)
+    clearPick() {
+      clearPick()
+    },
     dispose() {
       disposed = true
       cancelAnimationFrame(rafId)
       window.removeEventListener('pointermove', onPointerMove)
       window.removeEventListener('resize', onResize)
+      window.removeEventListener('pointerdown', onPickPointerDown)
+      window.removeEventListener('pointerup', onPickPointerUp)
+      offTimeStore()
       keyPan.dispose()
       controls.dispose()
       stage.renderer.dispose()
@@ -1726,6 +2543,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       },
       invalidate,
       stats,
+      follow,
     },
   }
   engine.debug.engine = engine

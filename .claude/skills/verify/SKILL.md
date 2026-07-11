@@ -8,7 +8,7 @@ description: 啟動並驗證 terrain-art app（dev server、tiles symlink、head
 ## 啟動
 1. dev server 用 Bash `run_in_background: true` 跑 `npm run dev`（`(npm run dev &)` 子 shell 會被回收）。5173 被主 repo 佔用時 Vite 自動挑 5174。
 2. **fresh worktree 必備 symlink**（少任何一個 → "generating terrain…" 永遠卡住）：
-   - `public/tiles` → `../taipei-gis-analytics/data/processed/base_map/terrain_rgb/tiles`（gitignored）
+   - `public/tiles/bathy` → `../taipei-gis-analytics/data/processed/base_map/terrain_rgb/tiles_bathy`（`public/tiles` 本身要是**真實目錄**，`bathy` 是裡面的 symlink 子項；gitignored）。**注意**：`src/engine/dem.js` 的 `TILE_URL` 一律讀 `${TILE_BASE}/bathy/{z}/{x}/{y}.png`（金馬擴圖+南擴+bathymetry 上線後的現況），舊版把 `public/tiles` 直接指到 `terrain_rgb/tiles`（無 `bathy/` 巢狀）或直接指到 `tiles_bathy` 根目錄都會讓每一片 tile 404（vite SPA fallback 回 200 text/html，`fetchTileDirect` 判定 non-image 當作缺失，靜默退化成全 0m 平地——不會報錯、不會卡住 loading，只會整個地形長得像平的，非常容易忽略，2026-07-11 驗證時踩過）
    - `node_modules` → 主 checkout 的 node_modules
 3. `.env` 沒有 `VITE_TILE_BASE` 是正常的：dev 吃本地 `/tiles`，線上才走 R2。
 

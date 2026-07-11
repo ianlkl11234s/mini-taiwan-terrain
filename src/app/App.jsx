@@ -1,13 +1,50 @@
 import { useEffect, useRef, useState } from 'react'
 import { createEngine } from '../engine/index.js'
-import { T, FONT_DATA, glass } from './theme.js'
+import { T, FONT_DATA, FONT_CJK, glass, RAIL_LEFT, RAIL_WIDTH } from './theme.js'
 import IconRailSidebar from './components/IconRailSidebar.jsx'
 import TitleBlock from './components/TitleBlock.jsx'
 import Telemetry from './components/Telemetry.jsx'
+import TimelineBar from './components/TimelineBar.jsx'
 import PoiTags from './components/PoiTags.jsx'
+import LayerPickCard from './components/LayerPickCard.jsx'
 
 // React shell (R2)：engine mount 容器 + 全部 overlay。引擎只透過 facade
 // （createEngine / setParams / 事件）互動，src/engine/ 內部一概不碰。
+
+// 跟隨中角落 chip（src/engine/follow.js，docs/FOLLOW_CAMERA_DESIGN.md §5）——
+// 卡片可能已關，chip 是唯一常駐的解除出口。訂 engine 'follow' 事件，跟
+// LayerPickCard 的按鈕狀態是各自獨立的訂閱者，共同的狀態擁有者是 engine/follow.js。
+function FollowChip({ engine }) {
+  const [follow, setFollow] = useState({ active: false, title: null })
+  useEffect(() => engine.on('follow', (s) => setFollow(s)), [engine])
+  if (!follow.active) return null
+  return (
+    <div
+      style={{
+        ...glass(),
+        position: 'fixed',
+        top: 16,
+        right: 16,
+        zIndex: 20,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '6px 8px 6px 12px',
+        boxShadow: T.shadow,
+      }}
+    >
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--hud-accent)', flexShrink: 0 }} />
+      <span style={{ fontFamily: FONT_CJK, fontSize: T.fs.base, color: T.textStrong, whiteSpace: 'nowrap' }}>跟隨中：{follow.title}</span>
+      <button
+        onClick={() => engine.stopFollow()}
+        title="解除跟隨 Stop following"
+        style={{ all: 'unset', cursor: 'pointer', color: T.textDim, padding: '0 3px', fontFamily: FONT_DATA }}
+      >
+        ✕
+      </button>
+    </div>
+  )
+}
 
 export default function App() {
   const containerRef = useRef(null)
@@ -57,11 +94,30 @@ export default function App() {
       {engine && (
         <>
           <div ref={hudRootRef}>
-            <Telemetry engine={engine} />
+            {/* Telemetry(收合 chip) 疊在 TimelineBar 上方，左下同一個 fixed
+                容器裡用 flex column 堆疊 —— 高度全交給內容自己撐開，不用猜
+                TimelineBar 實際高度去手算第二個 bottom 偏移量 */}
+            <div
+              style={{
+                position: 'fixed',
+                left: RAIL_LEFT + RAIL_WIDTH + 12,
+                bottom: 20,
+                zIndex: 10,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'flex-start',
+                gap: 10,
+              }}
+            >
+              <Telemetry engine={engine} />
+              <TimelineBar />
+            </div>
             <PoiTags engine={engine} />
           </div>
           <TitleBlock engine={engine} />
           <IconRailSidebar engine={engine} />
+          <LayerPickCard engine={engine} />
+          <FollowChip engine={engine} />
         </>
       )}
       <div
