@@ -4,34 +4,26 @@
 
 ## 現況快照
 
-- **本地 main 領先 origin/main 18 個 commit，未 push、未發 PR**（用戶指示：修到一個程度再收）。全部經過驗收、`npm run build` 通過。
-- 本 session 完成（時序）：步道圖層 → 階層面板+點選 popup 系統 → 山頂鑽地修復 → ③海平面 z-fight → ④澎湖擴圖 → ⑤海底地形（GEBCO）→ ①②農田 drape+灌溉渠道 → overzoom/快取/淡綠帶三修 → 金馬+福建擴圖 → 外島海岸線+南界 21.0 → **向量瓦片三期**（OSM 路網分級+點選、農田單田點選、投影錨點修復）→ **列車 MVP**（TRA 992 班時刻表光點）。
-- 設計文件（opus 審定、實作前必讀）：`docs/BATHYMETRY_DESIGN.md`、`docs/VECTOR_TILES_DESIGN.md`。
+- **本地 main 領先 origin/main 21 個 commit，未 push、未發 PR**（用戶指示：修到一個程度再收）。全部經過驗收、`npm run build` 通過。
+- 本 session 完成（時序）：步道圖層 → 階層面板+點選 popup 系統 → 山頂鑽地修復 → ③海平面 z-fight → ④澎湖擴圖 → ⑤海底地形（GEBCO）→ ①②農田 drape+灌溉渠道 → overzoom/快取/淡綠帶三修 → 金馬+福建擴圖 → 外島海岸線+南界 21.0 → **向量瓦片三期**（OSM 路網分級+點選、農田單田點選、投影錨點修復）→ **列車 MVP**（TRA 992 班時刻表光點）→ **時間軸**（見下節）。
+- 設計文件（opus 審定、實作前必讀）：`docs/BATHYMETRY_DESIGN.md`、`docs/VECTOR_TILES_DESIGN.md`、`docs/TIMELINE_DESIGN.md`。
 - R2 資產現況：`terrain-tiles/`（本島舊磚，舊版前端用）、`terrain-tiles/bathy/`（8,096 磚，現行前端唯一讀取路徑）、`terrain-tiles/vector/`（osm_road_drive.pmtiles 59MB + ftw_fields_2025.pmtiles 107MB）。
 - bbox 現況：117.8–123.5E / 21.0–26.5N（含金馬澎+福建沿岸+巴士海峽）。
 
-## 下一項（用戶已指定）：時間軸
+## 時間軸（2026-07-11 完成）
 
-把左下 TELEMETRY 面板**換成 pulse 風格的時間軸控制列**（用戶提供截圖規格）：
+pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收合為 FPS 膠囊，點擊展開，功能未刪）。
 
-```
-[◀] [7/11 (六)] [▶]  [Now]  [1d ▾]
-[▶播放] [60x ▾]  00:32
-[——●———————————————] 00:00 ~ 23:59
-```
-
-- 元件：日期前後切換、Now 回現在、範圍選擇（先 1d）、播放/暫停、倍速（60x 等）、當前時刻顯示、當日 scrubber
-- **架構鐵則（CLAUDE.md 已載）**：採 pulse External Time Store 模式——`currentTime` 存 module 變數不進 React state/deps，三種訂閱粒度（每幀/節流/跨日），參考 `../mini-taiwan-pulse/src/state/timeStore.ts` + `hooks/useTimeline.ts` + `docs/TIMELINE_ARCHITECTURE.md`
-- **第一個消費者：列車圖層**——`src/engine/trains.js` 的 `update(daySec)` 已是純函式，把現行「牆鐘+trainsTimeOffset」換成 timeStore 訂閱即可；倍速播放時列車加速跑
-- TELEMETRY 資訊移到 debug 面板或收合角落（別直接刪功能）
-- UI 走 terrain-art 紙質 FUI 風格，不照抄 pulse 深色
-- 之後的時序圖層（雨量、水位）都吃同一個 store
+- **架構 = lazy-clock 變體**（設計 SSOT：`docs/TIMELINE_DESIGN.md`，opus 審定）：`src/state/timeStore.js` 時間永遠現算不用迴圈推進；UI 用 **epoch snapshot** 綁 useSyncExternalStore（裸 getTime 會無限重繪、快取時間數字會讓播放鈕卡住——都在設計 §5 陷阱）；live-follow 旗標吸收 suspend/resume 漂移
+- 列車已改吃 `timeStore.getDaySeconds()`；`trainsTimeOffset` 已全面移除（時間軸 scrub 取代）
+- on-demand render 四象限驗收過：列車可見+暫停、隱藏+播放都凍結 renderCount
+- **之後的時序圖層（雨量、水位）都吃同一顆 store**：`subscribeThrottled`（著色）+ `subscribeDate`（跨日載資料，本期尚無消費者、未被實戰驗證）
 
 ## Backlog（優先序供參，用戶隨時重排）
 
 | # | 項目 | 脈絡 |
 |---|------|------|
-| 1 | **時間軸**（上述） | 用戶指定下一項 |
+| 1 | ~~時間軸~~ ✅ 2026-07-11 完成 | 見上節；設計 `docs/TIMELINE_DESIGN.md` |
 | 2 | 列車二期：點選班次資訊卡、3D 車廂、**跟隨鏡頭** | 跟隨鏡頭無範本（v3/pulse 都沒做），需從零設計且不與 tour.js 打架；盤點結論在 session 記錄 |
 | 3 | rail_lines.json 切段點維護 | 切段點不在真轉乘站 → 16% 班次無法全段映射（桃園↔板橋、羅東↔花蓮等）；修好整班涵蓋 84%→~98%（`scripts/bake_trains.py` 會回報涵蓋率） |
 | 4 | OSM 步道圖層 | 需上游 analytics 從 PBF 重抽全台 walk network（path/footway/steps/track ~19 萬邊，現有萃取只有 9 城市）；OSM 無 sac_scale 難度標籤 |
