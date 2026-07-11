@@ -64,6 +64,7 @@ export function createMotion({ params, camera, controls, sample, getPois, ensure
     p1: new THREE.Vector3(),
     t0: new THREE.Vector3(),
     t1: new THREE.Vector3(),
+    onArrive: null, // optional callback, fired once from tick() when t reaches 1 — see flyTo()/cancel()
   }
 
   const tour = {
@@ -92,13 +93,20 @@ export function createMotion({ params, camera, controls, sample, getPois, ensure
   const Z_AXIS = new THREE.Vector3(0, 0, 1)
   const UP = new THREE.Vector3(0, 1, 0)
 
-  function flyTo(pos, target) {
+  // onArrive (optional): fired once from tick() the frame this tween reaches
+  // t=1 — "natural completion", never on a cancel() (see cancel(), which
+  // drops any pending callback before it can fire). follow.js's engage
+  // sequencing (docs/FOLLOW_CAMERA_DESIGN.md §3) is the reason this exists —
+  // edge-detecting tweenActive from outside can't tell "arrived" from "got
+  // cancelled mid-flight" apart, since both leave it false.
+  function flyTo(pos, target, onArrive) {
     tween.p0.copy(camera.position)
     tween.t0.copy(controls.target)
     tween.p1.copy(pos)
     tween.t1.copy(target)
     tween.t = 0
     tween.active = true
+    tween.onArrive = onArrive || null
   }
 
   // ---------------------------------------------------------------- geometry helpers
@@ -551,10 +559,14 @@ export function createMotion({ params, camera, controls, sample, getPois, ensure
     camera.up.set(0, 1, 0)
   }
 
-  // user grabbing the camera cancels any fly-to or tour (and aborts planning)
+  // user grabbing the camera cancels any fly-to or tour (and aborts planning).
+  // Drops any pending onArrive too — a cancelled flight must NOT fire it (see
+  // flyTo's doc); tick()'s tween branch only reaches the callsite below on a
+  // t>=1 arrival, so this is belt-and-suspenders, not load-bearing on its own.
   function cancel() {
     planGen++
     tween.active = false
+    tween.onArrive = null
     tour.active = false
     camera.up.set(0, 1, 0)
   }
@@ -603,7 +615,12 @@ export function createMotion({ params, camera, controls, sample, getPois, ensure
       camera.position.lerpVectors(tween.p0, tween.p1, e)
       controls.target.lerpVectors(tween.t0, tween.t1, e)
       camera.lookAt(controls.target)
-      if (tween.t >= 1) tween.active = false
+      if (tween.t >= 1) {
+        tween.active = false
+        const onArrive = tween.onArrive
+        tween.onArrive = null // clear before invoking — never fire twice
+        onArrive?.()
+      }
       return 'tween'
     }
     return null

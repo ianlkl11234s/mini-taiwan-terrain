@@ -384,6 +384,14 @@ export function createTrainsLayer(params, config = {}) {
   // small for a true raycast, so pick() projects these with the raycaster's
   // own camera and compares to the click's screen pixel).
   let lastHits = []
+  // trainNo -> {x,y,z}, refreshed every layout() call alongside lastHits —
+  // O(1) lookup for getEntityPosition() (follow camera, see index.js/
+  // follow.js), keyed by the SCHEDULE's train_no (stable across rebuilds,
+  // unlike an instance index — see module header's getEntityPosition doc).
+  // Dot mode: one entry per active train. Car mode: the HEAD car only (c===0)
+  // — that's "the train's position" for a chained car-mesh the same way the
+  // single dot was for the far-view LOD.
+  const hitByTrainNo = new Map()
 
   function gate() {
     return params.source === 'real' && !!hf && params[visibleKey] && dataReady
@@ -527,6 +535,7 @@ export function createTrainsLayer(params, config = {}) {
     const proj = hf.projection
     const exaggeration = params.demExaggeration
     lastHits.length = 0
+    hitByTrainNo.clear()
     return carMode ? layoutCars(proj, exaggeration) : layoutDots(proj, exaggeration)
   }
 
@@ -546,6 +555,7 @@ export function createTrainsLayer(params, config = {}) {
       _dummy.setPosition(w.x, y, w.z)
       dotMesh.setMatrixAt(count, _dummy)
       lastHits.push({ train: tr, elapsed, x: w.x, y, z: w.z })
+      hitByTrainNo.set(tr.trainNo, { x: w.x, y, z: w.z })
       count++
     }
     dotMesh.count = count
@@ -625,6 +635,7 @@ export function createTrainsLayer(params, config = {}) {
         _dummy.setPosition(bx, by, bz)
         carMesh.setMatrixAt(instCount, _dummy)
         lastHits.push({ train: tr, elapsed, x: bx, y: by, z: bz })
+        if (c === 0) hitByTrainNo.set(tr.trainNo, { x: bx, y: by, z: bz }) // head car = "the train's position"
         instCount++
       }
       trainCount++
@@ -682,6 +693,16 @@ export function createTrainsLayer(params, config = {}) {
       applyStyle()
     },
 
+    // follow camera (src/engine/follow.js, docs/FOLLOW_CAMERA_DESIGN.md §2):
+    // entityId = train_no, stable across rebuilds (unlike an instance index).
+    // group.visible check FIRST — a hidden layer must read as "entity gone"
+    // (null) even though hitByTrainNo may still hold last-active-frame data,
+    // otherwise follow would keep carrying a camera on a layer nobody can see.
+    getEntityPosition(trainNo) {
+      if (!group.visible) return null
+      return hitByTrainNo.get(trainNo) ?? null
+    },
+
     // click-to-inspect (see index.js pointerup handler / layers.pickAll).
     // Same proximity-pick approach as markers.js's pick(): the dots are only
     // a few px on screen (DOT_R), too small for a real raycast, so this
@@ -729,6 +750,9 @@ export function createTrainsLayer(params, config = {}) {
           ['發車時刻 Departure', fmtHHMM(train.firstDep)],
         ],
         worldPos: new THREE.Vector3(x, y, z),
+        // follow camera opt-in (src/engine/follow.js) — entityId = train_no,
+        // resolved back to a live position each frame via getEntityPosition above
+        followable: { layerId: id, entityId: train.trainNo },
       }
     },
 

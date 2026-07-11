@@ -18,6 +18,7 @@ import { ChunkManager } from './chunks.js'
 import { findRealPeaks } from './peaks.js'
 import { createStage, LOD_MIN, LOD_MAX, LOD_D0 } from './scene.js'
 import { createMotion } from './tour.js'
+import { createFollow } from './follow.js'
 import { createKeyPan } from './keypan.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
@@ -29,7 +30,11 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 //   - createEngine({ container, params }) → engine
 //   - engine.setParams(patch) / getParams()  — parameter dispatch table
 //   - engine.flyTo / startTour / stopTour / selectPoi / deselect / triggerScan
-//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params'
+//   - engine.followEntity(layerId, entityId) / stopFollow() — camera follow
+//     (src/engine/follow.js, docs/FOLLOW_CAMERA_DESIGN.md); a layer opts in by
+//     implementing getEntityPosition(entityId) and returning `followable:
+//     {layerId, entityId}` from its pick() payload (see trains.js)
+//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params' 'follow'
 // UI never reaches into scene internals; debug/verify scripts use engine.debug.
 
 // Taiwan presets: [lat, lon, zoom]. P1: one streamed world locked to z12 —
@@ -790,6 +795,22 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     worldPerMeter: () => (heightField ? heightField.projection.K * params.demExaggeration : 0),
   })
 
+  // follow camera: the fifth motion source (see src/engine/follow.js header +
+  // docs/FOLLOW_CAMERA_DESIGN.md). This module never decides WHO cancels it —
+  // it just reacts to followEntity()/stopFollow() and polls motion/controls
+  // state each tick. The mutex wiring (who calls stopFollow) is below, at
+  // every OTHER motion-source entry point (keyPan.onEngage, selectPoi,
+  // deselect, flyToLonLat, startTour) — never on controls 'start' (would kill
+  // rotate/zoom too, see design doc §3).
+  const follow = createFollow({
+    camera,
+    controls,
+    motion,
+    layers,
+    invalidate,
+    onChange: (s) => emit('follow', s),
+  })
+
   // ---------------------------------------------------------------- tour path preview
   // A translucent accent line of the planned route, rebuilt whenever the panel
   // changes from/to/mode/offset. Removed the instant a tour starts and cleared
@@ -859,6 +880,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     controls,
     onEngage: () => {
       motion.cancel()
+      follow.stopFollow() // keyPan writes target directly, not via controls.state — can't be caught by follow's own pan detector
       invalidate()
     },
   })
@@ -872,6 +894,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function selectPoi(i) {
     const p = pois[i]
     if (!p) return
+    follow.stopFollow() // POI focus and follow both own the tween — POI wins on click
     invalidate()
     if (selectedPoi === -1) {
       returnPose.pos.copy(camera.position)
@@ -908,6 +931,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
 
   function deselect() {
+    follow.stopFollow() // the return-flight tween below must not fight delta-carry (design doc §3)
     invalidate()
     selectedPoi = -1
     emit('selection', { index: -1, poi: null })
@@ -1697,6 +1721,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       setTimeout(() => emit('loading', { active: false, message: 'generating terrain…' }), 2600)
       return false
     }
+    follow.stopFollow() // covers flyTo/applyPreset/custom-coordinate callers alike (design doc §3)
     invalidate()
     const { x, z } = heightField.projection.lonLatToWorld(lon, lat)
     _flyOffset.subVectors(camera.position, controls.target) // keep the current view offset
@@ -2057,8 +2082,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     pickRaycaster.pickPx = { x: e.clientX, y: e.clientY } // markers.js pick(): screen-space hit test for tiny instanced dots
     const hit = layers.pickAll(pickRaycaster)
     if (hit) {
-      activePick = { title: hit.title, rows: hit.rows, worldPos: hit.worldPos.clone(), layerId: hit.layerId }
-      emit('pick', { title: hit.title, rows: hit.rows, layerId: hit.layerId })
+      activePick = { title: hit.title, rows: hit.rows, worldPos: hit.worldPos.clone(), layerId: hit.layerId, followable: hit.followable }
+      emit('pick', { title: hit.title, rows: hit.rows, layerId: hit.layerId, followable: hit.followable })
     } else {
       activePick = null
       emit('pick', null)
@@ -2252,6 +2277,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
     terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
     layers.tickAll(layerCtx(dt)) // anti-z-fight lift tracks the view scale; marker dot rescale / tag crowd control
+    // follow camera: delta-carry off the entity's JUST-updated position above
+    // — must run after layers.tickAll() (this frame's placement) and before
+    // chunkManager.update() below (so DEM streaming follows the carried
+    // target) and camera.updateMatrixWorld() (see design doc §4)
+    follow.tick()
     if (lodChanged && !rebuildPending) {
       // far/near label policies changed — re-sow peaks + spot elevations now
       refreshPoiAnchor()
@@ -2370,6 +2400,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // spline, then commit. Emits 'tour' {planning:true} up front so the panel can
     // show a loading state; the tick's edge-detect emits {active} on begin/finish.
     async startTour(opts = {}) {
+      follow.stopFollow() // design doc §3 — tour owns the camera outright
       if (opts.from !== undefined) params.tourFrom = opts.from
       if (opts.to !== undefined) params.tourTo = opts.to
       if (opts.mode !== undefined) params.tourMode = opts.mode
@@ -2402,6 +2433,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     selectPoi,
     deselect,
     triggerScan,
+    // camera follow (src/engine/follow.js) — LayerPickCard's Follow button /
+    // App.jsx's corner chip. followEntity returns false without side effects
+    // if the layer/entity can't be resolved right now.
+    followEntity: follow.followEntity,
+    stopFollow: follow.stopFollow,
     // generic marker sets (pure display layer — see markers.js). Same id
     // with `points` replaces the set; without `points` patches color/visible.
     setMarkerSet(id, def) {
@@ -2507,6 +2543,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       },
       invalidate,
       stats,
+      follow,
     },
   }
   engine.debug.engine = engine
