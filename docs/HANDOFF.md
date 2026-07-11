@@ -27,7 +27,7 @@ pulse 風格時間軸控制列已上線，取代左下 TELEMETRY（TELEMETRY 收
 | 2 | ~~列車二期~~ ✅ 2026-07-11 全數完成 | 資訊卡＋3D 車廂（近景 LOD 鏈狀 instanced box，hysteresis 7/10 world units）＋跟隨鏡頭（delta-carry，設計 SSOT `docs/FOLLOW_CAMERA_DESIGN.md` opus 審定；follow.js 也支援未來 ships 的 mmsi） |
 | 3 | ~~rail_lines.json 切段點維護~~ ✅ 2026-07-11 完成 | `scripts/fix_rail_cuts.py` 簡單路徑分解重縫，全段涵蓋 **84%→100%**、leg 98.7%→100%；幾何聯集不變（`verify_rail_geometry.py` 可重驗）、thsr byte-identical |
 | 4 | OSM 步道圖層 | 需上游 analytics 從 PBF 重抽全台 walk network（path/footway/steps/track ~19 萬邊，現有萃取只有 9 城市）；OSM 無 sac_scale 難度標籤 |
-| 5 | Cloudflare Cache Rule（`.pmtiles` **＋ `/ships/trails/*.json`**） | **用戶手動**：dashboard 對 tiles.itsmigu.com 加 Cache Rule，否則每個請求回源（兩路徑實測都 cf-cache-status: DYNAMIC）；船舶快照單檔 3.7–7.4MB、Cloudflare 會 zstd 壓縮 |
+| 5 | ~~Cloudflare Cache Rule~~ ✅ 2026-07-11 用戶完成 | 單一規則涵蓋 `.pmtiles`+`/ships/trails/`，Edge TTL 7d ignore-origin；實測兩路徑 HIT。**注意**：重烘 pmtiles 同名覆寫後要 Purge Cache（或之後把 purge 加進上傳腳本） |
 | 6 | Worker 逃生艙（向量瓦片） | z14 密集瓦片解碼移 Web Worker；壓測 56-84fps 暫不需要，設計 §3 有方案 |
 | 7 | 澎湖 DTM 相位對齊 | mosaic 網格相位未對齊造成 bathy 磚 ~3m 微漂移；下次重烘用金門同款 `-te` 相位對齊手法一併修（analytics `docs/data-catalog/base_map/dtm_20m_kinmen.md` 有完整記錄） |
 | 8 | 綠島/龜山島 DEM 補洞 | 主 DEM 這兩島是 nodata（蘭嶼有值）；分幅版 dataset 35430 可能有 |
