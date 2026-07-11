@@ -442,7 +442,7 @@ export function createTrainsLayer(params) {
         id: 'trains',
         kind: 'point',
         label: 'Trains',
-        rowLabel: `台鐵列車 Trains（目前行駛中 ${lastActiveCount} 班）`,
+        rowLabel: '台鐵列車 Trains',
         count: lastActiveCount,
         visible: params.trainsVisible,
         styleSchema: {

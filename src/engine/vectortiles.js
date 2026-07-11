@@ -1134,7 +1134,7 @@ export function createFtwFieldsLayer(params, { invalidate } = {}) {
         id: 'ftw_fields',
         kind: 'area',
         label: 'Fields (vector)',
-        rowLabel: '農田(向量) Fields — 近景單田可點選；遠景農田分佈請改開「農田 Farmland」(farm_sim) drape',
+        rowLabel: '農田(向量) Fields',
         count: manager.tiles.size, // live tile count, not feature count (matches roads' describe convention)
         visible: params.ftwFieldsVisible,
         styleSchema: FIELDS_STYLE_SCHEMA,

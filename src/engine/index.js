@@ -98,10 +98,13 @@ export const DEFAULT_PARAMS = {
   // docs/BATHYMETRY_DESIGN.md) — this toggle only switches SHADING (ramp +
   // uHeightRange/uSeaLevelY/uSeaSplit + the region sea plane's opacity, see
   // terrain.js applyBathymetryShading / index.js's bathymetryVisible HANDLER).
-  // No re-fetch, no chunk rebuild. Default off keeps land rendering
-  // bit-identical to before; open ocean now shows subtle (white-shaded)
-  // seafloor relief since depth is baked into the mesh itself.
-  bathymetryVisible: false,
+  // No re-fetch, no chunk rebuild. Default ON (2026-07-11 user default) —
+  // open ocean shows the (white-shaded) seafloor relief immediately on load;
+  // land rendering is unaffected either way since depth is baked into the
+  // mesh regardless of this toggle. See regionSeaOpacity below: its default
+  // is kept in sync with what this toggle's HANDLER would set, so boot state
+  // matches post-toggle state without needing to flip it once.
+  bathymetryVisible: true,
   bathyDeepColor: '#0b1f36',
   bathyShallowColor: '#4a90c2',
   // very pale green coastal band (~0 to -15~-25 m) between bathyShallowColor
@@ -159,6 +162,15 @@ export const DEFAULT_PARAMS = {
   trailsWidth: 2,
   trailsOpacity: 0.9,
   trailsColor: '#5a8f3d',
+  // point-layer styleSchema defaults (markers.js createPointLayer's size/
+  // opacity sliders — POINT_STYLE). Key names are derived from each layer's
+  // id (${id}Size/${id}Opacity — see createPointLayer). 1.0/0.9 match the
+  // hardcoded pre-slider defaults (DOT_R multiplier / dot material opacity),
+  // so adding these sliders is a no-op on first load.
+  stationsSize: 1.0,
+  stationsOpacity: 0.9,
+  markersSize: 1.0,
+  markersOpacity: 0.9,
   // rivers: the river layer's BODY is a physics-derived flow-accumulation tint
   // painted into the terrain shader (terrain.js uRiverTex, whole-island bake
   // public/layers/river_sim.png — the retired vector centerlines are gone). ONE
@@ -213,11 +225,12 @@ export const DEFAULT_PARAMS = {
   // Deferred: public/layers/region_coast.json fetched on first switch-on.
   regionVisible: false,
   regionSeaColor: '#c2e0ff', // light blue sea (user default, RGB 194 224 255)
-  // opaque by default so bathymetry-off matches the app's pre-bathymetry
-  // look; the bathymetryVisible HANDLER drops this to 0.5 while seafloor
-  // shading is on, so the semi-transparent plane reveals the relief beneath
-  // it (see docs/BATHYMETRY_DESIGN.md §2.5).
-  regionSeaOpacity: 1.0,
+  // 0.5 to match bathymetryVisible's default-on state (the bathymetryVisible
+  // HANDLER sets the same 0.5 whenever it's toggled on, so the semi-
+  // transparent plane reveals the relief beneath it — see
+  // docs/BATHYMETRY_DESIGN.md §2.5); toggling bathymetry off flips this back
+  // to 1.0 via that same HANDLER.
+  regionSeaOpacity: 0.5,
   regionLineColor: '#303030', // dark-grey coastline (user default, RGB 48 48 48)
   regionLineWidth: 1.3,
   regionLineOpacity: 0.9,
@@ -440,7 +453,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
 
   const layers = new LayerManager(scene)
-  const pointLayer = createPointLayer(params) // marker sets — imperative set API preserved
+  // hidden: true — no UI ever calls setMarkerSet (console/scripting escape
+  // hatch only, see engine.setMarkerSet/removeMarkerSet/listMarkerSets below),
+  // so the Layers panel omits its row entirely (see Layers.jsx's hidden
+  // filter). The layer itself stays fully registered/functional — build/
+  // update/tickView still run and setMarkerSet still creates real 3D markers.
+  const pointLayer = createPointLayer(params, { hidden: true }) // marker sets — imperative set API preserved
   // display labels for the station marker systems (see stationsLayer pickRows
   // below) — the baked stations.json carries only the bare system id
   const STATION_SYSTEM_LABELS = {

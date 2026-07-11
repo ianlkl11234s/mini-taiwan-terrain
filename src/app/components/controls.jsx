@@ -61,8 +61,21 @@ export function Row({ label, children, onClick, active }) {
         background: active ? T.rowActive : 'transparent',
       }}
     >
-      <span style={{ fontFamily: FONT_CJK, fontSize: T.fs.md, color: T.textDefault, whiteSpace: 'nowrap' }}>{label}</span>
-      {children}
+      <span
+        title={label}
+        style={{
+          fontFamily: FONT_CJK,
+          fontSize: T.fs.md,
+          color: T.textDefault,
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          minWidth: 0,
+        }}
+      >
+        {label}
+      </span>
+      <span style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>{children}</span>
     </div>
   )
 }

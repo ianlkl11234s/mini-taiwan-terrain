@@ -64,12 +64,17 @@ export default function Layers({ engine }) {
   // before the group was switched off (session-only, not persisted)
   const lastOnRef = useRef({})
 
-  const groups = groupLayers(layers)
+  // hidden layers (e.g. the console-only generic 'markers' scaffold — see
+  // markers.js createPointLayer's `hidden` option) stay fully registered/
+  // functional in the engine, just omitted from the panel and its bulk
+  // actions (ALL OFF / theme master switch).
+  const visibleLayers = layers.filter((l) => !l.hidden)
+  const groups = groupLayers(visibleLayers)
 
   return (
     <div>
       <button
-        onClick={() => layers.forEach((l) => setLayerFullyVisible(engine, l, false))}
+        onClick={() => visibleLayers.forEach((l) => setLayerFullyVisible(engine, l, false))}
         style={{
           all: 'unset',
           cursor: 'pointer',
@@ -226,7 +231,7 @@ function SubgroupTag({ children }) {
 // collapsed by default — the improvement over the old always-shown layout).
 function LayerRow({ engine, layer, expanded, onToggleExpand }) {
   if (layer.sets !== undefined) {
-    return <MarkerSetLayer engine={engine} layer={layer} />
+    return <MarkerSetLayer engine={engine} layer={layer} expanded={expanded} onToggleExpand={onToggleExpand} />
   }
   const hasStyle = !!layer.styleSchema
   return (
@@ -276,13 +281,56 @@ function StyleControl({ value, schema, onChange }) {
   return <Slider label={schema.label} min={schema.min} max={schema.max} step={schema.step} value={value} onChange={onChange} format={schema.format} />
 }
 
-// marker sets: the layer's own name as a small label, then a dynamic list —
-// one toggle per set (per-system visibility, e.g. one row per transit system)
-function MarkerSetLayer({ engine, layer }) {
+// marker sets: the layer's own name as a small label (+ styleSchema chevron,
+// e.g. stations' size/opacity sliders — same pattern as LayerRow's plain
+// branch), then a dynamic list — one toggle per set (per-system visibility,
+// e.g. one row per transit system)
+function MarkerSetLayer({ engine, layer, expanded, onToggleExpand }) {
   const sets = layer.sets
+  const hasStyle = !!layer.styleSchema
   return (
     <div>
-      <div style={{ fontFamily: FONT_CJK, fontSize: T.fs.md, color: T.textDefault, padding: '5px 8px 0' }}>{layer.rowLabel ?? layer.label}</div>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, padding: '5px 8px 0' }}>
+        <span
+          title={layer.rowLabel ?? layer.label}
+          style={{
+            fontFamily: FONT_CJK,
+            fontSize: T.fs.md,
+            color: T.textDefault,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            minWidth: 0,
+          }}
+        >
+          {layer.rowLabel ?? layer.label}
+        </span>
+        {hasStyle && (
+          <button
+            onClick={onToggleExpand}
+            title={expanded ? '收合樣式 Collapse' : '展開樣式 Expand'}
+            style={{
+              all: 'unset',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              flexShrink: 0,
+              color: T.textFaint,
+              transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)',
+              transition: 'transform 0.15s',
+            }}
+          >
+            <Icon name="chevronDown" size={12} strokeWidth={2} />
+          </button>
+        )}
+      </div>
+      {hasStyle && expanded && (
+        <div style={{ marginLeft: 10 }}>
+          {Object.entries(layer.styleSchema).map(([key, sch]) => (
+            <StyleControl key={key} value={layer.style[key]} schema={sch} onChange={(v) => engine.setLayerStyle(layer.id, { [key]: v })} />
+          ))}
+        </div>
+      )}
       <div style={{ marginLeft: 10 }}>
         {sets.length === 0 ? (
           <div style={{ fontFamily: FONT_DATA, fontSize: T.fs.sm, color: T.textFaint, padding: '2px 8px' }}>NO MARKER SETS</div>
