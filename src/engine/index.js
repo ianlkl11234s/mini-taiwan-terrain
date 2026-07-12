@@ -304,14 +304,16 @@ export const DEFAULT_PARAMS = {
   // zones don't read as a solid opaque blob (design brief).
   airspaceVisible: false,
   airspaceOpacity: 0.25,
-  // power towers / wind turbines: InstancedMesh point layers with real 3D
-  // silhouettes (src/engine/energy.js), gated to near-view only (see that
-  // module's camDist hysteresis) — size scales footprint only, never true
-  // height (matches trains.js's widthM/heightM convention).
-  powerTowersVisible: false,
+  // power towers / wind turbines: two sets each (src/engine/energy.js) — 立體
+  // 3D (InstancedMesh point layers with real 3D silhouettes, gated to
+  // near-view only — see that module's camDist hysteresis) and 點位 Dots (a
+  // full always-resident point cloud, no gate). No single …Visible param
+  // anymore: visibility is per-set (ports/hospitals/medical panel
+  // convention — see energy.js's setState/sets facade); size scales
+  // footprint only, never true height (matches trains.js's widthM/heightM
+  // convention), and also scales the dots' screen-space point size.
   powerTowersSize: 1.0,
   powerTowersOpacity: 0.9,
-  windTurbinesVisible: false,
   windTurbinesSize: 1.0,
   windTurbinesOpacity: 0.95,
   // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
@@ -776,8 +778,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
   const buildingsLayer = createBuildingsLayer(params, { invalidate })
   const airspaceLayer = createAirspaceLayer(params)
-  const powerTowersLayer = createPowerTowersLayer(params)
-  const windTurbinesLayer = createWindTurbinesLayer(params)
+  const powerTowersLayer = createPowerTowersLayer(params, { onActivate: () => loadPowerTowersData() })
+  const windTurbinesLayer = createWindTurbinesLayer(params, { onActivate: () => loadWindTurbinesData() })
   const shipsLayer = createShipsLayer(params)
   const currentsLayer = createCurrentsLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
@@ -2351,24 +2353,6 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       airspaceLayer.update(layerCtx())
     },
     airspaceOpacity: () => airspaceLayer.update(layerCtx()),
-    // power towers / wind turbines: manifest-driven deferred point layers,
-    // same first-switch-on-fetches pattern. size/opacity just re-run update()
-    // (buildings/trains convention) — energy.js's own tickView/update staleness
-    // checks (lastSizeMult/lastExaggeration) pick up the new params[key] value
-    // and re-lay-out on the very next frame (setParams's trailing invalidate()
-    // guarantees one happens).
-    powerTowersVisible: (v) => {
-      if (v) loadPowerTowersData()
-      powerTowersLayer.update(layerCtx())
-    },
-    powerTowersSize: () => powerTowersLayer.update(layerCtx()),
-    powerTowersOpacity: () => powerTowersLayer.update(layerCtx()),
-    windTurbinesVisible: (v) => {
-      if (v) loadWindTurbinesData()
-      windTurbinesLayer.update(layerCtx())
-    },
-    windTurbinesSize: () => windTurbinesLayer.update(layerCtx()),
-    windTurbinesOpacity: () => windTurbinesLayer.update(layerCtx()),
     // region: first switch-on fetches the neighbouring coastlines (deferred);
     // the sea plane + style params re-run the layer's update
     regionVisible: (v) => {
@@ -2725,6 +2709,19 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // the hysteresis.
     const camDist = camera.position.distanceTo(controls.target)
     lastCamDist = camDist // trains.js near-view car-chain LOD reads this via layerCtx().camDist
+    // MapControls' drag-pan is screen-space (a fixed fraction of the visible
+    // ground plane per pixel of mouse movement), so it ALSO crawls once
+    // minDistance (scene.js, 0.08 ≈ 40 m) is hugging the hillside — same
+    // problem keyPan's own camDist-scaled speed has, just via a different
+    // knob. panSpeed is pure input sensitivity (three.js multiplies the
+    // per-pixel pan delta by it) — never touches rendering, so no
+    // invalidate() is needed here; the very next drag frame just reads the
+    // updated value. At camDist ≥ 0.35 this clamps to exactly 1 (identical to
+    // the untouched default), so far-view drag feel is byte-for-byte
+    // unchanged; below that it ramps up to 4× as camDist shrinks toward
+    // minDistance. Per-frame cost is one divide + clamp — negligible next to
+    // the rest of this function.
+    controls.panSpeed = THREE.MathUtils.clamp(0.35 / camDist, 1, 4)
     const realMode = params.source === 'real' && heightField
     const lodChanged = stage.tickView(camDist, !!realMode)
     const fogScale = stage.fogScale

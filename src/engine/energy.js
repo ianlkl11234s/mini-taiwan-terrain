@@ -46,6 +46,33 @@ import { metersToWorldY, drapeAt } from './geo.js'
 // keeps the layer OUT of the render loop's isAnimating() set, matching the
 // on-demand-render mandate (an animated blade would force continuous
 // rendering exactly like typhoon/seaAnimated do, which nothing here asked for).
+//
+// ---- two display "sets" per layer: 立體 3D / 點位 Dots (2026-07-12) ------
+// Both layers now follow the ports/hospitals/medical "sets" panel convention
+// (see medical.js header) instead of a single visibleParam/paramMap toggle:
+//   立體 3D    — the near-view InstancedMesh silhouettes described above,
+//                unchanged mechanics, just wrapped as one independently-
+//                toggleable set.
+//   點位 Dots  — ALL points, ALWAYS resident, NO camDist/lodZoom gate at all
+//                (the whole point is to see nationwide distribution at any
+//                zoom, including the far views where 立體 3D never
+//                activates). One THREE.Points cloud per layer — a single
+//                draw call regardless of count (26,589 towers / 812
+//                turbines), sizeAttenuation OFF so each dot stays a small
+//                constant ~3px on screen instead of ballooning as the camera
+//                dollies in. Built once positions + a live heightField exist
+//                (先空後填 — see ensureDotsBuilt/computeDotPositions below);
+//                only the Y column is ever recomputed after that (on a
+//                demExaggeration change), never rebuilt from scratch.
+// Both sets default to visible: true (medical.js's makeCatState convention)
+// — the brief's design: far away you see the dots' spread, dolly in and the
+// 3D silhouettes fade in on top of the same points (deliberately allowed to
+// overlap; a nearby dot sitting inside its own 3D tower's footprint reads as
+// "this is the same object at two LODs", not as clutter). Activation
+// (fetching the manifest JSON) is the same one-shot onActivate/setVisible
+// hook medical.js/markers.js use: the panel shows a single plain toggle
+// until first switched on, then the two per-set rows take over (see
+// describe()'s `sets` field).
 
 const TOWER_HEIGHT_BY_CLASS = { 0: 25, 1: 40, 2: 55 } // meters — MUST mirror bake_energy.py's TOWER_HEIGHT_BY_CLASS
 const TOWER_BASE_RADIUS_M = 2.2
@@ -62,6 +89,12 @@ const TOWER_GATHER_RADIUS = 9 // world units around the pan center — subset ac
 const TOWER_REBUILD_DELTA = 1.5 // world units the pan center must move before re-scanning the grid
 const TOWER_MAX_INSTANCES = 3000 // generous headroom over measured corridor density — see handoff report
 const TOWER_GRID_CELL = 2 // world units
+// 點位 Dots set: same steel-gray as the 3D silhouette's TOWER_COLOR — visually
+// checked (2026-07-12) against both the tan mountain color ramp and the pale
+// low-elevation plains: a lighter tint washed out badly on the plains, this
+// exact color reads clearly on both.
+const TOWER_DOT_COLOR = TOWER_COLOR
+const TOWER_DOT_PX = 4 // base gl_PointSize (sizeAttenuation off, in device px) — devicePixelRatio 2 -> ~2 CSS px
 
 const TURBINE_HEIGHT_M = 80 // fixed per the design brief — capacity_mw does not change tower height
 const TURBINE_TOWER_RADIUS_M = 2
@@ -75,8 +108,17 @@ const TURBINE_COLOR = '#f2f4f6'
 const TURBINE_NEAR_ENTER_DIST = 10 // world units — a bit further than towers (visually larger, sparser, more notable)
 const TURBINE_NEAR_EXIT_DIST = 14
 const TURBINE_LOD_ZOOM_MIN = 12
+// 點位 Dots set: a clear saturated cyan, same "白/青" family as the 3D
+// silhouette's near-white TURBINE_COLOR but pulled further from white —
+// visually checked (2026-07-12): TURBINE_COLOR itself (near-white) all but
+// vanished against both the pale low-elevation plains and light fog; this
+// cyan reads clearly against terrain tan, mountain gray, AND white plains.
+const TURBINE_DOT_COLOR = '#29b6d8'
+const TURBINE_DOT_PX = 4.5 // slightly larger than towers' dot — turbines are the sparser, more "notable" set (mirrors TURBINE_NEAR_ENTER_DIST's own reasoning)
 
 const PICK_PX = 16 // click-to-inspect screen-space tolerance (markers.js/trains.js proximity-pick convention)
+const SET_3D = '立體 3D' // panel set id (shown directly as the row label — medical.js CAT_NAMES convention)
+const SET_DOTS = '點位 Dots'
 
 // ---------------------------------------------------------------- shared geometry builders
 
@@ -179,13 +221,101 @@ const ENERGY_STYLE = {
   opacity: { type: 'slider', label: '不透明度 Opacity', min: 0.1, max: 1, step: 0.02, format: (v) => v.toFixed(2) },
 }
 
+// ---------------------------------------------------------------- 點位 Dots (shared, both layers)
+
+// world XYZ for every point, in a flat Float32Array ready for a
+// THREE.BufferAttribute — the whole "點位 Dots" set is one draw call, no
+// per-instance matrix (a Points cloud only needs position). Caches lon/lat ->
+// world x/z on each point the same way ensurePositions()/layoutAll() already
+// do elsewhere in this module, so whichever code path (grid build, dots
+// build) runs first pays that one-time cost.
+function computeDotPositions(points, hf, exaggeration) {
+  const proj = hf.projection
+  const arr = new Float32Array(points.length * 3)
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i]
+    if (p._x === undefined) {
+      const w = proj.lonLatToWorld(p.lon, p.lat)
+      p._x = w.x
+      p._z = w.z
+    }
+    const y = p.elev != null ? metersToWorldY(hf, p.elev, exaggeration) : drapeAt(hf, p._x, p._z, exaggeration)
+    arr[i * 3] = p._x
+    arr[i * 3 + 1] = y
+    arr[i * 3 + 2] = p._z
+  }
+  return arr
+}
+
+// one THREE.Points cloud, always fully resident once built (no camDist/
+// lodZoom gate — "全量常駐" is the whole point of this set) — shared builder
+// for both power towers (26,589 pts) and wind turbines (812 pts). Returns a
+// small handle the caller stores and drives from its own update()/setStyle().
+function createDotsCloud(color, basePx) {
+  const material = new THREE.PointsMaterial({
+    color: new THREE.Color(color),
+    size: basePx,
+    sizeAttenuation: false, // constant ~2-3 px screen size at any zoom, not a world-unit radius
+    transparent: false,
+    opacity: 1,
+    depthTest: true, // respect terrain occlusion — these sit ON the real surface, not a HUD overlay
+    depthWrite: true,
+    fog: true,
+  })
+  let mesh = null // THREE.Points — created lazily once positions + a heightField exist (先空後填)
+  let built = false
+  let lastExaggeration = null
+  return {
+    material,
+    get object() {
+      return mesh
+    },
+    get built() {
+      return built
+    },
+    // (re)build or refresh positions. No-op until `points`+`hf` are ready;
+    // cheap re-entrant call from update() every frame — the two guards
+    // (built, exaggeration-unchanged) make the steady-state cost a single
+    // comparison, matching the on-demand-render mandate.
+    ensure(group, points, hf, exaggeration) {
+      if (!hf || !points.length) return
+      if (!built) {
+        const geo = new THREE.BufferGeometry()
+        geo.setAttribute('position', new THREE.BufferAttribute(computeDotPositions(points, hf, exaggeration), 3))
+        mesh = new THREE.Points(geo, material)
+        group.add(mesh)
+        built = true
+        lastExaggeration = exaggeration
+        return
+      }
+      if (lastExaggeration === exaggeration) return
+      const attr = mesh.geometry.attributes.position
+      attr.array.set(computeDotPositions(points, hf, exaggeration))
+      attr.needsUpdate = true
+      mesh.geometry.computeBoundingSphere()
+      lastExaggeration = exaggeration
+    },
+    setSize(px) {
+      material.size = px
+    },
+    setOpacity(v) {
+      material.opacity = v
+      material.transparent = v < 1
+    },
+    dispose() {
+      mesh?.geometry.dispose()
+      material.dispose()
+    },
+  }
+}
+
 function applyOpacity(material, opacity) {
   material.opacity = opacity
   material.transparent = opacity < 1
 }
 
 // ================================================================== 電塔 Power Towers
-export function createPowerTowersLayer(params) {
+export function createPowerTowersLayer(params, { onActivate } = {}) {
   const group = new THREE.Group()
   group.visible = false
 
@@ -200,6 +330,9 @@ export function createPowerTowersLayer(params) {
   const mesh = new THREE.InstancedMesh(geo, material, TOWER_MAX_INSTANCES)
   mesh.count = 0 // 先空後填 — nothing drawn until data + a near-enough view exist
   group.add(mesh)
+  // 點位 Dots set (see module header) — full 26,589-point cloud, no camDist
+  // gate, one draw call. ensure()'d lazily in update() once data+hf exist.
+  const dots = createDotsCloud(TOWER_DOT_COLOR, TOWER_DOT_PX * (params.powerTowersSize ?? 1))
 
   let points = [] // baked {lon,lat,elev,v,vc,op}
   let operators = []
@@ -207,6 +340,8 @@ export function createPowerTowersLayer(params) {
   let hf = null
   let dataReady = false
   let positionsReady = false
+  let activated = false // one-shot onActivate guard (medical.js/markers.js contract)
+  const setState = { threeD: true, dots: true } // per-set panel toggle, both default on (see module header)
   let nearMode = false
   let lastCenter = null
   let lastExaggeration = null
@@ -214,8 +349,11 @@ export function createPowerTowersLayer(params) {
   let visibleList = [] // parallel to instance slots: {idx, x, y, z, topY}
   const _m = new THREE.Matrix4()
 
-  function gate() {
-    return params.source === 'real' && !!hf && !!params.powerTowersVisible && dataReady
+  // layer-level gate: no more single powerTowersVisible boolean — visibility
+  // is now per-set (setState.threeD / setState.dots), applied independently
+  // in tickView()/update() below.
+  function active() {
+    return params.source === 'real' && !!hf && dataReady
   }
 
   // lon/lat -> world x/z, once per point, the first time a live projection
@@ -265,8 +403,6 @@ export function createPowerTowersLayer(params) {
     label: 'Power Towers',
     rowLabel: '電塔 Power Towers',
     object3d: group,
-    visibleParam: 'powerTowersVisible',
-    paramMap: { visible: 'powerTowersVisible', size: 'powerTowersSize', opacity: 'powerTowersOpacity' },
 
     build() {},
 
@@ -280,34 +416,64 @@ export function createPowerTowersLayer(params) {
       dataReady = points.length > 0
     },
 
+    // one-shot activation trigger (medical.js/markers.js contract): the panel
+    // shows a single plain toggle until describe()'s `sets` first appears —
+    // flipping it calls this, which fires the manifest fetch exactly once.
+    setVisible(v) {
+      if (!v || activated || !onActivate) return
+      activated = true
+      Promise.resolve(onActivate()).catch((err) => {
+        console.warn('[layers] power_towers activation failed', err)
+        activated = false
+      })
+    },
+
+    // panel per-set toggle (立體 3D / 點位 Dots independently) — index.js's
+    // setLayerSet forwards here; def is always {visible} from the panel.
+    setSet(setId, def = {}) {
+      if (setId === SET_3D) {
+        if (def.visible !== undefined) setState.threeD = def.visible
+      } else if (setId === SET_DOTS) {
+        if (def.visible !== undefined) setState.dots = def.visible
+      }
+    },
+
     update(ctx) {
       hf = ctx.heightField
-      const show = gate()
-      if (show) {
+      const on = active()
+      if (on) {
         ensurePositions()
         applyOpacity(material, params.powerTowersOpacity ?? 0.9)
+        dots.ensure(group, points, hf, params.demExaggeration)
+        dots.setOpacity(params.powerTowersOpacity ?? 0.9)
       }
-      // group.visible alone fully hides the mesh when off (three.js skips
+      // group.visible alone fully hides everything when off (three.js skips
       // invisible objects entirely) — mesh.count/visibleList are deliberately
       // left as-is so re-showing without an intervening camera move redraws
       // instantly instead of waiting for tickView's moved-delta to trip.
-      group.visible = show
+      group.visible = on
+      if (dots.object) dots.object.visible = on && setState.dots
     },
 
     // per-frame (only while non-idle): hysteresis near/far switch + throttled
-    // spatial re-gather. Idle-camera steady state costs nothing beyond the
-    // gate() + distance check below.
+    // spatial re-gather for the 立體 3D set. 點位 Dots has no per-frame work —
+    // its visibility is set once in update() above and its geometry is static
+    // once built (only demExaggeration changes touch it, handled by
+    // dots.ensure's own staleness check).
     tickView(ctx) {
-      if (!gate() || !positionsReady) return
+      if (!active() || !positionsReady) return
       const zoomOk = (ctx.lodZoom ?? TOWER_LOD_ZOOM_MIN) >= TOWER_LOD_ZOOM_MIN
       if (nearMode && (ctx.camDist > TOWER_NEAR_EXIT_DIST || !zoomOk)) nearMode = false
       else if (!nearMode && ctx.camDist < TOWER_NEAR_ENTER_DIST && zoomOk) nearMode = true
 
-      if (!nearMode) {
+      const show3D = nearMode && setState.threeD
+      mesh.visible = show3D
+      if (!show3D) {
         if (mesh.count !== 0) {
           mesh.count = 0
           visibleList = []
         }
+        lastCenter = null // force a fresh gather next time 立體 3D/nearMode turns back on
         return
       }
       const center = ctx.labelCenter ?? { x: ctx.camera.position.x, z: ctx.camera.position.z }
@@ -318,17 +484,22 @@ export function createPowerTowersLayer(params) {
     },
 
     setStyle(patch) {
-      if (patch.size !== undefined) params.powerTowersSize = patch.size
+      if (patch.size !== undefined) {
+        params.powerTowersSize = patch.size
+        dots.setSize(TOWER_DOT_PX * patch.size) // one shared slider scales both sets (brief's requirement)
+      }
       if (patch.opacity !== undefined) {
         params.powerTowersOpacity = patch.opacity
         applyOpacity(material, patch.opacity)
+        dots.setOpacity(patch.opacity)
       }
     },
 
-    // click-to-inspect: proximity-pick over the currently-instanced subset
-    // only (markers.js/trains.js convention — these are a few px on screen).
+    // click-to-inspect: proximity-pick over the currently-instanced 立體 3D
+    // subset only (markers.js/trains.js convention — these are a few px on
+    // screen; 點位 Dots stays unclickable, same scale problem doubled).
     pick(raycaster) {
-      if (!group.visible || visibleList.length === 0) return null
+      if (!group.visible || !mesh.visible || visibleList.length === 0) return null
       const camera = raycaster.camera
       const clickPx = raycaster.pickPx
       if (!camera || !clickPx) return null
@@ -361,27 +532,35 @@ export function createPowerTowersLayer(params) {
     },
 
     describe() {
+      const sets = dataReady
+        ? [
+            { id: SET_3D, count: visibleList.length, visible: setState.threeD },
+            { id: SET_DOTS, count: points.length, visible: setState.dots },
+          ]
+        : []
       return {
         id: 'power_towers',
         kind: 'point',
         label: 'Power Towers',
         rowLabel: '電塔 Power Towers',
-        count: visibleList.length,
-        visible: params.powerTowersVisible,
+        count: points.length,
+        visible: dataReady && (setState.threeD || setState.dots),
         styleSchema: ENERGY_STYLE,
         style: { size: params.powerTowersSize ?? 1, opacity: params.powerTowersOpacity ?? 0.9 },
+        sets: sets.length > 0 || activated ? sets : undefined,
       }
     },
 
     dispose() {
       geo.dispose()
       material.dispose()
+      dots.dispose()
     },
   }
 }
 
 // ================================================================== 風機 Wind Turbines
-export function createWindTurbinesLayer(params) {
+export function createWindTurbinesLayer(params, { onActivate } = {}) {
   const group = new THREE.Group()
   group.visible = false
 
@@ -394,19 +573,26 @@ export function createWindTurbinesLayer(params) {
     fog: true,
   })
   let mesh = null // 先空後填: created only once data + heightField exist (capacity == point count, known then)
+  // 點位 Dots set (see module header) — full 812-point cloud, no camDist gate.
+  const dots = createDotsCloud(TURBINE_DOT_COLOR, TURBINE_DOT_PX * (params.windTurbinesSize ?? 1))
 
   let points = [] // baked {lon,lat,elev,cap,op}
   let hf = null
   let dataReady = false
   let built = false
+  let activated = false // one-shot onActivate guard (medical.js/markers.js contract)
+  const setState = { threeD: true, dots: true } // per-set panel toggle, both default on (see module header)
   let nearMode = false
   let lastExaggeration = null
   let lastSizeMult = null
   const hitList = [] // parallel to instance slots: {x,y,z,topY}
   const _m = new THREE.Matrix4()
 
-  function gate() {
-    return params.source === 'real' && !!hf && !!params.windTurbinesVisible && dataReady
+  // layer-level gate: no more single windTurbinesVisible boolean — visibility
+  // is now per-set (setState.threeD / setState.dots), applied independently
+  // in tickView()/update() below.
+  function active() {
+    return params.source === 'real' && !!hf && dataReady
   }
 
   function layoutAll() {
@@ -452,8 +638,6 @@ export function createWindTurbinesLayer(params) {
     label: 'Wind Turbines',
     rowLabel: '風機 Wind Turbines',
     object3d: group,
-    visibleParam: 'windTurbinesVisible',
-    paramMap: { visible: 'windTurbinesVisible', size: 'windTurbinesSize', opacity: 'windTurbinesOpacity' },
 
     build() {},
 
@@ -463,31 +647,59 @@ export function createWindTurbinesLayer(params) {
       dataReady = points.length > 0
     },
 
+    // one-shot activation trigger (medical.js/markers.js contract): the panel
+    // shows a single plain toggle until describe()'s `sets` first appears —
+    // flipping it calls this, which fires the manifest fetch exactly once.
+    setVisible(v) {
+      if (!v || activated || !onActivate) return
+      activated = true
+      Promise.resolve(onActivate()).catch((err) => {
+        console.warn('[layers] wind_turbines activation failed', err)
+        activated = false
+      })
+    },
+
+    // panel per-set toggle (立體 3D / 點位 Dots independently) — index.js's
+    // setLayerSet forwards here; def is always {visible} from the panel.
+    setSet(setId, def = {}) {
+      if (setId === SET_3D) {
+        if (def.visible !== undefined) setState.threeD = def.visible
+      } else if (setId === SET_DOTS) {
+        if (def.visible !== undefined) setState.dots = def.visible
+      }
+    },
+
     update(ctx) {
       hf = ctx.heightField
-      const show = gate()
-      if (show) {
+      const on = active()
+      if (on) {
         if (!built) buildMesh()
         else if (lastExaggeration !== params.demExaggeration || lastSizeMult !== (params.windTurbinesSize ?? 1)) layoutAll()
         applyOpacity(material, params.windTurbinesOpacity ?? 0.95)
+        dots.ensure(group, points, hf, params.demExaggeration)
+        dots.setOpacity(params.windTurbinesOpacity ?? 0.95)
       }
-      // group.visible alone fully hides the mesh when off — mesh.count/
+      // group.visible alone fully hides everything when off — mesh.count/
       // nearMode are deliberately left as-is (see power-towers' update() for
       // the same reasoning): re-showing without an intervening camera move
       // redraws instantly.
-      group.visible = show && built
+      group.visible = on && built
+      if (dots.object) dots.object.visible = on && setState.dots
     },
 
     // per-frame: same near/far camDist hysteresis as towers ("仍掛距離 gate
     // 防遠景雜訊") but no spatial subset — all 812 instances are already laid
     // out (layoutAll), this just flips mesh.count between 0 and the full
-    // count so idle-camera cost is a single distance compare.
+    // count so idle-camera cost is a single distance compare. 點位 Dots has no
+    // per-frame work (see power-towers' tickView doc).
     tickView(ctx) {
-      if (!gate() || !built) return
+      if (!active() || !built) return
       const zoomOk = (ctx.lodZoom ?? TURBINE_LOD_ZOOM_MIN) >= TURBINE_LOD_ZOOM_MIN
       if (nearMode && (ctx.camDist > TURBINE_NEAR_EXIT_DIST || !zoomOk)) nearMode = false
       else if (!nearMode && ctx.camDist < TURBINE_NEAR_ENTER_DIST && zoomOk) nearMode = true
-      const wantCount = nearMode ? points.length : 0
+      const show3D = nearMode && setState.threeD
+      mesh.visible = show3D
+      const wantCount = show3D ? points.length : 0
       if (mesh.count !== wantCount) mesh.count = wantCount
     },
 
@@ -495,15 +707,19 @@ export function createWindTurbinesLayer(params) {
       if (patch.size !== undefined) {
         params.windTurbinesSize = patch.size
         if (built) layoutAll()
+        dots.setSize(TURBINE_DOT_PX * patch.size) // one shared slider scales both sets (brief's requirement)
       }
       if (patch.opacity !== undefined) {
         params.windTurbinesOpacity = patch.opacity
         applyOpacity(material, patch.opacity)
+        dots.setOpacity(patch.opacity)
       }
     },
 
+    // click-to-inspect: 立體 3D subset only (點位 Dots stays unclickable, same
+    // scale problem as power towers' dots — see that layer's pick() doc).
     pick(raycaster) {
-      if (!group.visible || !mesh || mesh.count === 0) return null
+      if (!group.visible || !mesh || !mesh.visible || mesh.count === 0) return null
       const camera = raycaster.camera
       const clickPx = raycaster.pickPx
       if (!camera || !clickPx) return null
@@ -534,21 +750,29 @@ export function createWindTurbinesLayer(params) {
     },
 
     describe() {
+      const sets = dataReady
+        ? [
+            { id: SET_3D, count: nearMode ? points.length : 0, visible: setState.threeD },
+            { id: SET_DOTS, count: points.length, visible: setState.dots },
+          ]
+        : []
       return {
         id: 'wind_turbines',
         kind: 'point',
         label: 'Wind Turbines',
         rowLabel: '風機 Wind Turbines',
-        count: nearMode ? points.length : 0,
-        visible: params.windTurbinesVisible,
+        count: points.length,
+        visible: dataReady && (setState.threeD || setState.dots),
         styleSchema: ENERGY_STYLE,
         style: { size: params.windTurbinesSize ?? 1, opacity: params.windTurbinesOpacity ?? 0.95 },
+        sets: sets.length > 0 || activated ? sets : undefined,
       }
     },
 
     dispose() {
       geo.dispose()
       material.dispose()
+      dots.dispose()
     },
   }
 }

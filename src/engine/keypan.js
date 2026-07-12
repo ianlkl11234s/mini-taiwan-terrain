@@ -24,6 +24,13 @@ const KEYMAP = {
   KeyD: 'r',
 }
 const SPEED = 0.85 // max speed = camera distance × SPEED → ~1 screen-height/s at any zoom
+// speed is floored to this camera-distance equivalent (~170 m) so that hugging
+// the hillside near minDistance (0.08, ~40 m — see scene.js) still cruises at
+// ~145 m/s instead of crawling: without the floor, SPEED scales linearly with
+// camDist all the way down, so near-ground keyboard panning became
+// unusably slow once minDistance was widened for the street-level 3D view.
+// Far-view speed (camDist already ≥ this) is untouched.
+const KEYPAN_FLOOR_DIST = 0.35
 const ACCEL = 7 // damp λ toward full speed (ease-in)
 const GLIDE = 4 // damp λ toward zero after release (slide to a stop)
 
@@ -67,7 +74,7 @@ export function createKeyPan({ camera, controls, onEngage }) {
       _want.set(0, 0, 0).addScaledVector(_fwd, f)
       _want.x += -_fwd.z * r // right = forward × up
       _want.z += _fwd.x * r
-      if (f || r) _want.normalize().multiplyScalar(camera.position.distanceTo(controls.target) * SPEED)
+      if (f || r) _want.normalize().multiplyScalar(Math.max(camera.position.distanceTo(controls.target), KEYPAN_FLOOR_DIST) * SPEED)
       const lambda = f || r ? ACCEL : GLIDE
       vel.x = THREE.MathUtils.damp(vel.x, _want.x, lambda, dt)
       vel.z = THREE.MathUtils.damp(vel.z, _want.z, lambda, dt)

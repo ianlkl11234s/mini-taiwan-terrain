@@ -78,10 +78,11 @@ export function createStage(params, container) {
   controls.enableDamping = true
   controls.dampingFactor = 0.06
   controls.maxPolarAngle = Math.PI * 0.49
-  // 0.25 (was 2) — close enough to hug a hillside; index.js's tick() clamps
+  // 0.08 (was 0.25, before that 2) — ~40 m from the target, close enough for a
+  // street-level look at the 3D buildings layer; index.js's tick() clamps
   // camera height to the ground sample so dollying this close never digs
-  // into the terrain
-  controls.minDistance = 0.25
+  // into the terrain. near plane 0.02 (~10 m) still clears it comfortably.
+  controls.minDistance = 0.08
   controls.maxDistance = 1000
   controls.update()
 
