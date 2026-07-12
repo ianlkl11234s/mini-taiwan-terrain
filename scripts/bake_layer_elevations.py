@@ -27,7 +27,12 @@ from pathlib import Path
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
-TILES_DIR = ROOT / "public" / "tiles"
+# bathy/ nesting (see src/engine/dem.js TILE_URL + docs/.claude/skills/verify):
+# the local tile symlink is public/tiles/bathy/{z}/{x}/{y}.png since the
+# GEBCO-bathymetry tile set landed alongside the old flat layout — this
+# constant went stale when that migration happened (every TileCache lookup
+# silently fell through to the sea/0m fallback, never erroring), fixed here.
+TILES_DIR = ROOT / "public" / "tiles" / "bathy"
 OUT_DIR = ROOT / "public" / "layers"
 
 GIS_ROOT = Path("/Users/migu/Desktop/資料庫/gen_ai_try/ichef_工作用/GIS")

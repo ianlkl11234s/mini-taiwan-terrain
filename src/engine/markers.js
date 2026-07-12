@@ -356,9 +356,10 @@ export function createMarkers(params, { dotRadius = DOT_R, showLabels = true, si
 //
 // Third use (trail signs): `dotRadius`/`showLabels` tune a set collection
 // whose points are much denser than stations (waypoints every ~13-90 m along
-// a route, sometimes literally the SAME coordinates as the trail LINE's own
-// baked vertices — see polyline.js createTrailsLayer). Per-point name tags
-// there would repeat one trail's name across every waypoint that ranks in
+// a route — bake_trails.py's Forestry Bureau signage dataset; a separate
+// source from the trails LINE layer's own hiking_trails.pmtiles, see
+// vectortiles.js createTrailsLayer). Per-point name tags there would repeat
+// one trail's name across every waypoint that ranks in
 // the nearest-MAX_LABELS window (a wall of duplicate tags), so
 // showLabels:false skips the tag ranking/sprite work entirely — dots only,
 // same visual language as stations otherwise. dotRadius lets that dense set

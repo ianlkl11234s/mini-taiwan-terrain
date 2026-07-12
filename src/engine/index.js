@@ -1,15 +1,19 @@
 import * as THREE from 'three'
 import { Terrain } from './terrain.js'
 import { LayerManager } from './layers.js'
-import { createCoastlineLayer, createCountiesLayer, createRailLayer, createTrailsLayer, createRiversLayer, createIrrigationLayer } from './polyline.js'
+import { createCoastlineLayer, createCountiesLayer, createRailLayer, createRiversLayer, createIrrigationLayer } from './polyline.js'
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
 import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
+import { createCurrentsLayer } from './currents.js'
 import { createRegionLayer } from './region.js'
 import { createLabelsLayer } from './labels.js'
-import { createOsmRoadsLayer, createFtwFieldsLayer } from './vectortiles.js'
+import { createOsmRoadsLayer, createTrailsLayer, createFtwFieldsLayer, createBuildingsLayer } from './vectortiles.js'
+import { createAirspaceLayer } from './airspace.js'
+import { createPowerTowersLayer, createWindTurbinesLayer } from './energy.js'
+import { createMedicalLayer } from './medical.js'
 import { createCone } from './cone.js'
 import { createHud3D, findPois } from './hud3d.js'
 import * as timeStore from '../state/timeStore.js'
@@ -180,24 +184,33 @@ export const DEFAULT_PARAMS = {
   shipsColor: '#3a6ea5',
   shipsSize: 1.0,
   shipsOpacity: 0.95,
+  // ocean currents: CPU-advected particle streaklines (src/engine/currents.js)
+  // over a baked CMEMS surface-current snapshot (CDN PNG+JSON, fetched once
+  // on first switch-on — see loadCurrentsData/currentsVisible HANDLER and
+  // docs/OCEAN_CURRENTS_DESIGN.md). Ambient, wall-clock animation like the
+  // typhoon/sea-ripple layers — not gated on the timeline (see isAnimating()).
+  currentsVisible: false,
+  currentsOpacity: 0.7,
+  currentsSpeed: 1.0,
   // OSM roads: PMTiles-streamed vector-tile line layer (docs/VECTOR_TILES_DESIGN.md)
-  // — NOT a manifest-driven JSON fetch like rail/trails; the manager
-  // (vectortiles.js VectorTileManager) streams tiles from the R2-hosted
-  // osm_road_drive.pmtiles archive as the camera pans, only once switched on.
-  // Phase 2: highway-class width/color buckets baked per-class into
-  // vertexColors (see vectortiles.js ROAD_STYLE) — no single color swatch;
-  // width/opacity stay as global multipliers on top of the buckets.
+  // — NOT a manifest-driven JSON fetch like rail; the manager (vectortiles.js
+  // VectorTileManager) streams tiles from the R2-hosted osm_road_drive.pmtiles
+  // archive as the camera pans, only once switched on. Phase 2: highway-class
+  // width/color buckets baked per-class into vertexColors (see vectortiles.js
+  // ROAD_STYLE) — no single color swatch; width/opacity stay as global
+  // multipliers on top of the buckets.
   osmRoadsVisible: false,
   osmRoadsWidth: 1.5,
   osmRoadsOpacity: 0.85,
-  // trails: manifest-driven deferred layer (public/layers/trails.json, fetched
-  // on first trailsVisible:true), same fail-quiet pattern as rail. Every trail
-  // shares one baked color (see polyline.js createTrailsLayer) so — unlike
-  // rail — there IS a color param.
+  // trails: PMTiles-streamed vector-tile line layer, same pattern as osmRoads
+  // above (vectortiles.js createTrailsLayer, hiking_trails.pmtiles — 7,339
+  // lines from 6 merged sources, superseding the 2026-07-10 49-trail baked-
+  // JSON version). Unlike roads there's no per-class bucketing, so — like the
+  // old baked layer — every trail shares ONE color param.
   trailsVisible: false,
   trailsWidth: 2,
   trailsOpacity: 0.9,
-  trailsColor: '#5a8f3d',
+  trailsColor: '#ff7a1a',
   // point-layer styleSchema defaults (markers.js createPointLayer's size/
   // opacity sliders — POINT_STYLE). Key names are derived from each layer's
   // id (${id}Size/${id}Opacity — see createPointLayer). 1.0/0.9 match the
@@ -207,6 +220,27 @@ export const DEFAULT_PARAMS = {
   stationsOpacity: 0.9,
   markersSize: 1.0,
   markersOpacity: 0.9,
+  // basic POI point packs (bake_poi_layers.py) — same size/opacity slider
+  // convention as stations/markers above. fire_stations/police_stations use
+  // an explicit sizeParam/opacityParam override (createPointLayer's default
+  // `${id}Size` would read oddly off a snake_case id), everything else uses
+  // the default derived key.
+  airportsSize: 1.0,
+  airportsOpacity: 0.9,
+  portsSize: 1.0,
+  portsOpacity: 0.9,
+  fireStationsSize: 1.0,
+  fireStationsOpacity: 0.9,
+  hospitalsSize: 1.0,
+  hospitalsOpacity: 0.9,
+  policeStationsSize: 1.0,
+  policeStationsOpacity: 0.9,
+  // medical (medical.js, R2-hosted national 醫院/診所/藥局 roll) — declared here
+  // like every other layer so params serialization sees them even before the
+  // user first touches the sliders; medical.js's `?? 1`/`?? 0.92` guards keep
+  // working as the same defaults (opus final-review note).
+  medicalSize: 1.0,
+  medicalOpacity: 0.92,
   // rivers: the river layer's BODY is a physics-derived flow-accumulation tint
   // painted into the terrain shader (terrain.js uRiverTex, whole-island bake
   // public/layers/river_sim.png — the retired vector centerlines are gone). ONE
@@ -255,6 +289,33 @@ export const DEFAULT_PARAMS = {
   // (design §4); 濃度 (opacity) is the only style param.
   ftwFieldsVisible: false,
   ftwFieldsOpacity: 0.6,
+  // buildings: PMTiles-streamed vector-tile POLYGON layer, same streamed-not-
+  // manifest pattern as osmRoadsVisible/ftwFieldsVisible above, but extruded
+  // into flat-topped 3D boxes (GBA/TUM LoD1 footprints, see vectortiles.js
+  // createBuildingsLayer). z13 is the source archive's own minzoom — see that
+  // module's file header for why this layer alone needs a hard lodZoom gate.
+  // Fill color is a baked per-vertex height-band ramp (design handoff); 不透明度
+  // is the only style param, default just under fully opaque.
+  buildingsVisible: false,
+  buildingsOpacity: 0.95,
+  // airspace: baked-JSON polygon-extrusion layer (src/engine/airspace.js,
+  // public/layers/airspace.json — bake_airspace.py's P/R/D-filtered 31 zones
+  // out of the source 81). 0.25 default so the stacked walls of overlapping
+  // zones don't read as a solid opaque blob (design brief).
+  airspaceVisible: false,
+  airspaceOpacity: 0.25,
+  // power towers / wind turbines: two sets each (src/engine/energy.js) — 立體
+  // 3D (InstancedMesh point layers with real 3D silhouettes, gated to
+  // near-view only — see that module's camDist hysteresis) and 點位 Dots (a
+  // full always-resident point cloud, no gate). No single …Visible param
+  // anymore: visibility is per-set (ports/hospitals/medical panel
+  // convention — see energy.js's setState/sets facade); size scales
+  // footprint only, never true height (matches trains.js's widthM/heightM
+  // convention), and also scales the dots' screen-space point size.
+  powerTowersSize: 1.0,
+  powerTowersOpacity: 0.9,
+  windTurbinesSize: 1.0,
+  windTurbinesOpacity: 0.95,
   // region: neighbouring coastlines (outlying islands, N Philippines, Ryukyus,
   // S Japan, S Korea, SE China) as flat strokes over a sea-coloured plane —
   // geographic context beyond the Taiwan DEM footprint (src/engine/region.js).
@@ -454,18 +515,56 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   let pixelBumped = false // whether the idle freeze raised the pixel ratio
   let renderCount = 0 // DEV verify hook: +1 per real composer.render
 
+  // 顯示效能提升包 killswitch: flip to false to fully disable both the 30fps
+  // ambient throttle and the ambient DPR drop below, reverting to pre-package
+  // behavior (always full-rate, always params.pixelRatio). Static — requires
+  // a rebuild, not a runtime toggle.
+  const PERF_THROTTLE = true
+
+  // 顯示效能提升包 a: ambient (non-interactive) animation throttles to 30fps —
+  // trains/ships/tide playback and sea ripple decoration don't need 60fps+ to
+  // read fine, so the tick skips frames instead of doing full work every RAF.
+  // tour/flyTo camera tweens and any live pointer/wheel interaction always run
+  // full-rate (see fullRate below in tick()).
+  const ANIM_FPS = 30 // ambient throttle target — HUD fps settling ~30 during ambient-only playback is expected, not a regression
+  const ANIM_FRAME_MS = 1000 / ANIM_FPS
+  let interactUntil = 0 // performance.now() deadline — full-rate while now < this
+  let ambientThrottled = false // true when the last processed frame was ambient-only (ungated by interaction/tour)
+  let nextAmbientFrameAt = 0 // accumulator pacing target for the next throttled frame
+
+  // 顯示效能提升包 b: ambient-only playback also drops to a fixed DPR (1.0) —
+  // only meaningful when the display's devicePixelRatio > 1 (Retina/HiDPI).
+  // Debounced (>500ms of sustained ambient-only) so a brief blip doesn't
+  // thrash the composer buffer realloc that setPixelRatio triggers.
+  const ANIM_PIXEL_RATIO = 1.0
+  const AMBIENT_PIXEL_DEBOUNCE_MS = 500
+  let ambientSince = 0 // performance.now() when the current ambient-only streak started (0 = no streak)
+  let ambientPixelDropped = false // whether the renderer is currently sitting at ANIM_PIXEL_RATIO because of ambient
+
   // any state change that should show on screen calls this — it (re)opens the
   // render window; the tick keeps rendering until it expires AND nothing animates
   function invalidate() {
     activeUntil = performance.now() + ACTIVE_WINDOW_MS
   }
 
+  // live input (drag/wheel/keypan-via-controls.update) — always full-rate for
+  // 300ms and immediately cancels any pending ambient throttle so the very
+  // next RAF after a gesture starts renders at full speed, not mid-pace.
+  function noteInteraction() {
+    interactUntil = performance.now() + 300
+    ambientThrottled = false
+    nextAmbientFrameAt = 0
+  }
+
   // controls fire 'change' every frame the camera actually moves (drag, wheel,
   // damping tail, keypan → controls.update, programmatic). 'start'/'end' bracket
   // a grab so the window opens on mousedown before any motion.
   controls.addEventListener('start', invalidate)
+  controls.addEventListener('start', noteInteraction)
   controls.addEventListener('change', invalidate)
+  controls.addEventListener('change', noteInteraction)
   controls.addEventListener('end', invalidate)
+  controls.addEventListener('end', noteInteraction)
   const onResize = () => invalidate() // scene.js owns the actual resize handler
   window.addEventListener('resize', onResize)
   // timeline: every discrete change (seek/play/pause/setSpeed) reopens the
@@ -575,11 +674,114 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       ['分署 Department', pt.dept || '—'],
     ],
   })
+  // basic POI point packs (bake_poi_layers.py) — same deferred onActivate
+  // pattern as stations/trail_signs above (fetch public/layers/<id>.json on
+  // first switch-on, group into one setSet() call per bake-time "system").
+  // ports/hospitals split into several sets (port_class_group / level) whose
+  // ids are ALREADY the Chinese display string (see bake script), so no
+  // separate label-lookup table like STATION_SYSTEM_LABELS is needed; the
+  // set id is used directly in pickRows.
+  const airportsLayer = createPointLayer(params, {
+    id: 'airports',
+    label: 'Airports',
+    rowLabel: '機場 Airports',
+    onActivate: () => loadPoiData('airports', airportsLayer),
+    pickRows: (pt) => [
+      ['名稱 Name', pt.name || '—'],
+      ['ICAO', pt.icao || '—'],
+      ['IATA', pt.iata || '—'],
+      ['類型 Type', pt.type || '—'],
+      ['高度 Elevation', pt.elevFt != null ? `${pt.elevFt} ft` : '—'],
+    ],
+  })
+  const portsLayer = createPointLayer(params, {
+    id: 'ports',
+    label: 'Ports',
+    rowLabel: '港口 Ports',
+    onActivate: () => loadPoiData('ports', portsLayer),
+    pickRows: (pt, setId) => [
+      ['名稱 Name', pt.name || '—'],
+      ['分類 Class', setId],
+      ['等級 Grade', pt.class || '—'],
+      ['縣市 County', pt.county || '—'],
+    ],
+  })
+  const fireStationsLayer = createPointLayer(params, {
+    id: 'fire_stations',
+    label: 'Fire Stations',
+    rowLabel: '消防分隊 Fire Stations',
+    onActivate: () => loadPoiData('fire_stations', fireStationsLayer),
+    sizeParam: 'fireStationsSize',
+    opacityParam: 'fireStationsOpacity',
+    pickRows: (pt) => [
+      ['名稱 Name', pt.name || '—'],
+      ['類型 Type', pt.type || '—'],
+      ['地址 Address', pt.address || '—'],
+    ],
+  })
+  const hospitalsLayer = createPointLayer(params, {
+    id: 'hospitals',
+    label: 'Hospitals',
+    rowLabel: '急救醫院 Hospitals',
+    onActivate: () => loadPoiData('hospitals', hospitalsLayer),
+    pickRows: (pt, setId) => [
+      ['名稱 Name', pt.name || '—'],
+      ['分級 Level', setId],
+      ['外傷中心 Trauma', pt.trauma ? '是 Yes' : '否 No'],
+      ['中風中心 Stroke', pt.stroke ? '是 Yes' : '否 No'],
+      ['地址 Address', pt.address || '—'],
+    ],
+  })
+  // F 醫療設施 POI: the full national NHI-contracted institution roll
+  // (bake_medical_poi.py -> medical.json, R2-hosted — see manifest entry and
+  // that bake script's docstring for the "42MB source" investigation and the
+  // 2-8MB-bracket R2 decision). Complements, does not replace, hospitalsLayer
+  // above (232 emergency-responsible hospitals only) — registered right after
+  // it for the same panel-proximity reasoning as thsr/ships elsewhere in this
+  // list. NOT a createPointLayer: see src/engine/medical.js module header for
+  // why (21,765 診所 alone is too many for markers.js's always-resident-dots
+  // convention — this follows energy.js's InstancedMesh+grid-gather playbook
+  // instead), but it still exposes the same `sets` panel contract (describe/
+  // setSet) as ports/hospitals so 醫院/診所/藥局 get independent toggles.
+  const medicalLayer = createMedicalLayer(params, {
+    onActivate: () => loadMedicalData(),
+  })
+  // police_stations.json's facility_subtype is the raw English source enum
+  // (police_justice/police_stations pipeline) — same bilingual-label-lookup
+  // pattern as STATION_SYSTEM_LABELS/HIGHWAY_LABELS above, a tag missing from
+  // this table just shows the raw string instead of blowing up.
+  const POLICE_SUBTYPE_LABELS = {
+    headquarters: '警察局本部 HQ',
+    police_dept: '警察局 Dept',
+    precinct: '分局 Precinct',
+    substation: '派出所 Substation',
+    specialized: '專業警察 Specialized',
+    other: '其他 Other',
+  }
+  const policeLayer = createPointLayer(params, {
+    id: 'police_stations',
+    label: 'Police',
+    rowLabel: '警察機關 Police',
+    onActivate: () => loadPoiData('police_stations', policeLayer),
+    sizeParam: 'policeStationsSize',
+    opacityParam: 'policeStationsOpacity',
+    pickRows: (pt) => [
+      ['名稱 Name', pt.name || '—'],
+      ['類型 Type', POLICE_SUBTYPE_LABELS[pt.subtype] ?? pt.subtype ?? '—'],
+      ['地址 Address', pt.address || '—'],
+    ],
+  })
   const labelsLayer = createLabelsLayer(params)
   const reservoirsLayer = createReservoirLayer(params)
   const osmRoadsLayer = createOsmRoadsLayer(params, { invalidate })
+  const trailsLayer = createTrailsLayer(params, { invalidate })
   const ftwFieldsLayer = createFtwFieldsLayer(params, { invalidate })
+  const buildingsLayer = createBuildingsLayer(params, { invalidate })
+  const airspaceLayer = createAirspaceLayer(params)
+  const powerTowersLayer = createPowerTowersLayer(params, { onActivate: () => loadPowerTowersData() })
+  const windTurbinesLayer = createWindTurbinesLayer(params, { onActivate: () => loadWindTurbinesData() })
   const shipsLayer = createShipsLayer(params)
+  const currentsLayer = createCurrentsLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
   // whatever meta.group/subgroup it's registered with through to describe(),
@@ -592,8 +794,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const GROUP_MOVE = { id: 'move', label: '交通 Move', order: 1 }
   const GROUP_WATER = { id: 'water', label: '水文 Water', order: 2 }
   const GROUP_AGRI = { id: 'agri', label: '農業 Agriculture', order: 3 }
-  const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 4 }
-  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 5 }
+  // basic public-safety POI packs (bake_poi_layers.py: fire/hospitals/police)
+  // — its own theme, not transport/water/agri/outdoor/fx
+  const GROUP_SAFETY = { id: 'safety', label: '安全 Safety', order: 4 }
+  const GROUP_OUTDOOR = { id: 'outdoor', label: '戶外 Outdoor', order: 5 }
+  // power towers + wind turbines (src/engine/energy.js) — its own theme, not
+  // transport/agriculture/safety
+  const GROUP_ENERGY = { id: 'energy', label: '能源 Energy', order: 6 }
+  const GROUP_FX = { id: 'fx', label: '效果 FX', order: 7 }
   const LAYER_GROUPS = {
     region: { group: GROUP_BASE },
     coastline: { group: GROUP_BASE },
@@ -604,12 +812,30 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // normal use). Not tied to any theme (transport/water/outdoor); parked
     // under Base as a generic overlay utility rather than left in "其他".
     markers: { group: GROUP_BASE },
+    // GBA/TUM 3D building extrusions (vectortiles.js createBuildingsLayer) —
+    // static base-map 3D content like region/coastline/counties above, not a
+    // themed transport/water/agriculture/outdoor/fx dataset
+    buildings: { group: GROUP_BASE },
     rail: { group: GROUP_MOVE },
     trains: { group: GROUP_MOVE },
     thsr: { group: GROUP_MOVE },
     stations: { group: GROUP_MOVE },
     osm_roads: { group: GROUP_MOVE },
     ships: { group: GROUP_MOVE },
+    // ocean currents (src/engine/currents.js) — grouped with ships, the other
+    // marine overlay in this theme (sea-ripple is a toggle inside 周邊 Region,
+    // GROUP_BASE, not a standalone panel row, so ships is the closest actual
+    // "same group" match for the brief's "面板分組跟 ships/海面同組")
+    currents: { group: GROUP_MOVE },
+    // basic POI packs (bake_poi_layers.py) — airports/ports are transport
+    // infrastructure like stations/ships above
+    airports: { group: GROUP_MOVE },
+    ports: { group: GROUP_MOVE },
+    // 3D airspace fence (bake_airspace.py / src/engine/airspace.js) — aviation
+    // hazard/restriction overlay, alongside airports/ports above
+    airspace: { group: GROUP_MOVE },
+    power_towers: { group: GROUP_ENERGY },
+    wind_turbines: { group: GROUP_ENERGY },
     rivers: { group: GROUP_WATER },
     reservoirs: { group: GROUP_WATER },
     // farmland tint + irrigation canals: agriculture, not hydrology — its own
@@ -618,6 +844,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     farm_sim: { group: GROUP_AGRI },
     ftw_fields: { group: GROUP_AGRI },
     irrigation: { group: GROUP_AGRI },
+    // basic POI packs (bake_poi_layers.py), continued — public-safety response
+    // infrastructure, its own theme (see GROUP_SAFETY)
+    fire_stations: { group: GROUP_SAFETY },
+    hospitals: { group: GROUP_SAFETY },
+    // full national 醫院/診所/藥局 roll (bake_medical_poi.py) — complements
+    // hospitals above, same theme
+    medical: { group: GROUP_SAFETY },
+    police_stations: { group: GROUP_SAFETY },
     trails: { group: GROUP_OUTDOOR },
     trail_signs: { group: GROUP_OUTDOOR },
     // peak spot-elevation / place-name labels (labels.js) — cartography tied
@@ -625,17 +859,31 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     labels: { group: GROUP_OUTDOOR },
     typhoon: { group: GROUP_FX },
   }
-  // registration order = draw / update order (coastline → counties → rail →
-  // trains → thsr → trails → rivers → reservoirs → farm sim → irrigation →
-  // typhoon → markers → stations → ships → trail signs → labels). thsr
+  // registration order = draw / update order (coastline → counties →
+  // buildings → airspace → rail → trains → thsr → trails → rivers →
+  // reservoirs → farm sim → irrigation → typhoon → markers → stations →
+  // ships → ocean currents → trail signs → airports/ports →
+  // fire/hospitals/medical/police → power towers → wind turbines → labels). thsr
   // registers right after trains so it lands directly below 台鐵列車 Trains,
-  // and ships registers right after stations, both in the Layers panel's
-  // 交通 Move group (Layers.jsx preserves registration order within a group
-  // — see groupLayers()).
+  // and ships (then currents right after it) register right after stations,
+  // all in the Layers panel's 交通 Move group (Layers.jsx preserves
+  // registration order within a group — see groupLayers()). airspace
+  // registers right after buildings (same
+  // low-pick-priority reasoning); power towers/wind turbines register late
+  // (high pick-priority for their small near-view silhouettes) just before
+  // labels.
   for (const layer of [
     createRegionLayer(params),
     createCoastlineLayer(params),
     createCountiesLayer(params),
+    // registered early (low pick-priority — pickAll walks REVERSE registration
+    // order) so its solid extruded meshes never swallow clicks meant for
+    // roads/rail/markers drawn on top of it
+    buildingsLayer,
+    // airspace: same early/low-pick-priority registration as buildings — a
+    // large translucent volume floating well above ground level shouldn't
+    // steal clicks meant for anything drawn on top of it
+    airspaceLayer,
     createRailLayer(params),
     createTrainsLayer(params, {
       // near-view car-chain LOD (see trains.js module header) — real TRA EMU
@@ -660,7 +908,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       heightM: 4,
     }),
     osmRoadsLayer,
-    createTrailsLayer(params),
+    trailsLayer,
     createRiversLayer(params),
     reservoirsLayer,
     createFarmSimLayer(params),
@@ -670,7 +918,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     pointLayer,
     stationsLayer,
     shipsLayer,
+    currentsLayer,
     trailSignsLayer,
+    airportsLayer,
+    portsLayer,
+    fireStationsLayer,
+    hospitalsLayer,
+    medicalLayer,
+    policeLayer,
+    powerTowersLayer,
+    windTurbinesLayer,
     labelsLayer,
   ]) {
     layers.register(layer, layerCtx(), LAYER_GROUPS[layer.id])
@@ -698,7 +955,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     stage.shadowNeedsUpdate()
     invalidate() // a chunk appeared/vanished (incl. after DEM tiles finish loading)
     osmRoadsLayer.markDemDirty() // coalesced redrape — see vectortiles.js VectorTileManager.markDemDirty
+    trailsLayer.markDemDirty()
     ftwFieldsLayer.markDemDirty()
+    buildingsLayer.markDemDirty()
   }
 
   const cone = createCone()
@@ -1170,37 +1429,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     railSystem: 'thsr',
   })
 
-  // trails: same deferred fetch-once pattern as rail (baked polylines, no
-  // per-line official colors — see polyline.js createTrailsLayer). setData's
-  // 2nd arg (lineColors) is null — the single trailsColor swatch drives the
-  // style — but the 3rd arg carries one {name,county,lengthKm,ascentM} per
-  // trail (parallel to the points arrays) for the click-to-inspect popup
-  // (polyline.js pick(), gated on config.pickRows).
-  let trailsFetch = { loading: false, loaded: false }
-  async function loadTrailsData() {
-    if (trailsFetch.loading || trailsFetch.loaded) return
-    trailsFetch.loading = true
-    try {
-      const res = await fetch(await manifestUrl('trails', '/layers/trails.json'))
-      if (!res.ok) throw new Error(`trails.json ${res.status}`)
-      const data = await res.json()
-      layers.get('trails').setData(
-        data.lines.map((l) => l.points),
-        null,
-        data.lines.map((l) => ({ name: l.name, county: l.county, lengthKm: l.lengthKm, ascentM: l.ascentM }))
-      )
-      trailsFetch.loaded = true
-      layers.get('trails').update(layerCtx())
-    } catch (err) {
-      console.warn('[layers] trails fetch failed', err)
-    } finally {
-      trailsFetch.loading = false
-      invalidate()
-      emit('layers')
-    }
-  }
-
-  // irrigation: same deferred fetch-once pattern as trails (baked polylines).
+  // irrigation: same deferred fetch-once pattern as the OLD trails baked-JSON
+  // layer used to be (see git history — 2026-07-12 superseded trails with a
+  // PMTiles/VectorTileManager stream, vectortiles.js createTrailsLayer; no
+  // manifest fetch needed there anymore, matching osm_roads/ftw_fields).
   // data.meta.color is ONE color for the whole canal network (not per-canal
   // like rail's lineColors array) — setData's 2nd arg stays null and the
   // single irrigationColor swatch drives the style. 3rd arg carries one
@@ -1611,6 +1843,46 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   }
   let shipsActivated = false // onActivate: first switch-on loads today + subscribes to future date changes (once — see shipsVisible HANDLER)
 
+  // ocean currents: CDN PNG+JSON snapshot (docs/OCEAN_CURRENTS_DESIGN.md) —
+  // fetch-once-on-first-switch-on, same {loading,loaded} guard as
+  // loadRailData. Decodes the PNG via an offscreen canvas (same approach as
+  // mini-taiwan-pulse's loadClimateRaster — see currents.js header) into an
+  // ImageData the layer's setData() reads R/G/alpha channels out of. A
+  // fetch/decode failure just leaves the layer gated empty (currents.js's
+  // dataLoaded stays false) — never throws past this function.
+  let currentsFetch = { loading: false, loaded: false }
+  async function loadCurrentsData() {
+    if (currentsFetch.loading || currentsFetch.loaded) return
+    currentsFetch.loading = true
+    try {
+      const metaRes = await fetch(`${SHIPS_TILE_BASE}/climate/currents_latest.json`)
+      if (!metaRes.ok) throw new Error(`currents_latest.json ${metaRes.status}`)
+      const meta = await metaRes.json()
+      const img = await new Promise((resolve, reject) => {
+        const el = new Image()
+        el.crossOrigin = 'anonymous'
+        el.onload = () => resolve(el)
+        el.onerror = () => reject(new Error('currents_latest.png load failed'))
+        el.src = `${SHIPS_TILE_BASE}/climate/currents_latest.png`
+      })
+      const canvas = document.createElement('canvas')
+      canvas.width = meta.width
+      canvas.height = meta.height
+      const ctx2d = canvas.getContext('2d', { willReadFrequently: true })
+      ctx2d.drawImage(img, 0, 0, meta.width, meta.height)
+      const imageData = ctx2d.getImageData(0, 0, meta.width, meta.height)
+      currentsLayer.setData(meta, imageData)
+      currentsFetch.loaded = true
+      currentsLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] ocean currents fetch failed', err)
+    } finally {
+      currentsFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
   // stationsLayer.onActivate — grouped one marker set per transit system.
   // Never rejects: a fetch failure just leaves the layer showing no sets
   // (console.warn + graceful "NO MARKER SETS" panel state), matching rail's
@@ -1647,6 +1919,123 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     } catch (err) {
       console.warn('[layers] trail signs fetch failed', err)
     } finally {
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // generic loader for bake_poi_layers.py's 5 basic POI packs (airports/
+  // ports/fire_stations/hospitals/police_stations) — same {systems: {id:
+  // {color, points}}} shape as stations.json/trail_signs.json above, so one
+  // function covers all 5 onActivate hooks instead of 5 near-identical
+  // copies. Same fail-quiet deferred pattern: a fetch failure just leaves
+  // the layer showing no sets.
+  async function loadPoiData(id, layer) {
+    try {
+      const res = await fetch(await manifestUrl(id, `/layers/${id}.json`))
+      if (!res.ok) throw new Error(`${id}.json ${res.status}`)
+      const data = await res.json()
+      for (const [systemId, sys] of Object.entries(data.systems)) {
+        layer.setSet(systemId, { color: sys.color, visible: true, points: sys.points })
+      }
+      layer.update(layerCtx())
+    } catch (err) {
+      console.warn(`[layers] ${id} fetch failed`, err)
+    } finally {
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // airspace: manifest-driven deferred polygon-extrusion layer (bake_airspace.py
+  // -> public/layers/airspace.json). Same fail-quiet fetch-once pattern as
+  // loadPoiData above; airspaceLayer.setData/update mirror water.js's
+  // reservoirs setData/build split (see airspace.js module header).
+  let airspaceFetch = { loading: false, loaded: false }
+  async function loadAirspaceData() {
+    if (airspaceFetch.loading || airspaceFetch.loaded) return
+    airspaceFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('airspace', '/layers/airspace.json'))
+      if (!res.ok) throw new Error(`airspace.json ${res.status}`)
+      const data = await res.json()
+      airspaceLayer.setData(data.zones)
+      airspaceFetch.loaded = true
+      airspaceLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] airspace fetch failed', err)
+    } finally {
+      airspaceFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // power towers / wind turbines: manifest-driven deferred point layers
+  // (bake_energy.py -> public/layers/power_towers.json / wind_turbines.json,
+  // src/engine/energy.js). Same fail-quiet fetch-once pattern as loadPoiData.
+  let powerTowersFetch = { loading: false, loaded: false }
+  async function loadPowerTowersData() {
+    if (powerTowersFetch.loading || powerTowersFetch.loaded) return
+    powerTowersFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('power_towers', '/layers/power_towers.json'))
+      if (!res.ok) throw new Error(`power_towers.json ${res.status}`)
+      const data = await res.json()
+      powerTowersLayer.setData(data.points, data.meta?.operators)
+      powerTowersFetch.loaded = true
+      powerTowersLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] power_towers fetch failed', err)
+    } finally {
+      powerTowersFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+  let windTurbinesFetch = { loading: false, loaded: false }
+  async function loadWindTurbinesData() {
+    if (windTurbinesFetch.loading || windTurbinesFetch.loaded) return
+    windTurbinesFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('wind_turbines', '/layers/wind_turbines.json'))
+      if (!res.ok) throw new Error(`wind_turbines.json ${res.status}`)
+      const data = await res.json()
+      windTurbinesLayer.setData(data.points)
+      windTurbinesFetch.loaded = true
+      windTurbinesLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] wind_turbines fetch failed', err)
+    } finally {
+      windTurbinesFetch.loading = false
+      invalidate()
+      emit('layers')
+    }
+  }
+
+  // medical: manifest-driven deferred point layer, but R2-hosted (not
+  // committed to git — see bake_medical_poi.py's size-bracket decision, 2.83
+  // MB lands in the 2-8 MB rule, not the <2MB git bracket the other 5 basic
+  // POI packs above use). Same fail-quiet fetch-once pattern as loadPoiData/
+  // loadPowerTowersData; medicalLayer.setData takes the flat {name,cat,
+  // county,lon,lat,elev} point array directly (bake_medical_poi.py's schema
+  // — no `systems` dict like the git-committed POI packs, since category is
+  // a plain int enum per the task spec, not a bake-time named-set split).
+  let medicalFetch = { loading: false, loaded: false }
+  async function loadMedicalData() {
+    if (medicalFetch.loading || medicalFetch.loaded) return
+    medicalFetch.loading = true
+    try {
+      const res = await fetch(await manifestUrl('medical', 'https://tiles.itsmigu.com/layers/medical.json'))
+      if (!res.ok) throw new Error(`medical.json ${res.status}`)
+      const data = await res.json()
+      medicalLayer.setData(data.points)
+      medicalFetch.loaded = true
+      medicalLayer.update(layerCtx())
+    } catch (err) {
+      console.warn('[layers] medical fetch failed', err)
+    } finally {
+      medicalFetch.loading = false
       invalidate()
       emit('layers')
     }
@@ -1878,6 +2267,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     shipsColor: () => layers.get('ships').update(layerCtx()),
     shipsSize: () => layers.get('ships').update(layerCtx()),
     shipsOpacity: () => layers.get('ships').update(layerCtx()),
+    // ocean currents: first switch-on triggers the deferred CDN fetch
+    // (loadCurrentsData no-ops once loaded/in-flight); opacity/speed just
+    // re-apply — the advection itself reads params.currentsSpeed fresh every
+    // tickView, no rebuild needed (see currents.js's step()).
+    currentsVisible: (v) => {
+      if (v) loadCurrentsData()
+      layers.get('currents').update(layerCtx())
+    },
+    currentsOpacity: () => layers.get('currents').update(layerCtx()),
+    currentsSpeed: () => layers.get('currents').update(layerCtx()),
     // OSM roads: no deferred JSON fetch to kick — the PMTiles manager streams
     // tiles itself once switched on (see vectortiles.js). update() just
     // (re)applies the gate/style; the manager's own setEnabled starts/stops
@@ -1885,12 +2284,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     osmRoadsVisible: () => layers.get('osm_roads').update(layerCtx()),
     osmRoadsWidth: () => layers.get('osm_roads').update(layerCtx()),
     osmRoadsOpacity: () => layers.get('osm_roads').update(layerCtx()),
-    // trails: same deferred-fetch pattern as rail; unlike rail this one has a
-    // color param (every trail shares one baked color, no per-line override)
-    trailsVisible: (v) => {
-      if (v) loadTrailsData()
-      layers.get('trails').update(layerCtx())
-    },
+    // trails: PMTiles/VectorTileManager stream (vectortiles.js createTrailsLayer)
+    // — same streamed-not-manifest pattern as osmRoadsVisible above, no fetch
+    // call here; update() re-evaluates its own gate() and (re)starts streaming.
+    trailsVisible: () => layers.get('trails').update(layerCtx()),
     trailsWidth: () => layers.get('trails').update(layerCtx()),
     trailsOpacity: () => layers.get('trails').update(layerCtx()),
     trailsColor: () => layers.get('trails').update(layerCtx()),
@@ -1943,6 +2340,19 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // as osmRoadsVisible above (see vectortiles.js createFtwFieldsLayer)
     ftwFieldsVisible: () => ftwFieldsLayer.update(layerCtx()),
     ftwFieldsOpacity: () => ftwFieldsLayer.update(layerCtx()),
+    // buildings: no deferred JSON fetch — same PMTiles-streams-itself pattern
+    // as osmRoadsVisible/ftwFieldsVisible above (see vectortiles.js
+    // createBuildingsLayer); update()'s own gate() also checks ctx.lodZoom
+    // against the z13 source minzoom
+    buildingsVisible: () => buildingsLayer.update(layerCtx()),
+    buildingsOpacity: () => buildingsLayer.update(layerCtx()),
+    // airspace: manifest-driven deferred polygon layer, same first-switch-on-
+    // fetches pattern as reservoirs/region below
+    airspaceVisible: (v) => {
+      if (v) loadAirspaceData()
+      airspaceLayer.update(layerCtx())
+    },
+    airspaceOpacity: () => airspaceLayer.update(layerCtx()),
     // region: first switch-on fetches the neighbouring coastlines (deferred);
     // the sea plane + style params re-run the layer's update
     regionVisible: (v) => {
@@ -2135,6 +2545,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
+      (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
       motion.tourActive ||
       motion.tweenActive ||
@@ -2182,8 +2593,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // Freeze: bump to native DPR for a Retina-sharp still, draw exactly one frame
   // at that resolution, then park. setPixelRatio reallocates the composer
   // buffers, so this cost lands once per idle transition — never mid-interaction.
+  // Compares against the renderer's actual current ratio (not params.pixelRatio)
+  // because ambient playback (perf pack b, below) may have already parked it at
+  // ANIM_PIXEL_RATIO — idle always wins the max either way. exitIdle below
+  // restores params.pixelRatio read LIVE (not a bump-time snapshot) so a
+  // Settings-panel pixelRatio change made while parked in idle takes effect on
+  // wake instead of being clobbered by a stale value (regression found in
+  // review: a preIdleRatio snapshot here would re-assert the ratio that was
+  // active at bump time, silently overwriting whatever the user just set).
   function enterIdle(dt) {
-    if (IDLE_PIXEL_RATIO > params.pixelRatio + 1e-3) {
+    const current = stage.renderer.getPixelRatio()
+    if (IDLE_PIXEL_RATIO > current + 1e-3) {
       stage.setPixelRatio(IDLE_PIXEL_RATIO)
       pixelBumped = true
     }
@@ -2195,9 +2615,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
 
   // Thaw on the next invalidate: restore the interactive (lower) pixel ratio so
   // live frames stay cheap. The active tick that follows renders at that ratio.
+  // Reads params.pixelRatio live so a mid-idle Settings change wins on wake.
+  // The ambientPixelDropped branch is defensive, not the common path: by the
+  // time idle is reached, ambient-drop bookkeeping (further down in tick())
+  // has always already restored params.pixelRatio and cleared the flag — see
+  // that block's own comment — so this ternary normally just resolves to
+  // params.pixelRatio. It's kept in case that invariant ever breaks, so a
+  // stale idle-exit doesn't silently re-bump DPR past an active ambient drop.
   function exitIdle() {
     if (pixelBumped) {
-      stage.setPixelRatio(params.pixelRatio)
+      stage.setPixelRatio(ambientPixelDropped ? Math.min(ANIM_PIXEL_RATIO, params.pixelRatio) : params.pixelRatio)
       pixelBumped = false
     }
     idle = false
@@ -2206,6 +2633,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   function tick() {
     if (disposed) return
     rafId = requestAnimationFrame(tick)
+    // perf pack a: ambient-throttle gate — skipped frames never call
+    // clock.getDelta(), so their elapsed time simply accumulates into the
+    // next processed frame's dt (nothing is lost, motion just steps in
+    // bigger increments at ~30fps instead of every RAF).
+    if (PERF_THROTTLE && ambientThrottled && performance.now() < nextAmbientFrameAt) return
     const dt = Math.min(clock.getDelta(), 0.05)
     const t = clock.elapsedTime
 
@@ -2213,6 +2645,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // open. Animating frames roll the window forward so any motion always gets a
     // full ACTIVE_WINDOW_MS tail (damping, settle) before the loop can idle.
     const animating = isAnimating()
+    // full-rate whenever a camera animation (tour/flyTo) or live pointer/wheel
+    // input is in play; note follow-camera mode is deliberately NOT included
+    // here — it's classified as ambient and throttles to 30fps too (see
+    // docs/HANDOFF.md 顯示效能提升包 for the tradeoff writeup)
+    const fullRate = motion.tweenActive || motion.tourActive || performance.now() < interactUntil
+    const ambientOnly = animating && !fullRate
     if (animating) invalidate()
     if (!animating && performance.now() >= activeUntil) {
       if (!idle) {
@@ -2271,6 +2709,19 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // the hysteresis.
     const camDist = camera.position.distanceTo(controls.target)
     lastCamDist = camDist // trains.js near-view car-chain LOD reads this via layerCtx().camDist
+    // MapControls' drag-pan is screen-space (a fixed fraction of the visible
+    // ground plane per pixel of mouse movement), so it ALSO crawls once
+    // minDistance (scene.js, 0.08 ≈ 40 m) is hugging the hillside — same
+    // problem keyPan's own camDist-scaled speed has, just via a different
+    // knob. panSpeed is pure input sensitivity (three.js multiplies the
+    // per-pixel pan delta by it) — never touches rendering, so no
+    // invalidate() is needed here; the very next drag frame just reads the
+    // updated value. At camDist ≥ 0.35 this clamps to exactly 1 (identical to
+    // the untouched default), so far-view drag feel is byte-for-byte
+    // unchanged; below that it ramps up to 4× as camDist shrinks toward
+    // minDistance. Per-frame cost is one divide + clamp — negligible next to
+    // the rest of this function.
+    controls.panSpeed = THREE.MathUtils.clamp(0.35 / camDist, 1, 4)
     const realMode = params.source === 'real' && heightField
     const lodChanged = stage.tickView(camDist, !!realMode)
     const fogScale = stage.fogScale
@@ -2361,6 +2812,38 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
 
     renderFrame(dt)
+
+    // perf pack a/b bookkeeping — only reached on a processed frame (the idle
+    // early-return above skips it entirely, which is fine: ambientPixelDropped
+    // is always cleared before the activity window can expire into true idle,
+    // see the restore branch below). Gated by PERF_THROTTLE: false means
+    // ambientThrottled never turns true (top-of-tick gate becomes a no-op) and
+    // the DPR-drop block below is skipped outright — full pre-package behavior.
+    ambientThrottled = PERF_THROTTLE && ambientOnly
+    if (ambientThrottled) {
+      // accumulator pacing (not "now + interval") so a slow frame can't drift
+      // the schedule forward or spiral — it just catches up to `now`.
+      nextAmbientFrameAt = Math.max(nextAmbientFrameAt + ANIM_FRAME_MS, performance.now())
+    }
+    if (PERF_THROTTLE && window.devicePixelRatio > 1) {
+      if (ambientOnly) {
+        if (!ambientSince) ambientSince = performance.now()
+        if (!ambientPixelDropped && performance.now() - ambientSince > AMBIENT_PIXEL_DEBOUNCE_MS) {
+          stage.setPixelRatio(Math.min(ANIM_PIXEL_RATIO, params.pixelRatio))
+          ambientPixelDropped = true
+        }
+      } else {
+        if (!ambientPixelDropped) ambientSince = 0 // streak broken before it dropped — restart the debounce clock next time
+        // restore only when ambient fully ends (animating → false), never just
+        // because interaction started a fullRate overlay on top of it — that
+        // would force a mid-gesture composer buffer realloc (see enterIdle)
+        if (!animating && ambientPixelDropped) {
+          stage.setPixelRatio(params.pixelRatio)
+          ambientPixelDropped = false
+          ambientSince = 0
+        }
+      }
+    }
   }
 
   // ---------------------------------------------------------------- facade
@@ -2540,6 +3023,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       },
       get idle() {
         return idle
+      },
+      // 顯示效能提升包 verify hook: the renderer's *actual* current DPR — 1.0
+      // during debounced ambient-only playback, IDLE_PIXEL_RATIO on the idle
+      // still, params.pixelRatio otherwise
+      get pixelRatio() {
+        return stage.renderer.getPixelRatio()
+      },
+      // 顯示效能提升包 verify hook: true on frames the ambient throttle is
+      // pacing to ~30fps (ambient motion, no tour/tween/interaction in play)
+      get ambientThrottled() {
+        return ambientThrottled
       },
       invalidate,
       stats,

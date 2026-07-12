@@ -51,20 +51,59 @@
       "visible": false
     },
     {
-      "id": "trails",
-      "kind": "line",
-      "label": "Trails",
-      "rowLabel": "步道 Trails",
-      "url": "/layers/trails.json",
-      "visible": false,
-      "style": { "width": 2, "opacity": 0.9 }
-    },
-    {
       "id": "trail_signs",
       "kind": "point",
       "label": "Trail Signs",
       "rowLabel": "步道路標 Trail Signs",
       "url": "/layers/trail_signs.json",
+      "visible": false
+    },
+    {
+      "id": "airports",
+      "kind": "point",
+      "label": "Airports",
+      "rowLabel": "機場 Airports",
+      "url": "/layers/airports.json",
+      "visible": false
+    },
+    {
+      "id": "ports",
+      "kind": "point",
+      "label": "Ports",
+      "rowLabel": "港口 Ports",
+      "url": "/layers/ports.json",
+      "visible": false
+    },
+    {
+      "id": "fire_stations",
+      "kind": "point",
+      "label": "Fire Stations",
+      "rowLabel": "消防分隊 Fire Stations",
+      "url": "/layers/fire_stations.json",
+      "visible": false
+    },
+    {
+      "id": "hospitals",
+      "kind": "point",
+      "label": "Hospitals",
+      "rowLabel": "急救醫院 Hospitals",
+      "url": "/layers/hospitals.json",
+      "visible": false
+    },
+    {
+      "id": "medical",
+      "kind": "point",
+      "label": "Medical",
+      "rowLabel": "醫療設施 Medical",
+      "url": "https://tiles.itsmigu.com/layers/medical.json",
+      "visible": false
+    },
+    {
+      "id": "police_stations",
+      "kind": "point",
+      "label": "Police",
+      "rowLabel": "警察機關 Police",
+      "url": "/layers/police_stations.json",
       "visible": false
     },
     {
@@ -123,6 +162,31 @@
       "label": "THSR Trains",
       "rowLabel": "高鐵列車 THSR Trains",
       "url": "/layers/thsr_schedule.json",
+      "visible": false
+    },
+    {
+      "id": "airspace",
+      "kind": "area",
+      "label": "Airspace",
+      "rowLabel": "空域 Airspace",
+      "url": "/layers/airspace.json",
+      "visible": false,
+      "style": { "opacity": 0.25 }
+    },
+    {
+      "id": "power_towers",
+      "kind": "point",
+      "label": "Power Towers",
+      "rowLabel": "電塔 Power Towers",
+      "url": "/layers/power_towers.json",
+      "visible": false
+    },
+    {
+      "id": "wind_turbines",
+      "kind": "point",
+      "label": "Wind Turbines",
+      "rowLabel": "風機 Wind Turbines",
+      "url": "/layers/wind_turbines.json",
       "visible": false
     }
   ]

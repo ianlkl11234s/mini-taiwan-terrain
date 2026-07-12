@@ -1,53 +1,57 @@
-# HANDOFF — 2026-07-12 session 交接
+# HANDOFF — 2026-07-12 隔夜衝刺交接
 
 > 給下一個 session 的第一份讀物。搭配 `CLAUDE.md`（慣例）與 `docs/PLATFORM_BLUEPRINT.md`（藍圖）。
+> 上一版（2026-07-12 晨間基線）見 git 歷史 `61474e0`。
 
 ## 現況快照
 
-- **main 與 origin 完全同步**：2026-07-11 sprint 全部經 PR #4 merge 上線（45+ commits），無未推變更。
-- **部署狀態**：GitHub Pages 備線已開通並注入 `VITE_TILE_BASE`（`https://ianlkl11234s.github.io/mini-taiwan-terrain/`，完整可用不再缺圖磚）；Zeabur 主線 deploy 需用戶在 dashboard 確認有跟上（CLI 看不到）。
-- **Cloudflare Cache Rule 已設**（用戶 2026-07-11 完成）：單一規則涵蓋 `*.pmtiles` + `/ships/trails/`，Edge TTL 7d ignore-origin，實測 HIT。**重烘 pmtiles 同名覆寫後要手動 Purge Cache**（或把 purge 加進上傳腳本，需 Cache Purge 權限的 API token）。
-- **功能現況**（全部驗收過）：時間軸（lazy-clock timeStore）、台鐵 992 班+高鐵 212 班（全段涵蓋率 100%）、3D 車廂近景 LOD、跟隨鏡頭（delta-carry）、列車點選資訊卡、船舶 AIS（7 天 CDN 快照+RPC fallback）、海面淡波紋、真實比例尺（demExaggeration 預設 1.0）、海底地形預設開、Layers 面板格式鐵則。
-- 設計文件 SSOT（opus 審定、動相關功能前必讀）：`TIMELINE_DESIGN.md`、`MARINE_DESIGN.md`、`FOLLOW_CAMERA_DESIGN.md`、`BATHYMETRY_DESIGN.md`、`VECTOR_TILES_DESIGN.md`。
-- R2 資產：`terrain-tiles/bathy/`（8,096 磚，前端唯一磚路徑）、`terrain-tiles/vector/`（osm_road_drive.pmtiles 59MB + ftw_fields_2025.pmtiles 107MB）、`terrain-tiles/ships/trails/`（7 個日檔 2026-07-04~10）、`terrain-tiles/`（本島舊磚，舊版用）。
-- bbox：117.8–123.5E / 21.0–26.5N（金馬澎+福建沿岸+巴士海峽）。
-- 2026-07-11 已完成項明細（時間軸、列車二期全三項、切段點、Cache Rule、AIS、海面、比例尺）：見舊版 HANDOFF（git 歷史 `95777fe`）與 PR #4 描述。
+- **本輪產出（2026-07-12 深夜隔夜衝刺，12 commits）**：branch `sprint/20260712-overnight-layers` 已 push 並開 PR，**等用戶 merge 拍板**（鐵則：merge 須用戶）。opus 全 diff 終審：無 MUST-FIX、可 merge；兩項 SHOULD-FIX 一項已修（見下）、一項記 backlog #5。
+- **效能包 a+b 上線**（原 backlog #3 的 a/b 子項）：ambient 動畫（列車/船/海流/海面）RAF 節流 30fps＋DPR 降 1.0；互動/tour/flyTo 全速；idle 補幀照舊。實測：ambient 97→29.7fps、拖曳恢復 78-113fps、idle renderCount 凍結。**killswitch：`src/engine/index.js` 的 `const PERF_THROTTLE`（≈L514），設 false 一鍵回舊行為（需 rebuild）**——用戶指示：若影響觀感就關。follow 跟隨模式歸類 ambient 吃 30fps（刻意取捨，註解有標）。
+- **八個新圖層全部上線**（各 layer 驗證過：pick/styleSchema/idle 凍結/build）：
+  | 圖層 | 資料 | 去向 | 備註 |
+  |---|---|---|---|
+  | 建物 Buildings | GBA 152 萬棟 z13-16 vector PMTiles 139.8MB | R2 `vector/buildings_3d_taiwan.pmtiles` | extrusion＋高度色帶；**CC BY-NC 4.0 署名（GBA © TUM, Zhu et al. 2025）走 pick 彈窗＋describe**；`BUILDINGS_RADIUS_FRAC=0.42`；只有本島 |
+  | 步道 Trails | 6 源 7,339 條 PMTiles 2.6MB | R2 `vector/hiking_trails.pmtiles` | **取代**舊 49 條 bake（polyline 版已退場）；trailsColor 預設 #ff7a1a（與 roads #e8722c 同色系，用戶可再定奪） |
+  | 機場/港口/消防/急救醫院/警察 | 57/277/717/232/2,065 點 | git `public/layers/*.json` | ports 5 sets、hospitals 4 sets（急救醫院 232≠目錄帳面 252，dedup 差異已在 bake docstring） |
+  | 空域 Airspace | 限航 29＋危險 2（**源資料無禁航 P**） | git 19.6KB | floor/ceiling 立體圍籬；ceiling clamp 10000m（影響 9 區） |
+  | 電塔/風機 | 26,589塔＋812機 | git 1.75MB/51KB | InstancedMesh＋近景雙閘門（cap 3000）；電壓資料稀疏（8/26589 有標）幾乎全 25m 桶；葉片靜態（旋轉 TODO） |
+  | 醫療設施 Medical | 全國健保機構 29,896 點（醫院 451/診所 21,765/藥局 7,680） | R2 `layers/medical.json`（2.83MB） | 真源=`nhi_institutions_geocoded.geojson`（42MB），**不是** poi/medical/medical/（那是 NLSC 社福設施）；與急救醫院層並存不同 id |
+  | 海流 Ocean Currents | CMEMS UV 流場 PNG 快照（valid_at 2026-07-02） | R2 `climate/currents_latest.{png,json}` | CPU 平流 2000 粒子；`FLOW_SCALE=9000`、`HDR_BOOST=10`（ACES tonemap 會壓暗 additive 色——重要 gotcha）；設計文件 `docs/OCEAN_CURRENTS_DESIGN.md`；黑潮可辨但偏淡（backlog #4） |
+- **opus 終審修正已入**（`0eaa3f2`）：①海流 isAnimating 加 `currentsFetch.loaded` gate（否則 CDN fetch 失敗會永久 30fps 空轉——唯一違反 on-demand 鐵則的路徑）②medicalSize/medicalOpacity 補進 DEFAULT_PARAMS。
+- 合併後互動實測：海流 ambient 30.04fps／DPR 1.0，拖曳 78.3fps 全速；**海流開著時互動 DPR 維持 1.0 不回 1.5**（避免手勢中 buffer 重配，效能包註解明講的取捨）。
+- 本 diff **零新增 Supabase RPC／零 DB 負載**——所有新資料是靜態 CDN/git。
+- 設計文件 SSOT：`TIMELINE_DESIGN.md`、`MARINE_DESIGN.md`、`FOLLOW_CAMERA_DESIGN.md`、`BATHYMETRY_DESIGN.md`、`VECTOR_TILES_DESIGN.md`、**`OCEAN_CURRENTS_DESIGN.md`（新）**。
+
+## 需用戶手動（PR merge 前後）
+
+1. **PR merge 拍板**（branch `sprint/20260712-overnight-layers`）
+2. **Cloudflare Cache Rule 補涵蓋 `/layers/*.json`**（medical.json 走 R2 每次回源；現規則只有 `*.pmtiles`＋`/ships/trails/`）；順手可加 `/climate/*`
+3. merge 後 **Zeabur dashboard 確認 redeploy**（無新環境變數）
+4. 目測定奪：trailsColor 橙是否要改（與 roads 同色系）；海流視覺強度是否要加強（backlog #4）
 
 ## 未完成 Backlog（優先序供參，用戶隨時重排）
 
 | # | 項目 | 脈絡 |
 |---|------|------|
-| 1 | **時序圖層二號：雨量/水位**（推薦下一個） | 時間軸/subscribeDate/CDN 快照模式全就位，這是地基的原始目的；資料 collectors 在收（`config/realtime_tables.yaml`）；接法照 MARINE_DESIGN 的 ships 模式 |
-| 2 | **AIS phase 2** | ①快照 cron 化（現 7 天是手動烘，會陳舊——`bake_ship_trails.py` 已冪等，排程即可）②船種分色（per-type sets，車站模式）③即時船位（需 gis-platform 開 `get_ship_current` public RPC，上游先動）④跟隨船（follow.js 介面已預留 mmsi） |
-| 3 | **顯示效能提升包**（2026-07-12 用戶新增） | 見下節專章 |
-| 4 | OSM 步道圖層 | 卡上游：analytics 從 PBF 重抽全台 walk network（現有萃取只有 9 城市）；OSM 無 sac_scale 難度標籤 |
-| 5 | 生態系 P1：Supabase rate limit / Spend Cap | 全生態系缺口（gis-platform 動手，與 pulse 一起解）；**AIS 上線後前端 RPC 面變大，急迫性升高**；藍圖 §7 L5 |
-| 6 | 澎湖 DTM 相位對齊 | bathy 磚 ~3m 微漂移；下次重烘用金門同款 `-te` 手法一併修（analytics `docs/data-catalog/base_map/dtm_20m_kinmen.md`） |
-| 7 | 綠島/龜山島 DEM 補洞 | 主 DEM 兩島 nodata；分幅版 dataset 35430 可能有 |
-| 8 | 灌溉全量版（3.4MB）上 R2 | 現行 repo 內為簡化版；備案 B 參數在 `scripts/bake_irrigation.py` 回報中 |
-
-## 顯示效能提升包（backlog #3 專章，實作前先 profile 真 GPU）
-
-> 原則：on-demand render 鐵則已把「靜止成本」壓到零，剩下的戰場是**連續渲染時的每幀成本**（列車/船舶播放中、海面波紋開啟時）。按 CP 值排序，a/b 普惠低風險先做，c/d/e 需 profile 佐證再動。
-
-| 子項 | 內容 | 預期收益 / 風險 |
-|------|------|----------------|
-| a. **動畫幀率上限** | ambient 連續渲染（列車/船/海面）時把 RAF 節流到 30fps；使用者互動（orbit/zoom/pan/tween）瞬間恢復全速 | GPU 成本直接砍半；低風險，地圖引擎常規手法 |
-| b. **DPR 上限＋動態解析度** | `renderer.setPixelRatio` 上限 2（Retina 3x 螢幕是 9 倍像素成本）；進階：動畫/互動中降 0.75–1x，靜止前補一幀全解析度 | 高 DPI 裝置大幅減負；注意 idle 補幀保銳利度 |
-| c. **向量瓦片解碼移 Web Worker**（原 backlog 併入） | z14 密集瓦片主執行緒解碼卡幀；`VECTOR_TILES_DESIGN.md` §3 已有方案 | 消除縮放卡頓尖峰；壓測 56-84fps 未觸發，放大鏡頭+慢 GPU 才有感 |
-| d. **海面 overdraw 審計** | 海面板 `alphaTest` 令 early-Z 失效（opus 審查確認）：被地形遮住的海像素仍跑 fragment（含波紋 sin×3）。評估 depth pre-pass／海域裁剪 mesh／idle 換便宜材質 | 全螢幕級 fragment 節省；動遮罩機制要小心（MARINE M1 教訓） |
-| e. **ships trail 記憶體 → typed array** | 每日 1.1–1.4 萬艘 ×10–20 萬點常駐 JS 物件陣列；轉 typed array 降 GC 壓力與記憶體 | 記憶體減半以上；純資料結構改動，改動面在 ships.js 核心 |
-| f. **後處理鏈審計** | 盤點 scene.js composer 的 pass 清單，動畫模式停用昂貴 pass（若有 bloom/AO 類） | 視 pass 而定；先盤點再說 |
-| g. farm/river_sim 8192 貼圖 vs 低階 GPU（原 backlog 併入） | SwiftShader 自動縮圖、真 GPU 16384 通常無虞 | 觀察即可，暫不動 |
+| 1 | **AIS 快照 cron 化**（方案已設計，用戶延後） | 本機 launchd 每日 09:30 跑 `bake_ship_trails.py`（rclone 憑證已在本機、日檔冪等、Mac 醒來補跑；collectors 側要搬憑證故不選）。海流快照每日刷新（pulse 上游 → R2 拷貝）可併同一個排程解 |
+| 2 | **時序圖層：雨量/水位**（資料盤點已完成，用戶延後） | rain_gauge ~1,306 站（`get_rain_gauge_day`，每站每小時）＋river ~332 站（`get_river_water_level_day`）皆在線；接法照 MARINE_DESIGN ships 模式；降水 PNG 柵格另議 |
+| 3 | 效能包 c–g 殘項 | c 向量瓦片解碼移 Worker／d 海面 overdraw 審計／e ships trail typed array／f 後處理鏈審計／g 8192 貼圖觀察——原專章見 `61474e0` |
+| 4 | 海流視覺強化 | 加粒子數／Line2 加寬／獨立非 tonemap composite pass（設計文件有候選）；快照過期顯示（valid_at 已 10 天） |
+| 5 | 建物 redrape 納入分幀 budget（opus SHOULD-FIX） | 近景密集區平移時 `_redrape` 一次重掃 ~3M 頂點（20-60ms jank spike，互動全速不受節流保護）；roads/fields 同架構但頂點量差 10-50x |
+| 6 | sets loader 吞錯不 rethrow → toggle 無法重試（既有缺陷） | stations/ports/hospitals/medical 全 sets 層同病：fetch 失敗後 `activated` 已 set，再切開關不重試，只能刷頁 |
+| 7 | 生態系 P1：Supabase rate limit / Spend Cap | 沿舊 backlog #5；本輪零新增 RPC 無惡化 |
+| 8 | 離岸風場 36 面／建物外島／澎湖 DTM 相位／綠島龜山島 DEM 補洞／灌溉全量版 | 小項集合：離岸風場面資料不吃點位 sets（airspace.js 是正確參考路徑）；其餘沿舊 backlog #6-8 |
+| 9 | `bake_flow_accum.py`/`pilot_flow_accum.py` 的 TILES_DIR 缺 `bathy/` 段（潛在同 bug） | `bake_layer_elevations.py` 同 bug 本輪已修（高程查找靜默 fallback 0m）；這兩支未修（當時不在改動面） |
 
 ## 開發慣例備忘（跨 session 有效）
 
 - 派工必指定模型（haiku 盤點 / sonnet 實作 / opus 設計與重大審查），主迴圈只分派驗收
-- **會動 `src/engine` 的實作棒走 git worktree 隔離**；環境設置見 `.claude/skills/verify/SKILL.md`（tiles 為實體目錄含 bathy symlink——相對 symlink 深度不夠時用絕對路徑；worktree 內 build 前記得移掉 tiles symlink 否則 vite 會嘗試複製整個磚目錄）
-- 驗證分級：shader/部署/跨 repo 才雙道（實作自驗+opus 終審），一般圖層煙霧測試即可
-- **子代理收尾嚴禁寬 pattern `pkill -f`**（兩次教訓）；本機有並行 session 會劫持共用 agent-browser daemon——實作棒改用獨立 Chrome + `--remote-debugging-port` + 專屬 `--session`
-- 用戶 dev server 慣用 port 6015（`gis-up` 清單目前登記 6007，尚未改）
-- 列車資料契約：`train_tracks.json` 弧長=EPSG:3826 真實公尺；part key=`tra_00..30`（切段點重縫後 37→31 parts）；`dep_sec_of_day`=Asia/Taipei 當日秒；`rail_lines.json` 的 `meta.partCount/vertexCount` 已過期（無程式讀取）
-- 高鐵資料契約：schema 同台鐵；part=`thsr_00` 南下/`thsr_01` 北上（鏡射走廊）；**方向判定=整班「起點 ratio < 終點 ratio」**（bake `match_thsr_track_to_part()` 與前端 `resolveCorridorPart()` 同規則，改一邊必改另一邊）；時刻表源=pulse 快照 2026-02-18
-- 船舶資料契約：CDN 快照 `{VITE_TILE_BASE}/ships/trails/{YYYY-MM-DD}.json`＝`{meta, trails:[{mmsi, ship_type, points:[[lat,lng,ts]]}]}`（ts=epoch 秒遞增、已過濾 >40 節跳點）；非快照日 fallback `get_ship_trails` RPC（分號字串格式、需自行過濾）
-- 圖層列格式鐵則（`/new-layer` skill §4b）：rowLabel 嚴格「中文名 英文名」、禁動態數字、新圖層必須 styleSchema（點層 size+opacity 起跳）
+- **會動 `src/engine` 的實作棒走 git worktree 隔離**；多棒序列任務可共用同一 worktree 同一 branch 鏈續（本輪五棒實證可行）；環境設置見 `.claude/skills/verify/SKILL.md`（build 前 tiles 目錄要暫移，vite 會 ELOOP/整目錄複製）
+- **rclone 上 R2 必帶 `--s3-no-check-bucket`**（本機 key 無 HeadBucket 權限會 403）
+- 量測/驗證用獨立 Chrome＋`--remote-debugging-port`＋專屬 `--user-data-dir`＋`--disable-backgrounding-occluded-windows`；量測時視窗保持可見；**嚴禁寬 pattern `pkill -f`**；用戶 dev server 慣用 6015，實作棒用 6220+
+- 本機 dev 看 R2-hosted 圖層（海流/medical）要 `VITE_TILE_BASE=https://tiles.itsmigu.com npm run dev`
+- **ACES tonemap gotcha**：HDR buffer＋ACES 會把 0..1 additive 色壓到近隱形——發光類疊加層要把顏色乘 HDR boost（海流用 10，見 currents.js）
+- 測試時重複 navigate/reload 會累積 HMR 殘留（React error-boundary 洗版、`reading 'delete'`）——先用乾淨 Chrome profile 單次流程重跑排除，本輪三棒都遇過、都非真 bug
+- 驗證分級：shader/部署/跨 repo 才雙道（實作自驗＋opus 終審），一般圖層煙霧測試即可
+- 列車/高鐵/船舶資料契約沿舊版（git `61474e0` §慣例）：train_tracks 弧長=EPSG:3826 真實公尺、thsr 方向=起訖 ratio 規則、ships CDN 快照格式
+- 圖層列格式鐵則（`/new-layer` skill §4b）：rowLabel 嚴格「中文名 英文名」、禁動態數字、新圖層必須 styleSchema
