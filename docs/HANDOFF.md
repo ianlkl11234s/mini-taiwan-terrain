@@ -5,7 +5,8 @@
 
 ## 現況快照
 
-- **本輪產出（2026-07-12 深夜隔夜衝刺，12 commits）**：branch `sprint/20260712-overnight-layers` 已 push 並開 PR，**等用戶 merge 拍板**（鐵則：merge 須用戶）。opus 全 diff 終審：無 MUST-FIX、可 merge；兩項 SHOULD-FIX 一項已修（見下）、一項記 backlog #5。
+- **本輪產出（2026-07-12 深夜隔夜衝刺 + 晨間驗收微調，14 commits）**：**PR #5 已由用戶 merge 上線（merge commit `d06cc7d`）**，main 與 origin 同步，本輪兩個 agent worktree 已清除。opus 全 diff 終審：無 MUST-FIX；兩項 SHOULD-FIX 一項已修（見下）、一項記 backlog #5。
+- **近景 UX 包**（`b78bb43`，用戶晨間驗收時追加）：①`minDistance` 0.25→0.08（可貼近至 ~40m 看建物街景）②貼地移動提速——keypan 加 `KEYPAN_FLOOR_DIST=0.35` 速度下限＋`controls.panSpeed` 近距動態補償（camDist≥0.35 恆為 1，遠景手感不變）③電塔/風機各加「點位 Dots」set（THREE.Points 全量常駐、2-3px 固定 screen-size、無近景閘門）——遠景看分佈、推近 3D 浮現；電塔/風機順勢改為 onActivate/sets 啟用模式（移除 visibleParam 死代碼）。
 - **效能包 a+b 上線**（原 backlog #3 的 a/b 子項）：ambient 動畫（列車/船/海流/海面）RAF 節流 30fps＋DPR 降 1.0；互動/tour/flyTo 全速；idle 補幀照舊。實測：ambient 97→29.7fps、拖曳恢復 78-113fps、idle renderCount 凍結。**killswitch：`src/engine/index.js` 的 `const PERF_THROTTLE`（≈L514），設 false 一鍵回舊行為（需 rebuild）**——用戶指示：若影響觀感就關。follow 跟隨模式歸類 ambient 吃 30fps（刻意取捨，註解有標）。
 - **八個新圖層全部上線**（各 layer 驗證過：pick/styleSchema/idle 凍結/build）：
   | 圖層 | 資料 | 去向 | 備註 |
@@ -22,12 +23,12 @@
 - 本 diff **零新增 Supabase RPC／零 DB 負載**——所有新資料是靜態 CDN/git。
 - 設計文件 SSOT：`TIMELINE_DESIGN.md`、`MARINE_DESIGN.md`、`FOLLOW_CAMERA_DESIGN.md`、`BATHYMETRY_DESIGN.md`、`VECTOR_TILES_DESIGN.md`、**`OCEAN_CURRENTS_DESIGN.md`（新）**。
 
-## 需用戶手動（PR merge 前後）
+## 用戶手動項狀態
 
-1. **PR merge 拍板**（branch `sprint/20260712-overnight-layers`）
-2. **Cloudflare Cache Rule 補涵蓋 `/layers/*.json`**（medical.json 走 R2 每次回源；現規則只有 `*.pmtiles`＋`/ships/trails/`）；順手可加 `/climate/*`
-3. merge 後 **Zeabur dashboard 確認 redeploy**（無新環境變數）
-4. 目測定奪：trailsColor 橙是否要改（與 roads 同色系）；海流視覺強度是否要加強（backlog #4）
+1. ~~PR merge 拍板~~ ✅ 已 merge（`d06cc7d`，2026-07-12 上午）
+2. ~~Cloudflare Cache Rule 補涵蓋~~ ✅ 已設並實測（規則現為 `host eq tiles.itsmigu.com AND (pmtiles OR /ships/trails/ OR /layers/ OR /climate/)`；medical.json MISS→HIT、currents PNG REVALIDATED→HIT 皆驗證過）
+3. **Zeabur dashboard 確認 redeploy**（無新環境變數）——未確認
+4. 目測定奪（開放中）：trailsColor 橙是否要改（與 roads 同色系）；海流視覺強度是否要加強（backlog #4）；電塔/風機 dots 的大小顏色（現 2-3px，塔 `#5c6670`/機 `#29b6d8`）；效能包 30fps 觀感（不滿意 → `PERF_THROTTLE=false`）
 
 ## 未完成 Backlog（優先序供參，用戶隨時重排）
 
