@@ -38,7 +38,13 @@
 
 - [x] P1a-1 redrape 分幀化（PR：sprint/vector-perf-p1a）
 - [x] P1a-2 dirty-region（同上；空集合＝「chunk 有動但 DEM 沒變」→ 不入佇列，null 才退回全層）
-  - ⚠️ 實作代理在 runtime 驗證中途被中斷：build ✅、瀏覽器初步操作無錯誤，但「拖曳平移觀察 redrape 佇列行為＋idle renderCount 凍結＋exaggeration 全層正確」三項實測未跑完，merge 前需人工或 /verify 補驗
+  - ✅ 2026-07-14 /verify 補驗通過（SwiftShader headless，台北→台中實測）：
+    - 貼地：建物 tile mesh（18.1 萬頂點）底部 -4.27 vs 地形取樣 -4.24，貼合正常
+    - dirty-region 實效：飛行途中 markDemDirty 42 次呼叫，33 次空集合→零入佇列（舊版會 42 次全層重掃）
+    - 佇列排空：強制全層 fallback（48+48 tiles）→ 分幀排空 drained、期間 renderCount 僅 +8
+    - idle freeze：收斂後 renderCount 凍結 12 秒不動、`idle:true`
+    - exaggeration：設 1.6 後 mesh minY 精確 ×1.6、同步全層重貼、pending 立即為空、rc 隨後凍結
+    - console 無新 error（glBlitFramebuffer warning 為 SwiftShader 已知 artifact）
 - [ ] P1b 共用幀預算
 - [ ] P2a worker decode
 - [ ] P2c 分層 LRU
