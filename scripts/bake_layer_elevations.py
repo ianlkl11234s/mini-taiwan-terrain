@@ -38,6 +38,10 @@ OUT_DIR = ROOT / "public" / "layers"
 GIS_ROOT = Path("/Users/migu/Desktop/資料庫/gen_ai_try/ichef_工作用/GIS")
 RAIL_SRC = GIS_ROOT / "taipei-gis-analytics/data/processed/transportation/rail_lines/rail_lines_20260527.geojson"
 STATIONS_SRC = GIS_ROOT / "mini-taiwan-pulse/public/geo/station_points.geojson"
+# TDX-sourced TRA station list (244 stations) -- station_points.geojson only
+# has 212 and is missing ~32 major hubs (臺北/高雄/臺中/新竹/花蓮/臺東/基隆/宜蘭
+# among them). Used in bake_stations() to fill that gap; see comment there.
+TRA_STATIONS_TDX_SRC = GIS_ROOT / "mini-taiwan-pulse/public/rail/tra/stations/stations.geojson"
 THSR_PILLARS_SRC = GIS_ROOT / "mini-taiwan-pulse/public/station_pillars.json"
 THSR_NAMES_SRC = GIS_ROOT / "taipei-gis-analytics/output/report/0123_ichef_used/04_transit/rail_stations_tra_thsr.geojson"
 
@@ -248,6 +252,25 @@ def bake_stations(cache):
         entry["points"].append(
             {"name": pr.get("name", ""), "lat": round(lat, 5), "lon": round(lon, 5), "elev": cache.elevation(lon, lat)}
         )
+
+    # TRA gap-fill: same merge logic as bake_trains.py's build_station_catalog()
+    # — key by exact `name` string match, keep the existing 212 stations'
+    # entries untouched, append any TDX name not already present. Verified 0
+    # alias conflicts (all 212 existing names match this 244-name set
+    # verbatim), so a plain set-membership check is sufficient.
+    if "tra" in systems and TRA_STATIONS_TDX_SRC.exists():
+        existing_names = {p["name"] for p in systems["tra"]["points"]}
+        tdx_data = json.loads(TRA_STATIONS_TDX_SRC.read_text())
+        for feat in tdx_data["features"]:
+            pr = feat["properties"]
+            name = pr["name"]
+            if name in existing_names:
+                continue
+            lon, lat = feat["geometry"]["coordinates"]
+            systems["tra"]["points"].append(
+                {"name": name, "lat": round(lat, 5), "lon": round(lon, 5), "elev": cache.elevation(lon, lat)}
+            )
+            existing_names.add(name)
 
     # THSR has no entry in station_points.geojson — supplement from the pillar
     # coordinates (id/lng/lat) + the separate id -> name lookup.
