@@ -22,7 +22,7 @@ export default function Settings({ engine }) {
   return (
     <div>
       <SectionHeader>View</SectionHeader>
-      <Slider label="視距 View distance" min={1} max={2.5} step={0.05} value={p.viewRange} onChange={live('viewRange')} format={(v) => `${v.toFixed(2)}×`} />
+      <Slider label="視距 View distance" min={1} max={3.75} step={0.05} value={p.viewRange} onChange={live('viewRange')} format={(v) => `${v.toFixed(2)}×`} />
       <Slider
         label="垂直放大 Vertical scale"
         min={0.5}

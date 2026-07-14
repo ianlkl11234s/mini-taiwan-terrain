@@ -387,7 +387,14 @@ export const DEFAULT_PARAMS = {
   // R2: multiplies the fog near/far baseline inside the fogScale computation
   // (scene.tickView) — pushes the fog wall out; chunk streaming, scan radius
   // and POI search all key off fogFar × fogScale so they follow automatically.
-  viewRange: 1.0,
+  // 1.75 預設（user UX 回報：舊預設 1.0 視距太近）——上限同步從 2.5 拉到 3.75
+  // （見 Settings.jsx / debugPanel.js 同一顆滑桿），選 1.5x 而非 2x 上限是因為
+  // vectortiles.js 的常駐 tile 半徑 = fogFar×fogScale×frac 對近景視角（camDist
+  // ≤ LOD_D0）直接等於 fogFar×viewRange×frac，且 tile 數約與半徑平方成正比
+  // （見 vectortiles.js:1261-1277 buildings 的實測基準）——上限開 2x（5.0）估算
+  // 會把 buildings 常駐 tile 數推到原本 max=2.5 情境的 ~4 倍，1.5x（3.75）約
+  // 2.25 倍，風險小很多。
+  viewRange: 1.75,
   surveyLines: true,
 
   // motion
