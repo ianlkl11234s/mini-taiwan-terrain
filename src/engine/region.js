@@ -31,7 +31,9 @@ const SEA_SIZE = 12000 // world units — covers the whole region from the origi
 // slab. Land is NOT excluded by height — low plains would flood / z-fight —
 // it is cut out by a land/sea MASK (region_sea_mask.png, from the exact
 // Taiwan coastline ring) the plane samples as an alphaMap: mask sea=255 →
-// drawn, land=0 → alphaTest discards it.
+// drawn, land=0 → discarded by a custom shader test (onBeforeCompile below,
+// NOT material.alphaTest — that would multiply in the user's opacity slider
+// and false-discard the sea too, see the constructor comment).
 const SEA_PLANE_M = 0
 // Both offsets below are additional anti-z-fight LIFTS on top of SEA_PLANE_M
 // (world units, fogScale-scaled per geo.zFightLift — same helper water.js and
@@ -55,7 +57,11 @@ export function createRegionLayer(params) {
     depthTest: true,
     depthWrite: false,
     fog: true,
-    alphaTest: 0.5, // mask land (0) is discarded; the alphaMap is set by setMask
+    // 陸海遮罩 discard 不用 material.alphaTest（見下方 onBeforeCompile 自行 discard）
+    // ——alphaTest 比較的是最終 diffuseColor.a（= opacity * mask），使用者把
+    // 海透明度滑桿拖到門檻以下時，連合法的海面像素也會被誤判「未達標」整片消失
+    // （回報 bug：0.5 以下海面直接消失）。改成比較 opacity*0.5，等價於只看 mask
+    // 本身、不受 opacity 影響。
     // at far/grazing views this plane and the terrain's own (now bathymetric,
     // no longer flat) "sea" mesh can still read as near-coplanar right at the
     // coastline and z-fight into horizontal streaks. polygonOffset pulls the
@@ -77,8 +83,9 @@ export function createRegionLayer(params) {
 
   // --- sea ripple decoration (docs/MARINE_DESIGN.md §2) ------------------
   // opus M1: never swap seaMat for a raw ShaderMaterial — its alphaMap (land
-  // mask) / alphaTest / fog / opacity (the bathymetryVisible HANDLER's 0.5⇄1.0
-  // toggle) / polygonOffset are load-bearing and must survive untouched.
+  // mask, discarded via the onBeforeCompile injection below) / fog / opacity
+  // (the bathymetryVisible HANDLER's 0.5⇄1.0 toggle) / polygonOffset are
+  // load-bearing and must survive untouched.
   // Instead, onBeforeCompile injects fragment-only fresnel/specular GLSL into
   // the material's own generated shader (same technique as terrain.js:79).
   // No vertex displacement: this repo's ~480 m/world-unit scale makes real
@@ -119,12 +126,15 @@ uniform float uSeaTime;
 uniform float uRippleStrength;
 uniform float uRippleSpeed;`
       )
-      // AFTER alphatest_fragment: the land/sea mask discard has already run,
-      // so this only ever touches sea pixels, and diffuseColor already has
-      // alphaMap applied — nothing here can resurrect a discarded land pixel.
+      // 陸海遮罩 discard 就地換成手刻版本（不再借用 material.alphaTest，理由見
+      // constructor 那段註解）：diffuseColor.a 在這裡已經是 opacity * mask
+      // （map_fragment → color_fragment → alphamap_fragment 前面都跑完了），
+      // 拿 opacity*0.5 當門檻等價於「mask < 0.5 才丟」，且與 opacity 滑桿無關
+      // ——opacity 拖多低，合法的海面像素都不會被這行誤殺。下面的波紋 decoration
+      // 接在這行之後，只會碰到存活下來的海面像素，不會救回被丟棄的陸地像素。
       .replace(
         '#include <alphatest_fragment>',
-        `#include <alphatest_fragment>
+        `if (diffuseColor.a < opacity * 0.5) discard;
 {
   // three independently-scrolling analytic sine fields fake a perturbed
   // normal via their own slope (no dFdx/dFdy — portable to SwiftShader),
