@@ -954,10 +954,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   chunkManager.onChunksChanged = () => {
     stage.shadowNeedsUpdate()
     invalidate() // a chunk appeared/vanished (incl. after DEM tiles finish loading)
-    osmRoadsLayer.markDemDirty() // coalesced redrape — see vectortiles.js VectorTileManager.markDemDirty
-    trailsLayer.markDemDirty()
-    ftwFieldsLayer.markDemDirty()
-    buildingsLayer.markDemDirty()
+    // P1a-2: which DEM tiles actually changed this round (heightField is the
+    // z12 instance vector layers themselves sample/drape against — see
+    // geo.js HeightField.takeRecentDemChanges) — lets each manager queue only
+    // the live tiles whose own footprint intersects, instead of every tile.
+    const dirtyDemKeys = heightField ? heightField.takeRecentDemChanges() : null
+    osmRoadsLayer.markDemDirty(dirtyDemKeys) // frame-budgeted redrape — see vectortiles.js VectorTileManager.markDemDirty
+    trailsLayer.markDemDirty(dirtyDemKeys)
+    ftwFieldsLayer.markDemDirty(dirtyDemKeys)
+    buildingsLayer.markDemDirty(dirtyDemKeys)
   }
 
   const cone = createCone()
@@ -2552,6 +2557,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       scanStart >= 0 ||
       rebuildPending ||
       chunkManager.queue.length > 0 ||
+      // P1a-1: a frame-budgeted vector-tile redrape pass is still draining —
+      // idle-freeze must not truncate it mid-drain (see vectortiles.js
+      // VectorTileManager._pumpRedrape/hasPendingRedrape).
+      osmRoadsLayer.hasPendingRedrape() ||
+      trailsLayer.hasPendingRedrape() ||
+      ftwFieldsLayer.hasPendingRedrape() ||
+      buildingsLayer.hasPendingRedrape() ||
       hud3.pulseActive()
     )
   }

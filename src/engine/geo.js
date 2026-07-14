@@ -100,6 +100,11 @@ export class HeightField {
     // Map insertion order doubles as the LRU order; ensureTiles re-inserts to touch.
     this.tiles = new Map()
     this.pending = new Map() // key → in-flight fetch promise (dedupes requests)
+    // "tx,ty" keys newly stored (fetched OR resolved as sea) since the last
+    // takeRecentDemChanges() call — P1a-2 dirty-region redrape (vectortiles.js
+    // markDemDirty): lets a caller ask "which DEM tiles actually changed this
+    // round" instead of assuming every live vector tile needs re-draping.
+    this._recentDemChanges = new Set()
     this.datumM = 0 // vertical datum (meters), frozen once at initial load
     // fixed island-wide range for hypsometric tint/ramp normalization — always
     // spans the full sea-floor-to-summit domain now that tiles always carry
@@ -227,7 +232,17 @@ export class HeightField {
     this.tiles.set(k, { data, mean })
     this._mtx = NaN
     this._mtile = null
+    this._recentDemChanges.add(k)
     this._evictToCap()
+  }
+
+  // take-and-clear the set of tile keys newly stored since the last call (see
+  // _recentDemChanges above) — vectortiles.js's markDemDirty(dirtyDemKeys)
+  // consumer.
+  takeRecentDemChanges() {
+    const keys = this._recentDemChanges
+    this._recentDemChanges = new Set()
+    return keys
   }
 
   _evictToCap() {
