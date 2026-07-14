@@ -520,7 +520,8 @@ export class VectorTileManager {
     this._inFlight = 0
     this._resolutionSet = false
     this._lastVScale = NaN // heightField.projection.K * exaggeration — redrape gate
-    this._demDirty = false
+    this._redrapeQueue = [] // tile keys pending a frame-budgeted DEM-dirty redrape (P1a-1) — see markDemDirty/_pumpRedrape
+    this._redrapeQueued = new Set() // dedupe set paralleling _redrapeQueue
     this.onTilesChanged = null // hook: a build landed — caller invalidates the on-demand renderer
   }
 
@@ -571,10 +572,56 @@ export class VectorTileManager {
     }
   }
 
-  // DEM coverage changed (chunkManager.onChunksChanged) — coalesced into ONE
-  // redrape pass on the next update() tick, never per-frame (design §6).
-  markDemDirty() {
-    this._demDirty = true
+  // DEM coverage changed (chunkManager.onChunksChanged) — queues a frame-
+  // budgeted redrape pass (P1a-1: drained by _pumpRedrape from update(), a few
+  // tiles per frame) instead of a synchronous full-layer walk. An exaggeration
+  // change is still handled synchronously in update() (every vertex's Y moves
+  // then, and it's a rare one-off user action — see design §6).
+  //
+  // dirtyDemKeys (P1a-2, optional): Set of "tx,ty" DEM tile keys that newly
+  // became resident this round (geo.js HeightField.takeRecentDemChanges()) —
+  // when given, only live tiles whose OWN DEM footprint (demFootprint) actually
+  // intersects it get queued; every other live tile's DEM data hasn't changed,
+  // so redraping it would just recompute identical heights. An EMPTY set means
+  // "chunks churned but no DEM data changed" (e.g. trailing-edge chunk
+  // eviction while panning) — heights can't have moved, queue nothing. Only a
+  // null/undefined ("don't know") falls back to queuing every live tile,
+  // matching the pre-dirty-region behavior.
+  markDemDirty(dirtyDemKeys) {
+    if (!this.tiles.size) return
+    if (!dirtyDemKeys) {
+      for (const k of this.tiles.keys()) this._enqueueRedrape(k)
+      return
+    }
+    if (!dirtyDemKeys.size) return
+    const hf = this.heightField
+    if (!hf) return // no heightField yet — nothing live to redrape anyway
+    const proj = this._proj(this._lastVz)
+    const half = proj.tileWorldSize / 2
+    for (const [k, t] of this.tiles) {
+      const coords = demFootprint(hf, t.cx - half, t.cx + half, t.cz - half, t.cz + half)
+      let hit = false
+      for (let i = 0; i < coords.length; i++) {
+        if (dirtyDemKeys.has(coords[i].tx + ',' + coords[i].ty)) {
+          hit = true
+          break
+        }
+      }
+      if (hit) this._enqueueRedrape(k)
+    }
+  }
+
+  _enqueueRedrape(k) {
+    if (this._redrapeQueued.has(k)) return
+    this._redrapeQueued.add(k)
+    this._redrapeQueue.push(k)
+  }
+
+  // true while a frame-budgeted redrape pass is still draining — index.js's
+  // isAnimating() polls this so the idle-freeze gate never truncates one
+  // mid-drain (on-demand render must keep the window open until empty).
+  hasPendingRedrape() {
+    return this._redrapeQueue.length > 0
   }
 
   // one tile now owns up to meshKeys.length bucket meshes instead of 1 —
@@ -594,6 +641,8 @@ export class VectorTileManager {
     for (const e of this.queue) e.abort?.abort()
     this.queue = []
     this.queued.clear()
+    this._redrapeQueue = []
+    this._redrapeQueued.clear()
   }
 
   // ---- anchor bug fix (see docs/VECTOR_TILES_DESIGN.md task brief) --------
@@ -659,10 +708,18 @@ export class VectorTileManager {
     // harmless no-op redrape, but it still primes _lastExaggeration/_lastVScale)
     if (heightField) {
       const vScale = heightField.projection.K * exaggeration
-      if (vScale !== this._lastVScale || this._demDirty) {
+      if (vScale !== this._lastVScale) {
+        // exaggeration changed — rare, one-off, every vertex's Y moves: keep
+        // the synchronous full-layer redrape (P1a-1's frame-budgeted queue
+        // only covers the DEM-dirty path, see markDemDirty) and drop any
+        // DEM-dirty redrape still queued, since this pass already covers
+        // every live tile at the new scale.
         this._lastVScale = vScale
-        this._demDirty = false
         this._redrape(heightField, exaggeration)
+        this._redrapeQueue = []
+        this._redrapeQueued.clear()
+      } else if (this._redrapeQueue.length) {
+        this._pumpRedrape(heightField, exaggeration)
       }
     }
     this._pump()
@@ -832,11 +889,34 @@ export class VectorTileManager {
   }
 
   // in-place y rewrite for every live tile — no geometry rebuild (design
-  // §3/§6). Runs on an exaggeration change or a DEM-coverage dirty flag,
-  // never per-frame. Walks every bucket a tile actually has a mesh for.
+  // §3/§6). Runs on an exaggeration change, synchronously, never per-frame.
+  // Walks every bucket a tile actually has a mesh for.
   _redrape(heightField, exaggeration) {
     this._lastExaggeration = exaggeration
     for (const t of this.tiles.values()) {
+      for (const key of this.meshKeys) {
+        const bd = t.buckets[key]
+        const mesh = t.meshes[key]
+        if (!bd || !mesh) continue
+        this._redrapeBucket(bd, mesh, heightField, exaggeration)
+      }
+    }
+  }
+
+  // P1a-1: frame-budgeted DEM-dirty redrape pump — drains this._redrapeQueue
+  // within BUILD_BUDGET_MS per call, same performance.now() measurement style
+  // as _pump()'s build loop, with a persistent queue so a dense layer (e.g.
+  // buildings' ~65 live tiles / ~312 萬 vertices) spreads its re-drape cost
+  // across frames instead of one 20-60ms spike. A queued key may have gone
+  // dead since being enqueued (LRU-evicted or dropped by _clear()) — this.tiles
+  // no longer has it, so it's skipped for free, per markDemDirty's own comment.
+  _pumpRedrape(heightField, exaggeration) {
+    const t0 = performance.now()
+    while (this._redrapeQueue.length && performance.now() - t0 < BUILD_BUDGET_MS) {
+      const k = this._redrapeQueue.shift()
+      this._redrapeQueued.delete(k)
+      const t = this.tiles.get(k)
+      if (!t) continue // evicted/cleared since queued — dead tile, skip
       for (const key of this.meshKeys) {
         const bd = t.buckets[key]
         const mesh = t.meshes[key]
@@ -989,10 +1069,16 @@ export function createOsmRoadsLayer(params, { invalidate } = {}) {
       return manager.pick(raycaster)
     },
 
-    // chunkManager.onChunksChanged hook (index.js) — coalesced redrape, see
-    // VectorTileManager.markDemDirty
-    markDemDirty() {
-      manager.markDemDirty()
+    // chunkManager.onChunksChanged hook (index.js) — frame-budgeted
+    // dirty-region redrape, see VectorTileManager.markDemDirty
+    markDemDirty(dirtyDemKeys) {
+      manager.markDemDirty(dirtyDemKeys)
+    },
+
+    // P1a-1: index.js's isAnimating() polls this so the idle-freeze gate
+    // never truncates an in-progress redrape pass mid-drain.
+    hasPendingRedrape() {
+      return manager.hasPendingRedrape()
     },
 
     describe() {
@@ -1123,10 +1209,16 @@ export function createFtwFieldsLayer(params, { invalidate } = {}) {
       return manager.pick(raycaster)
     },
 
-    // chunkManager.onChunksChanged hook (index.js) — coalesced redrape, see
-    // VectorTileManager.markDemDirty
-    markDemDirty() {
-      manager.markDemDirty()
+    // chunkManager.onChunksChanged hook (index.js) — frame-budgeted
+    // dirty-region redrape, see VectorTileManager.markDemDirty
+    markDemDirty(dirtyDemKeys) {
+      manager.markDemDirty(dirtyDemKeys)
+    },
+
+    // P1a-1: index.js's isAnimating() polls this so the idle-freeze gate
+    // never truncates an in-progress redrape pass mid-drain.
+    hasPendingRedrape() {
+      return manager.hasPendingRedrape()
     },
 
     describe() {
@@ -1551,10 +1643,16 @@ export function createBuildingsLayer(params, { invalidate } = {}) {
       return manager.pick(raycaster)
     },
 
-    // chunkManager.onChunksChanged hook (index.js) — coalesced redrape, see
-    // VectorTileManager.markDemDirty
-    markDemDirty() {
-      manager.markDemDirty()
+    // chunkManager.onChunksChanged hook (index.js) — frame-budgeted
+    // dirty-region redrape, see VectorTileManager.markDemDirty
+    markDemDirty(dirtyDemKeys) {
+      manager.markDemDirty(dirtyDemKeys)
+    },
+
+    // P1a-1: index.js's isAnimating() polls this so the idle-freeze gate
+    // never truncates an in-progress redrape pass mid-drain.
+    hasPendingRedrape() {
+      return manager.hasPendingRedrape()
     },
 
     describe() {
@@ -1830,10 +1928,16 @@ export function createTrailsLayer(params, { invalidate } = {}) {
       return manager.pick(raycaster)
     },
 
-    // chunkManager.onChunksChanged hook (index.js) — coalesced redrape, see
-    // VectorTileManager.markDemDirty
-    markDemDirty() {
-      manager.markDemDirty()
+    // chunkManager.onChunksChanged hook (index.js) — frame-budgeted
+    // dirty-region redrape, see VectorTileManager.markDemDirty
+    markDemDirty(dirtyDemKeys) {
+      manager.markDemDirty(dirtyDemKeys)
+    },
+
+    // P1a-1: index.js's isAnimating() polls this so the idle-freeze gate
+    // never truncates an in-progress redrape pass mid-drain.
+    hasPendingRedrape() {
+      return manager.hasPendingRedrape()
     },
 
     describe() {
