@@ -26,6 +26,7 @@ import { createStage, LOD_MIN, LOD_MAX, LOD_D0 } from './scene.js'
 import { createMotion } from './tour.js'
 import { createFollow } from './follow.js'
 import { createRide } from './ride.js'
+import { createWalk } from './walk.js'
 import { createKeyPan } from './keypan.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
@@ -45,7 +46,10 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 //     layered on top of an active follow session (src/engine/ride.js, same
 //     doc's "Ride view" section); a layer opts in by additionally
 //     implementing getEntityLookahead(entityId, aheadMeters) (trains.js only)
-//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params' 'follow' 'ride'
+//   - engine.toggleWalkMode() — first-person WASD walk on the terrain
+//     (src/engine/walk.js, docs/WALK_MODE_DESIGN.md); independent of
+//     follow/ride, no layer opt-in needed
+//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params' 'follow' 'ride' 'walk'
 // UI never reaches into scene internals; debug/verify scripts use engine.debug.
 
 // Taiwan presets: [lat, lon, zoom]. P1: one streamed world locked to z12 —
@@ -114,6 +118,14 @@ export const DEFAULT_PARAMS = {
   // ahead along the track the camera aims.
   rideHeight: 0.04,
   rideLookAhead: 3000,
+
+  // walk mode (src/engine/walk.js, docs/WALK_MODE_DESIGN.md): first-person
+  // WASD camera on the terrain. Both in real-world METERS. walkSpeed 40 m/s
+  // reads like a brisk "walk" at this world scale (a real 1.5 m/s would be
+  // imperceptible against 480.78 m/unit); walkEyeHeight 12 m balances detail
+  // vs. the 20m-DEM near-ground blur a true 1.7m eye height would sit in.
+  walkSpeed: 40,
+  walkEyeHeight: 12,
 
   // map overlay
   mapTint: 1.0,
@@ -1150,6 +1162,19 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     getHeightField: () => heightField,
     invalidate,
     onChange: (s) => emit('ride', s),
+  })
+
+  // walk mode: first-person WASD camera, standalone (no followed entity) —
+  // Immersive-mode Phase 2 prototype (src/engine/walk.js, docs/WALK_MODE_DESIGN.md).
+  const walk = createWalk({
+    camera,
+    controls,
+    params,
+    motion,
+    follow,
+    getHeightField: () => heightField,
+    invalidate,
+    onChange: (s) => emit('walk', s),
   })
 
   // ---------------------------------------------------------------- tour path preview
@@ -2693,6 +2718,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
       (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing — also covers ride view (src/engine/ride.js): riding always requires trainsVisible/thsrVisible true (getEntityPosition gates on group.visible) and its camera motion is driven by the SAME train-position advance, so no separate ride branch is needed here. Paused timeline ⇒ this goes false ⇒ ride camera correctly freezes too.
+      walk.isMoving() || // walk mode (src/engine/walk.js): true while any WASD key is held OR the vertical ground-follow damper hasn't snapped to its target yet — a stationary, level walker correctly lets this go false and the loop idles
       environment.needsFrameLoop() || // sun sweeps per-frame only during fast playback (>=60x); live/slow playback uses environment.js's sparse timer so the app still idles (docs/ENVIRONMENT_DESIGN.md)
       motion.tourActive ||
       motion.tweenActive ||
@@ -2820,8 +2846,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
     if (idle) exitIdle()
 
-    // camera motion: tour > fly tween > free navigation (with pan clamp)
-    if (!motion.tick(dt)) {
+    // camera motion: tour > fly tween > free navigation (with pan clamp).
+    // walk mode (src/engine/walk.js) owns the camera outright while active —
+    // same reasoning as the tour/tween branch below, so it takes the same
+    // keyPan.reset() path (W/A/S/D are shared keys between keyPan's map-pan
+    // and walk's movement; walk.tick() below is the only writer while active).
+    if (walk.active) {
+      keyPan.reset()
+    } else if (!motion.tick(dt)) {
       keyPan.tick(dt) // arrow/WASD velocity, applied before damping + clamp
       controls.update()
       stage.clampPan() // free navigation only — tours / fly-tos manage their own path
@@ -2893,6 +2925,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // chunkManager.update()/camera.updateMatrixWorld() below, same slot follow
     // itself uses.
     ride.tick(dt)
+    // walk mode: absolute camera placement + controls.target write, same slot
+    // as ride — must land before chunkManager.update() below so streaming
+    // follows the walker (src/engine/walk.js module header).
+    walk.tick(dt)
     if (lodChanged && !rebuildPending) {
       // far/near label policies changed — re-sow peaks + spot elevations now
       refreshPoiAnchor()
@@ -3090,6 +3126,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       const layer = layers.get(layerId)
       return !!layer && typeof layer.getEntityLookahead === 'function'
     },
+    // walk mode (src/engine/walk.js) — Settings panel's Walk section button.
+    // No-op (returns false) until the real-world height field has loaded.
+    toggleWalkMode: walk.toggle,
     // generic marker sets (pure display layer — see markers.js). Same id
     // with `points` replaces the set; without `points` patches color/visible.
     setMarkerSet(id, def) {
@@ -3158,6 +3197,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       environment.dispose()
       keyPan.dispose()
       ride.dispose()
+      walk.dispose()
       controls.dispose()
       stage.renderer.dispose()
       stage.renderer.domElement.remove()
@@ -3242,6 +3282,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
           entityId: follow.entityId,
           ratio: layers.get(follow.layerId)?.getEntityRatio?.(follow.entityId) ?? null,
         }
+      },
+      // walk mode verify hook (docs/WALK_MODE_DESIGN.md): window.__exp.walk
+      // exposes setInput({forward,right,sprint,yaw,pitch}) for headless/
+      // pointer-lock-less testing; window.__exp.walkState is the read-only
+      // snapshot — {active, x, z, eyeY, groundM, moving, yaw, pitch}.
+      walk,
+      get walkState() {
+        return walk.debugState()
       },
     },
   }

@@ -78,6 +78,43 @@ function FollowChip({ engine }) {
   )
 }
 
+// 步行模式提示 chip（src/engine/walk.js，docs/WALK_MODE_DESIGN.md）——頂部置中，
+// 不跟右上角的 FollowChip 或左側 IconRailSidebar 打架。只在 walk.active 時顯示，
+// 純提示 + 一個常駐離開出口（跟 FollowChip 的 ✕ 同款，Settings 面板可能已收合）。
+function WalkHint({ engine }) {
+  const [active, setActive] = useState(false)
+  useEffect(() => engine.on('walk', (s) => setActive(s.active)), [engine])
+  if (!active) return null
+  return (
+    <div
+      style={{
+        ...glass(),
+        position: 'fixed',
+        top: 16,
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 20,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        padding: '6px 8px 6px 14px',
+        boxShadow: T.shadow,
+      }}
+    >
+      <span style={{ fontFamily: FONT_CJK, fontSize: T.fs.base, color: T.textStrong, whiteSpace: 'nowrap' }}>
+        步行中 · WASD 移動 · Shift 衝刺 · ESC 離開
+      </span>
+      <button
+        onClick={() => engine.toggleWalkMode()}
+        title="結束步行 Exit walk"
+        style={{ all: 'unset', cursor: 'pointer', color: T.textDim, padding: '0 3px', fontFamily: FONT_DATA }}
+      >
+        ✕
+      </button>
+    </div>
+  )
+}
+
 export default function App() {
   const containerRef = useRef(null)
   const hudRootRef = useRef(null) // debug panel 的 HUD show/opacity 開關作用對象
@@ -150,6 +187,7 @@ export default function App() {
           <IconRailSidebar engine={engine} />
           <LayerPickCard engine={engine} />
           <FollowChip engine={engine} />
+          <WalkHint engine={engine} />
         </>
       )}
       <div
