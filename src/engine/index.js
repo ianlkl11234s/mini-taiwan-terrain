@@ -5,7 +5,7 @@ import { createCoastlineLayer, createCountiesLayer, createRailLayer, createRiver
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
-import { createRainLayer } from './rain.js'
+import { createRainLayer, WIND_BY_WEATHER } from './rain.js'
 import { createEnvironment } from './environment.js'
 import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
@@ -380,7 +380,7 @@ export const DEFAULT_PARAMS = {
   // typhoonVisible has to the (procedural, always-available) typhoon layer.
   rainVisible: false,
   rainIntensity: 0.6,
-  rainDensity: 3000,
+  rainDensity: 5000,
 
   // environment (src/engine/environment.js, docs/ENVIRONMENT_DESIGN.md):
   // timeline-driven sun position (suncalc) + a weather mood layered on top.
@@ -2234,6 +2234,22 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     else regenerateTerrain()
   }
 
+  // rain overlay (screen-space postprocessing pass, src/engine/rainOverlay.js,
+  // docs/ENVIRONMENT_DESIGN.md §8): keeps stage.rainOverlayFx's uniforms and
+  // stage.rainOverlayPass.enabled in sync with params. Called from every
+  // HANDLER that can change what the overlay should look like (rainVisible,
+  // rainIntensity, weather) — rainDensity is excluded, it only resizes the
+  // world-space rain.js BufferGeometry and has no meaning for this pass.
+  // WIND_BY_WEATHER is imported from rain.js, not duplicated here, so the
+  // world-space and screen-space rain always slant the same way.
+  function applyRainOverlay() {
+    stage.rainOverlayPass.enabled = params.rainVisible
+    stage.rainOverlayFx.uniforms.get('uIntensity').value = params.rainIntensity
+    const wind = WIND_BY_WEATHER[params.weather] ?? WIND_BY_WEATHER.clear
+    stage.rainOverlayFx.uniforms.get('uWind').value.set(wind[0], wind[1])
+  }
+  applyRainOverlay() // initial sync on load — same seed-then-apply() pattern as environment.js
+
   // ---------------------------------------------------------------- setParams dispatch
   // rebuild class is deduped (one regenerateTerrain per patch); everything else
   // dispatches per-key: uniforms / material / post chain / camera / lights.
@@ -2468,8 +2484,16 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     typhoonColor: () => layers.get('typhoon').update(layerCtx()),
     // rain: purely procedural, no deferred fetch — every param just re-runs
     // the layer's update (visibility gate + style), same as typhoon above.
-    rainVisible: () => layers.get('rain').update(layerCtx()),
-    rainIntensity: () => layers.get('rain').update(layerCtx()),
+    // Also syncs the screen-space overlay pass (applyRainOverlay, defined
+    // above HANDLERS) — rainDensity excluded, see that function's comment.
+    rainVisible: () => {
+      layers.get('rain').update(layerCtx())
+      applyRainOverlay()
+    },
+    rainIntensity: () => {
+      layers.get('rain').update(layerCtx())
+      applyRainOverlay()
+    },
     rainDensity: () => layers.get('rain').update(layerCtx()),
     // weather (docs/ENVIRONMENT_DESIGN.md): a "mood" preset — drives
     // rainVisible/rainIntensity and (typhoon only) typhoonVisible directly,
@@ -2488,6 +2512,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       }
       layers.get('rain').update(layerCtx())
       layers.get('typhoon').update(layerCtx())
+      applyRainOverlay() // weather also drives uWind (WIND_BY_WEATHER) — see that function
       environment.apply() // fog/light mood modifier — see environment.js's WEATHER table
       emit('layers') // refresh the Layers panel (rainVisible/typhoonVisible just changed under it)
     },
@@ -3160,6 +3185,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       // ramp/weather output, envAuto state — window.__exp.environment
       get environment() {
         return environment.debug()
+      },
+      // rain overlay verify hook (rainOverlay.js, docs/ENVIRONMENT_DESIGN.md
+      // §8): window.__exp.rainOverlay — {enabled, intensity, wind}
+      get rainOverlay() {
+        return {
+          enabled: stage.rainOverlayPass.enabled,
+          intensity: stage.rainOverlayFx.uniforms.get('uIntensity').value,
+          wind: stage.rainOverlayFx.uniforms.get('uWind').value.toArray(),
+        }
       },
       get heightField() {
         return heightField

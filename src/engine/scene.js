@@ -16,6 +16,7 @@ import {
   Effect,
   BlendFunction,
 } from 'postprocessing'
+import { RainOverlayEffect } from './rainOverlay.js'
 
 // The "stage": renderer / camera / controls / lights / post chain, plus the
 // per-frame view-scale machinery (distance LOD target, fogScale, shadow
@@ -276,9 +277,39 @@ export function createStage(params, container) {
 
   const dofPass = new EffectPass(camera, dof)
   composer.addPass(dofPass)
+
+  // rain overlay (rainOverlay.js, docs/ENVIRONMENT_DESIGN.md §8): screen-space
+  // streaks. MUST sit here — before the exposure/tonemap/grade merged pass
+  // below, in the same toggleable slot dofPass occupies — and NOT as the
+  // chain's last pass. First draft put it last (reasoning: read post-tonemap
+  // colors for an accurate light/dark tint pick) and that broke on/off
+  // toggling: EffectComposer.addPass() gives `renderToScreen` to whichever
+  // pass was added most recently, and render() only writes the actual visible
+  // canvas from whichever pass currently has that flag AND is enabled
+  // (`if (pass.enabled) { pass.render(...) }` — a disabled pass's render()
+  // never runs, full stop). With rain last, disabling it left NOTHING
+  // painting the screen that frame — the canvas visibly froze on the last
+  // rain frame forever (confirmed empirically: renderCount kept climbing
+  // after weather→clear while the on-screen streaks never went away, fixed
+  // immediately by moving the pass here). The always-on merged pass below
+  // must stay the last-added pass so it keeps permanent renderToScreen
+  // ownership — exactly the guarantee dofPass already relies on. Cost: rain's
+  // luminance-based tint reads the pre-tonemap HDR linear buffer instead of
+  // final graded colors (see rainOverlay.js's lum→lumTone compression for how
+  // that's handled). Seed values here are placeholders; index.js's
+  // applyRainOverlay() does the real initial sync right after HANDLERS is set
+  // up (same two-step seed-then-apply() pattern environment.js uses).
+  const rainOverlayFx = new RainOverlayEffect({ intensity: params.rainIntensity, wind: [0, 0] })
+  const rainOverlayPass = new EffectPass(camera, rainOverlayFx)
+  composer.addPass(rainOverlayPass)
+
   composer.addPass(new EffectPass(camera, exposureFx, toneMap, hueSat, contrastFx, grain, vignette, smaa))
   // skip the whole DOF pass when bokeh is zero — it's pure cost with no visual effect
   dofPass.enabled = params.bokehScale > 0
+  // zero-cost while off — EffectComposer skips disabled passes entirely, same
+  // guarantee dofPass relies on above (see the placement comment for why this
+  // pass must NOT be last in the chain for that guarantee to hold safely).
+  rainOverlayPass.enabled = params.rainVisible
 
   // shared viewport uniform for the fat-line materials (Line2/LineMaterial
   // needs the resolution to convert px linewidth → clip space): the overlay
@@ -310,6 +341,8 @@ export function createStage(params, container) {
     hueSat,
     grain,
     vignette,
+    rainOverlayFx,
+    rainOverlayPass,
     get lodZoom() {
       return lodZoom
     },

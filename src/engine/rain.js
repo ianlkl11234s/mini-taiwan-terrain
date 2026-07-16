@@ -27,14 +27,23 @@ const BOX_Y = 1
 const RAIN_WORLD_SCALE = 0.6 // group.scale = camDist * this — see module header
 const BASE_SPEED = 0.16 // local-units/sec at rainIntensity 0
 const SPEED_RANGE = 0.34 // added at rainIntensity 1
-const BASE_LEN = 0.03
-const LEN_RANGE = 0.05
-const MAX_OPACITY = 0.55
+// BASE_LEN/LEN_RANGE, MAX_OPACITY and RAIN_COLOR below were tuned up from
+// their original (0.03/0.05, 0.55, #bcd2e0) values — the pale blue-white at
+// low opacity was reading as near-zero contrast against this app's light
+// paper-map terrain (see docs/ENVIRONMENT_DESIGN.md §8): a darker, longer,
+// more opaque streak actually shows "streak" texture at low camera angles
+// (ride view) instead of just a faint shimmer.
+const BASE_LEN = 0.05
+const LEN_RANGE = 0.09
+const MAX_OPACITY = 0.8
 const MIN_DENSITY = 300
 const MAX_DENSITY = 8000
-const RAIN_COLOR = '#bcd2e0'
-// wind tilt (local-unit xz offset per streak) by weather — typhoon slants hard
-const WIND_BY_WEATHER = { clear: [0, 0], rain: [0.14, 0.08], typhoon: [0.42, 0.3] }
+const RAIN_COLOR = '#5a6b7a'
+// wind tilt (local-unit xz offset per streak) by weather — typhoon slants
+// hard. Exported so rainOverlay.js's screen-space streaks (index.js's
+// applyRainOverlay()) slant in sync with this world-space layer — one source
+// of truth, no duplicated numbers to drift.
+export const WIND_BY_WEATHER = { clear: [0, 0], rain: [0.14, 0.08], typhoon: [0.42, 0.3] }
 
 // BOX_Y interpolated directly into the template (NOT a post-hoc .replace() —
 // that string-replace form only swaps the FIRST occurrence, silently leaving
