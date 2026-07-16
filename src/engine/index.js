@@ -2485,7 +2485,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     sunAzimuth: () => environment.apply(),
     sunElevation: () => environment.apply(),
     hemiIntensity: () => environment.apply(),
-    envLight: (v) => (scene.environmentIntensity = v),
+    envLight: () => environment.apply(), // both modes read params.envLight; envAuto multiplies in the ramp/weather IBL coefficient
     shadowSoftness: (v) => (stage.sun.shadow.radius = v),
   }
 
@@ -2624,7 +2624,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
       (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
-      (params.envAuto && timeStore.getPlaying()) || // sun position keeps recomputing only while the timeline actually plays — static+paused must freeze (docs/ENVIRONMENT_DESIGN.md)
+      environment.needsFrameLoop() || // sun sweeps per-frame only during fast playback (>=60x); live/slow playback uses environment.js's sparse timer so the app still idles (docs/ENVIRONMENT_DESIGN.md)
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||

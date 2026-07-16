@@ -69,7 +69,9 @@ engineEl = suncalcAltitudeDeg                              // 同義，不用換
 ## 6. 更新時機與 on-demand render
 
 - **離散變化**（seek/play/pause/setSpeed）：`environment.js` 自己訂閱 `timeStore.subscribe(cb)`（跟 `index.js` 既有的 `invalidate()` 訂閱是分開的兩個訂閱者），只要 `envAuto` 開著就整套重算一次——這條路徑**不看 `playing` 狀態**，暫停中拖時間軸一樣會移動太陽。
-- **播放中連續變化**：`timeStore` 的 raw `subscribe` 播放中不會逐幀觸發（`docs/TIMELINE_DESIGN.md` §1.3），所以 `isAnimating()` 加一支 `(params.envAuto && timeStore.getPlaying())`，讓引擎的 render tick 在這個狀態下保持非閒置，`environment.tick(dt)` 因此每個活躍 frame 都會被呼叫；內部再自行節流到 ~250ms 才真正重算 suncalc + ramp（sky 貼相機的位置更新不節流，逐幀都做，因為鏡頭移動跟播放速度無關）。
+- **播放中連續變化**：`timeStore` 的 raw `subscribe` 播放中不會逐幀觸發（`docs/TIMELINE_DESIGN.md` §1.3），播放中的太陽更新分兩檔：
+  - **快轉（speed ≥ 60×）**：太陽肉眼可見地掃動（≥0.25°/s），`isAnimating()` 走 `environment.needsFrameLoop()` 保持非閒置，`environment.tick(dt)` 每個活躍 frame 被呼叫、內部節流 ~250ms 才真正重算 suncalc + ramp（sky 貼相機的位置更新不節流，逐幀都做，因為鏡頭移動跟播放速度無關）。
+  - **慢速/即時（speed < 60×，含預設 live-follow 1×）**：**不進 frame loop、app 照常閒置凍結**。`environment.js` 內部一支 10 秒的 wall-clock 稀疏定時器負責：醒來重算太陽角度，累積漂移超過 0.15°（1× 下約 40 秒）才 `applyAuto()` + `invalidate()` 重繪一幀。這是為了守住鐵則——時間軸預設就在播放，若 1× 也常駐 ambient 渲染，app 從此永不凍結。
 - **靜態陰影模式**：`applyAuto()` 只有太陽方位角/仰角變化超過 0.5° 才呼叫 `stage.placeSunAt()`（連帶觸發 VSM `shadowMap.needsUpdate`）——否則播放中每 250ms 一次的節流 tick 會在陰影幾乎沒變的情況下重烘整張陰影貼圖。
 
 **鐵則驗收表**：
@@ -77,7 +79,8 @@ engineEl = suncalcAltitudeDeg                              // 同義，不用換
 | envAuto | weather | playing | renderCount |
 |:---:|:---:|:---:|---|
 | true | clear | 暫停 | **凍結**（`isAnimating()` 兩個新分支都 false） |
-| true | clear | 播放 | 持續渲染（太陽緩慢移動） |
+| true | clear | 播放 < 60× | **凍結**，僅稀疏定時器偶發重繪一幀（1× 約每 40 秒一幀） |
+| true | clear | 播放 ≥ 60× | 持續渲染（太陽可見掃動，`needsFrameLoop()` 恆真） |
 | true | rain/typhoon | 任意 | 持續渲染（`rainVisible` 分支恆真） |
 | false | 任意 | 任意 | 跟改動前完全一樣（不受本次改動影響） |
 
