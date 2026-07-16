@@ -86,6 +86,29 @@ export default function Settings({ engine }) {
         />
       </Row>
 
+      <SectionHeader>Ride view</SectionHeader>
+      {/* 車廂視角（src/engine/ride.js，docs/FOLLOW_CAMERA_DESIGN.md §Ride view）——
+          rideHeight 是 world unit（1 unit ≈ 480.78m，geo.js K_ANCHOR），這裡只顯示換算後的公尺數；
+          rideLookAhead 本身就是公尺，直接顯示 km。兩者都是「讀即用」的 live 參數，不需要 rebuild。 */}
+      <Slider
+        label="視角高度 Height"
+        min={0.01}
+        max={0.2}
+        step={0.005}
+        value={p.rideHeight}
+        onChange={live('rideHeight')}
+        format={(v) => `${Math.round(v * 480.78)} m`}
+      />
+      <Slider
+        label="前瞻距離 Look-ahead"
+        min={500}
+        max={8000}
+        step={100}
+        value={p.rideLookAhead}
+        onChange={live('rideLookAhead')}
+        format={(v) => `${(v / 1000).toFixed(1)} km`}
+      />
+
       <SectionHeader>Peaks</SectionHeader>
       <Slider label="搜尋半徑 Radius" min={0} max={80} step={5} value={p.peakRadiusKm} onChange={live('peakRadiusKm')} format={(v) => v === 0 ? '自動' : `${v} km`} />
       <Slider label="顯示數量 Max peaks" min={3} max={100} step={1} value={p.peakLimit} onChange={live('peakLimit')} format={(v) => String(v)} />

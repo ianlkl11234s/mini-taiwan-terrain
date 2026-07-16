@@ -25,6 +25,7 @@ import { findRealPeaks } from './peaks.js'
 import { createStage, LOD_MIN, LOD_MAX, LOD_D0 } from './scene.js'
 import { createMotion } from './tour.js'
 import { createFollow } from './follow.js'
+import { createRide } from './ride.js'
 import { createKeyPan } from './keypan.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
@@ -40,7 +41,11 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 //     (src/engine/follow.js, docs/FOLLOW_CAMERA_DESIGN.md); a layer opts in by
 //     implementing getEntityPosition(entityId) and returning `followable:
 //     {layerId, entityId}` from its pick() payload (see trains.js)
-//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params' 'follow'
+//   - engine.toggleRideView() / canRideView(layerId) — cockpit "ride" camera
+//     layered on top of an active follow session (src/engine/ride.js, same
+//     doc's "Ride view" section); a layer opts in by additionally
+//     implementing getEntityLookahead(entityId, aheadMeters) (trains.js only)
+//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params' 'follow' 'ride'
 // UI never reaches into scene internals; debug/verify scripts use engine.debug.
 
 // Taiwan presets: [lat, lon, zoom]. P1: one streamed world locked to z12 —
@@ -100,6 +105,15 @@ export const DEFAULT_PARAMS = {
   focusDistance: 24.74,
   focusRange: 25,
   bokehScale: 0,
+
+  // ride view (src/engine/ride.js, docs/FOLLOW_CAMERA_DESIGN.md §Ride view):
+  // cockpit camera glued to a followed train. rideHeight is in WORLD UNITS
+  // (0.04 ≈ 20m — "watching from the roof", the doc's default; 1 unit ≈
+  // 480.78m, see geo.js's K_ANCHOR comment). rideLookAhead is in real-world
+  // METERS (same unit trains.js's carLenM/part.lengthM already use) — how far
+  // ahead along the track the camera aims.
+  rideHeight: 0.04,
+  rideLookAhead: 3000,
 
   // map overlay
   mapTint: 1.0,
@@ -1105,7 +1119,37 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     motion,
     layers,
     invalidate,
-    onChange: (s) => emit('follow', s),
+    onChange: (s) => {
+      // ride view (src/engine/ride.js) is layered on top of follow and owns
+      // no mutex logic of its own — the instant follow stops (any of its
+      // mutex callers: startTour/flyToLonLat/selectPoi/deselect/keyPan/
+      // pan-drag/entity-vanished, see follow.js header), ride must fully
+      // exit too, synchronously, BEFORE whatever new tween/tour is about to
+      // start writing the camera. Every one of those callers invokes
+      // follow.stopFollow() as its first step (see design doc §3), so this
+      // notify() always fires ahead of the competing motion source's own
+      // setup — ride.exit() below always wins the race.
+      if (!s.active) ride.exit()
+      emit('follow', s)
+    },
+  })
+
+  // ride view: cockpit camera glued to the followed train, looking forward
+  // along the track (src/engine/ride.js, docs/FOLLOW_CAMERA_DESIGN.md §Ride
+  // view) — Immersive Mode Phase 1's second piece. `ride` is referenced
+  // inside follow's onChange above; safe because that callback only ever
+  // fires later (never during createFollow() itself), by which time this
+  // `const` has already been assigned.
+  const ride = createRide({
+    camera,
+    controls,
+    follow,
+    motion,
+    layers,
+    params,
+    getHeightField: () => heightField,
+    invalidate,
+    onChange: (s) => emit('ride', s),
   })
 
   // ---------------------------------------------------------------- tour path preview
@@ -2623,7 +2667,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       params.rainVisible || // rain streaks fall every frame while visible — wall-clock ambient, same as typhoon
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
       (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
-      ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
+      ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing — also covers ride view (src/engine/ride.js): riding always requires trainsVisible/thsrVisible true (getEntityPosition gates on group.visible) and its camera motion is driven by the SAME train-position advance, so no separate ride branch is needed here. Paused timeline ⇒ this goes false ⇒ ride camera correctly freezes too.
       environment.needsFrameLoop() || // sun sweeps per-frame only during fast playback (>=60x); live/slow playback uses environment.js's sparse timer so the app still idles (docs/ENVIRONMENT_DESIGN.md)
       motion.tourActive ||
       motion.tweenActive ||
@@ -2819,6 +2863,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // chunkManager.update() below (so DEM streaming follows the carried
     // target) and camera.updateMatrixWorld() (see design doc §4)
     follow.tick()
+    // ride view: absolute camera placement layered on top of follow's
+    // delta-carry above — must run after it (see ride.js header) and before
+    // chunkManager.update()/camera.updateMatrixWorld() below, same slot follow
+    // itself uses.
+    ride.tick(dt)
     if (lodChanged && !rebuildPending) {
       // far/near label policies changed — re-sow peaks + spot elevations now
       refreshPoiAnchor()
@@ -3007,6 +3056,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // if the layer/entity can't be resolved right now.
     followEntity: follow.followEntity,
     stopFollow: follow.stopFollow,
+    // ride view (src/engine/ride.js) — LayerPickCard's Ride button / the
+    // corner chip's ride toggle. No-op (returns false) unless a follow
+    // session is active on a ride-capable layer; canRideView lets the UI
+    // decide whether to show the toggle at all (today: trains.js only).
+    toggleRideView: ride.toggle,
+    canRideView(layerId) {
+      const layer = layers.get(layerId)
+      return !!layer && typeof layer.getEntityLookahead === 'function'
+    },
     // generic marker sets (pure display layer — see markers.js). Same id
     // with `points` replaces the set; without `points` patches color/visible.
     setMarkerSet(id, def) {
@@ -3074,6 +3132,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       offTimeStore()
       environment.dispose()
       keyPan.dispose()
+      ride.dispose()
       controls.dispose()
       stage.renderer.dispose()
       stage.renderer.domElement.remove()
@@ -3129,7 +3188,27 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       },
       invalidate,
       stats,
+      // camera-motion-source triage (tour.js): tweenActive/tourActive gate
+      // both follow's engage sequencing and ride's entry guard (ride.js
+      // canRide()) — exposed alongside follow/ride below since debugging one
+      // of the three almost always means inspecting all three together.
+      motion,
       follow,
+      ride,
+      // ride view verify hook (docs/FOLLOW_CAMERA_DESIGN.md §Ride view):
+      // window.__exp.rideState — {active, layerId, entityId, ratio}. ratio is
+      // the followed train's current arc-length fraction (0..1) along
+      // whichever rail_lines.json part it's on right now (trains.js's
+      // getEntityRatio); null outside a ride/follow session or if the layer
+      // doesn't expose it.
+      get rideState() {
+        return {
+          active: ride.active,
+          layerId: follow.layerId,
+          entityId: follow.entityId,
+          ratio: layers.get(follow.layerId)?.getEntityRatio?.(follow.entityId) ?? null,
+        }
+      },
     },
   }
   engine.debug.engine = engine

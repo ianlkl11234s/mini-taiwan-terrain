@@ -14,10 +14,23 @@ import LayerPickCard from './components/LayerPickCard.jsx'
 // 跟隨中角落 chip（src/engine/follow.js，docs/FOLLOW_CAMERA_DESIGN.md §5）——
 // 卡片可能已關，chip 是唯一常駐的解除出口。訂 engine 'follow' 事件，跟
 // LayerPickCard 的按鈕狀態是各自獨立的訂閱者，共同的狀態擁有者是 engine/follow.js。
+//
+// 車廂視角（src/engine/ride.js，同文件 §Ride view）也掛在這顆 chip 上，理由
+// 一樣：pick 卡片可能已關，chip 才是「不管卡片開關都能切換/退出 ride」的常駐
+// 入口。只有跟隨中的圖層有實作 getEntityLookahead（目前只有 trains.js）才顯示。
 function FollowChip({ engine }) {
-  const [follow, setFollow] = useState({ active: false, title: null })
-  useEffect(() => engine.on('follow', (s) => setFollow(s)), [engine])
+  const [follow, setFollow] = useState({ active: false, title: null, layerId: null, entityId: null })
+  const [ride, setRide] = useState({ active: false })
+  useEffect(() => {
+    const offFollow = engine.on('follow', (s) => setFollow(s))
+    const offRide = engine.on('ride', (s) => setRide(s))
+    return () => {
+      offFollow()
+      offRide()
+    }
+  }, [engine])
   if (!follow.active) return null
+  const rideCapable = engine.canRideView(follow.layerId)
   return (
     <div
       style={{
@@ -35,6 +48,25 @@ function FollowChip({ engine }) {
     >
       <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--hud-accent)', flexShrink: 0 }} />
       <span style={{ fontFamily: FONT_CJK, fontSize: T.fs.base, color: T.textStrong, whiteSpace: 'nowrap' }}>跟隨中：{follow.title}</span>
+      {rideCapable && (
+        <button
+          onClick={() => engine.toggleRideView()}
+          title="車廂視角 Ride view（ESC 退出）"
+          style={{
+            all: 'unset',
+            cursor: 'pointer',
+            fontFamily: FONT_CJK,
+            fontSize: T.fs.sm,
+            color: ride.active ? 'var(--hud-accent)' : T.textDim,
+            whiteSpace: 'nowrap',
+            padding: '2px 6px',
+            borderRadius: T.radius.md,
+            border: `1px solid ${ride.active ? 'var(--hud-accent)' : T.ctrlInactiveBorder}`,
+          }}
+        >
+          {ride.active ? '俯視 Overview' : '車廂 Ride'}
+        </button>
+      )}
       <button
         onClick={() => engine.stopFollow()}
         title="解除跟隨 Stop following"
