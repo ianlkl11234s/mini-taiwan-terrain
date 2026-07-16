@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 // suncalc's ESM build (v2.0.1) has NO default export, only named ones —
 // `import SunCalc from 'suncalc'` silently resolves to undefined under Vite.
-import { getPosition as sunCalcGetPosition } from 'suncalc'
+import { getPosition as sunCalcGetPosition, getMoonPosition as sunCalcGetMoonPosition } from 'suncalc'
 import { Sky } from 'three/addons/objects/Sky.js'
 import * as timeStore from '../state/timeStore.js'
 
@@ -43,6 +43,27 @@ function computeSunAngles(unixSeconds) {
   return { az, el }
 }
 
+// same degrees/compass convention as getPosition (probed the same way)
+function computeMoonAngles(unixSeconds) {
+  const date = new Date(unixSeconds * 1000)
+  const pos = sunCalcGetMoonPosition(date, LAT, LON)
+  const az = ((pos.azimuth - 90) % 360 + 360) % 360
+  const el = pos.altitude
+  return { az, el }
+}
+
+// Stylized moonlight: fades in as the sun drops -6°..-12°, fixed brightness
+// regardless of lunar phase (a physically-honest new-moon night is just a
+// black screen), real moon position when it's meaningfully above the horizon,
+// a fixed pleasant angle otherwise (so the night look never degenerates).
+const MOON_START_EL = -6
+const MOON_FULL_EL = -12
+const MOON_COEF = 0.12
+const MOON_MIN_EL = 8
+const MOON_FALLBACK_AZ = 210
+const MOON_FALLBACK_EL = 45
+const _moonColor = new THREE.Color('#b9c9e8')
+
 // unit sun direction in the engine's world axes — same formula placeSun()/
 // placeSunAt() use for the light offset and typhoon.js's applyLight() uses
 // for its cloud lighting; kept in one place here since environment.js also
@@ -68,8 +89,8 @@ const DAY = 'DAY'
 const RAMP = [
   // 深夜 el < -12: flat dark-navy/moonlight — two stops at the same values so
   // everything below -12 clamps to this exact look (no further darkening).
-  { el: -90, env: 0.08, sun: 0, sunColor: '#0d1b2e', hemi: 0.15, hemiSky: '#16233a', hemiGround: '#05070c', fog: '#0d1b2e', sky: '#0a1220', envTint: 0.22, turbidity: 2, rayleigh: 0.4, mie: 0.004 },
-  { el: -12, env: 0.08, sun: 0, sunColor: '#0d1b2e', hemi: 0.15, hemiSky: '#16233a', hemiGround: '#05070c', fog: '#0d1b2e', sky: '#0a1220', envTint: 0.22, turbidity: 2, rayleigh: 0.4, mie: 0.004 },
+  { el: -90, env: 0.15, sun: 0, sunColor: '#0d1b2e', hemi: 0.28, hemiSky: '#2a3b5c', hemiGround: '#0a0f1a', fog: '#152238', sky: '#101b30', envTint: 0.38, turbidity: 2, rayleigh: 0.4, mie: 0.004 },
+  { el: -12, env: 0.15, sun: 0, sunColor: '#0d1b2e', hemi: 0.28, hemiSky: '#2a3b5c', hemiGround: '#0a0f1a', fog: '#152238', sky: '#101b30', envTint: 0.38, turbidity: 2, rayleigh: 0.4, mie: 0.004 },
   // 曙暮 -12..0: blue-violet twilight belt sliding toward the horizon glow
   { el: -4, env: 0.25, sun: 0.04, sunColor: '#7d6a86', hemi: 0.1, hemiSky: '#2b3a55', hemiGround: '#11131c', fog: '#3c3f5e', sky: '#2c3557', envTint: 0.4, turbidity: 4, rayleigh: 1.3, mie: 0.012 },
   // 金色時刻 0..8: warm horizon glow
@@ -187,18 +208,35 @@ export function createEnvironment(params, stage, { regionLayer, invalidate }) {
     const envTint = ramp.envTint * w.envTintMul
     const turbidity = ramp.turbidity * w.turbidityMul
 
-    // reposition the actual sun light only when it moved enough to matter —
-    // az/el are recomputed every apply() (cheap trig), but placeSunAt() forces
-    // a VSM shadow-map re-render (static mode) unconditionally, so gate that
-    // behind a ~0.5deg threshold (docs/ENVIRONMENT_DESIGN.md) instead of
-    // re-baking every throttled tick during playback.
-    if (!Number.isFinite(lastAz) || angDelta(az, lastAz) > 0.5 || Math.abs(el - lastEl) > 0.5) {
-      stage.placeSunAt(az, el)
-      lastAz = az
-      lastEl = el
+    // moonlight takeover: as the sun sinks past -6° the directional light
+    // hands over to the moon (see MOON_* consts above) so night keeps gentle
+    // shadows and shape definition instead of going flat black.
+    const moonT = THREE.MathUtils.clamp((MOON_START_EL - el) / (MOON_START_EL - MOON_FULL_EL), 0, 1)
+    let lightAz = az
+    let lightEl = el
+    let lightIntensity = sunCoef * params.sunIntensity
+    let lightColor = sunColor
+    if (moonT > 0) {
+      const moon = computeMoonAngles(timeStore.getTime())
+      const real = moon.el > MOON_MIN_EL
+      lightAz = real ? moon.az : MOON_FALLBACK_AZ
+      lightEl = real ? moon.el : MOON_FALLBACK_EL
+      lightIntensity = Math.max(lightIntensity, MOON_COEF * moonT * w.sunMul * params.sunIntensity)
+      lightColor = _moonColor
     }
-    stage.sun.intensity = sunCoef * params.sunIntensity
-    stage.sun.color.copy(sunColor)
+
+    // reposition the actual directional light only when it moved enough to
+    // matter — angles are recomputed every apply() (cheap trig), but
+    // placeSunAt() forces a VSM shadow-map re-render (static mode)
+    // unconditionally, so gate that behind a ~0.5deg threshold
+    // (docs/ENVIRONMENT_DESIGN.md) instead of re-baking every throttled tick.
+    if (!Number.isFinite(lastAz) || angDelta(lightAz, lastAz) > 0.5 || Math.abs(lightEl - lastEl) > 0.5) {
+      stage.placeSunAt(lightAz, lightEl)
+      lastAz = lightAz
+      lastEl = lightEl
+    }
+    stage.sun.intensity = lightIntensity
+    stage.sun.color.copy(lightColor)
     stage.hemi.intensity = hemiIntensity
     stage.hemi.color.copy(hemiSky)
     stage.hemi.groundColor.copy(hemiGround)
@@ -221,10 +259,10 @@ export function createEnvironment(params, stage, { regionLayer, invalidate }) {
 
     const su = regionLayer.getSeaEnvUniforms()
     su.uSkyColor.value.copy(skyColor)
-    su.uSunDir.value.copy(sunDirection(az, el))
+    su.uSunDir.value.copy(sunDirection(lightAz, lightEl)) // moon glint on the sea at night
     su.uEnvTint.value.setRGB(envTint, envTint, envTint)
 
-    lastState = { az, el, weather: params.weather, sunIntensity: stage.sun.intensity, hemiIntensity, envIBL: scene.environmentIntensity, fogColor: '#' + fogColor.getHexString(), skyColor: '#' + skyColor.getHexString(), envTint, turbidity, skyVisible: sky.visible }
+    lastState = { az, el, moon: moonT > 0, lightAz, lightEl, weather: params.weather, sunIntensity: stage.sun.intensity, hemiIntensity, envIBL: scene.environmentIntensity, fogColor: '#' + fogColor.getHexString(), skyColor: '#' + skyColor.getHexString(), envTint, turbidity, skyVisible: sky.visible }
   }
 
   // exact pre-existing behaviour — envAuto=false must reproduce this
