@@ -99,10 +99,22 @@ export function createRegionLayer(params) {
   // and outside code (applyStyle below, tickView's uSeaTime advance) keeps
   // driving objects it already holds. Also parked on seaMat.userData for
   // external inspection/driving (debug handle, future callers).
+  // Environment-system hooks (docs/ENVIRONMENT_DESIGN.md): three uniforms that
+  // used to be hardcoded constants inside the onBeforeCompile GLSL below
+  // (fresnel sky tint + specular sun direction), now driven live by
+  // environment.js so the sea reads the same time-of-day light as everything
+  // else. Defaults below are EXACTLY the old hardcoded values (verified: the
+  // old vec3(0.4145,0.3256,0.8496) sun direction is precisely
+  // normalize(cos(el)*cos(az), sin(el), cos(el)*sin(az)) at the DEFAULT_PARAMS
+  // sunAzimuth 64°/sunElevation 19° — see typhoon.js's applyLight for the same
+  // formula) — envAuto=false must reproduce the pre-existing look byte-for-byte.
   const rippleUniforms = {
     uSeaTime: { value: 0 },
     uRippleStrength: { value: params.seaRippleStrength },
     uRippleSpeed: { value: params.seaRippleSpeed },
+    uSkyColor: { value: new THREE.Color(0.8745, 0.9020, 0.8863) },
+    uSunDir: { value: new THREE.Vector3(0.4145, 0.3256, 0.8496) },
+    uEnvTint: { value: new THREE.Color(1, 1, 1) }, // multiplies final sea color — night/storm dimming
   }
   seaMat.userData.uniforms = rippleUniforms
   // three 的 program cache key 不含 onBeforeCompile（r172）：任何未來新增的
@@ -124,7 +136,10 @@ export function createRegionLayer(params) {
 varying vec3 vWorldPos;
 uniform float uSeaTime;
 uniform float uRippleStrength;
-uniform float uRippleSpeed;`
+uniform float uRippleSpeed;
+uniform vec3 uSkyColor;
+uniform vec3 uSunDir;
+uniform vec3 uEnvTint;`
       )
       // 陸海遮罩 discard 就地換成手刻版本（不再借用 material.alphaTest，理由見
       // constructor 那段註解）：diffuseColor.a 在這裡已經是 opacity * mask
@@ -166,23 +181,29 @@ uniform float uRippleSpeed;`
   vec3 rV = normalize(cameraPosition - vWorldPos);
   float rFres = pow(1.0 - clamp(dot(rN, rV), 0.0, 1.0), 5.0);
 
-  // paper-toned sky tint at grazing angles (#dfe6e2 direction) — NOT a
-  // saturated blue, matches the theme's paper aesthetic
-  vec3 rSky = vec3(0.8745, 0.9020, 0.8863);
-  diffuseColor.rgb = mix(diffuseColor.rgb, rSky, rFres * 0.5 * uRippleStrength);
+  // paper-toned sky tint at grazing angles (#dfe6e2 direction by default) —
+  // NOT a saturated blue, matches the theme's paper aesthetic. uSkyColor is
+  // environment.js-driven (docs/ENVIRONMENT_DESIGN.md); default value is the
+  // original hardcoded constant, so envAuto=false is pixel-identical.
+  diffuseColor.rgb = mix(diffuseColor.rgb, uSkyColor, rFres * 0.5 * uRippleStrength);
 
-  // faint specular glint off a fixed decorative light direction (matches the
-  // scene's default sun az/el 64deg/19deg — not wired live to the sun
-  // sliders; this is decoration, not a lighting simulation)
-  vec3 rL = vec3(0.4145, 0.3256, 0.8496);
-  vec3 rH = normalize(rL + rV);
+  // faint specular glint off the sun direction (uSunDir — environment.js
+  // syncs this to the real sun az/el; default matches the old fixed decorative
+  // direction, which was itself sunAzimuth 64deg/sunElevation 19deg baked in)
+  vec3 rH = normalize(uSunDir + rV);
   float rSpec = pow(max(dot(rN, rH), 0.0), 200.0);
   diffuseColor.rgb += vec3(1.0) * rSpec * 0.12 * uRippleStrength;
 
   // opacity: gentle +0..0.05 lift at grazing angles only — "很淡、接近透明"
   // is a hard requirement, this must never push the sea toward opaque
   diffuseColor.a = clamp(diffuseColor.a + rFres * 0.05 * uRippleStrength, 0.0, 1.0);
-}`
+}
+// uEnvTint: night/storm dimming multiplier from environment.js — this
+// MeshBasicMaterial ignores scene lights entirely, so without an explicit
+// tint the sea would stay full-bright at midnight and give away the trick.
+// Default (1,1,1) is a no-op, applied OUTSIDE the ripple-strength gate above
+// so it still dims the sea even with ripple decoration off.
+diffuseColor.rgb *= uEnvTint;`
       )
   }
 
@@ -289,6 +310,14 @@ uniform float uRippleSpeed;`
       lineColor: 'regionLineColor',
       lineWidth: 'regionLineWidth',
       lineOpacity: 'regionLineOpacity',
+    },
+
+    // environment.js hook: the sea's onBeforeCompile uniforms (uSkyColor/
+    // uSunDir/uEnvTint) live on this same object as uSeaTime/uRippleStrength
+    // — expose it so environment.js can drive them without region.js needing
+    // to know anything about time-of-day/weather itself.
+    getSeaEnvUniforms() {
+      return rippleUniforms
     },
 
     build(ctx) {

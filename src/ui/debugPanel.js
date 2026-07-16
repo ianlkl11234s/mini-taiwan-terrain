@@ -1,5 +1,6 @@
 import GUI from 'lil-gui'
 import { DEM_PRESETS } from '../engine/index.js'
+import * as timeStore from '../state/timeStore.js'
 
 // lil-gui debug panel. Binds directly to the engine's live params object so
 // .listen() mirrors (lod indicator, autofocus distance) keep working, but every
@@ -217,13 +218,31 @@ export function createDebugPanel(engine, hud2) {
   fPerf.add(params, 'shadowRes', [1024, 2048, 4096]).name('shadow resolution').onChange(set('shadowRes'))
   fMotion.add(params, 'paused')
 
-  const fLight = gui.addFolder('Light')
+  // envAuto (Environment folder below) owns sun/hemi whenever it's on — these
+  // sliders still write params.sunAzimuth etc (so envAuto=false picks them up
+  // unchanged) but have no VISIBLE effect while auto is active (see
+  // docs/ENVIRONMENT_DESIGN.md — spec explicitly calls for no disable logic,
+  // just this folder-title note).
+  const fLight = gui.addFolder('Light (manual — ignored while envAuto on)')
   fLight.add(params, 'sunIntensity', 0, 16, 0.1).onChange(set('sunIntensity'))
   fLight.add(params, 'sunAzimuth', 0, 360, 1).onChange(set('sunAzimuth'))
   fLight.add(params, 'sunElevation', 5, 85, 1).onChange(set('sunElevation'))
   fLight.add(params, 'hemiIntensity', 0, 2, 0.05).name('ambient').onChange(set('hemiIntensity'))
   fLight.add(params, 'envLight', 0, 1.5, 0.02).name('env light (shadow fill)').onChange(set('envLight'))
   fLight.add(params, 'shadowSoftness', 0, 30, 0.5).name('shadow softness').onChange(set('shadowSoftness'))
+
+  const fEnv = gui.addFolder('Environment')
+  fEnv.add(params, 'envAuto').name('auto (suncalc)').onChange(set('envAuto'))
+  fEnv.add(params, 'weather', ['clear', 'rain', 'typhoon']).onChange(set('weather'))
+  fEnv.add(params, 'rainIntensity', 0, 1, 0.02).name('rain intensity').onChange(set('rainIntensity'))
+  fEnv.add(params, 'rainDensity', 300, 8000, 100).name('rain density').onChange(set('rainDensity'))
+  // DEV-only scrub: sets the timeline directly (bypasses engine.setParams —
+  // time lives in timeStore, not params, see docs/TIMELINE_DESIGN.md)
+  const timeOverride = { hours: timeStore.getDaySeconds() / 3600 }
+  fEnv
+    .add(timeOverride, 'hours', 0, 24, 0.05)
+    .name('太陽時刻 override (h)')
+    .onChange((h) => timeStore.setTime(timeStore.getTime() - timeStore.getDaySeconds() + h * 3600))
 
   // only Terrain source starts expanded (Tour closed too — the GUI docks on
   // the left and a fully expanded column would cover the bottom-left telemetry)
@@ -237,6 +256,7 @@ export function createDebugPanel(engine, hud2) {
   fMotion.close()
   fPerf.close()
   fLight.close()
+  fEnv.close()
 
   return { gui }
 }

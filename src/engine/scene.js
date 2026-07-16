@@ -218,6 +218,21 @@ export function createStage(params, container) {
     if (params.shadowMode === 'static') renderer.shadowMap.needsUpdate = true
   }
 
+  // Environment-system override (src/engine/environment.js, docs/ENVIRONMENT_DESIGN.md):
+  // sets the sun's DIRECTION only, from explicit az/el degrees rather than
+  // params.sunAzimuth/sunElevation — lets envAuto drive the light off suncalc
+  // without ever mutating those params (the manual-mode round-trip guarantee).
+  // Intensity/color/hemi are the caller's job (environment.js sets stage.sun /
+  // stage.hemi directly, both now exposed below).
+  function placeSunAt(azDeg, elDeg) {
+    const az = THREE.MathUtils.degToRad(azDeg)
+    const el = THREE.MathUtils.degToRad(elDeg)
+    const r = 34
+    _sunOffset.set(Math.cos(az) * Math.cos(el) * r, Math.sin(el) * r, Math.sin(az) * Math.cos(el) * r)
+    _sunAnchor.set(NaN, NaN) // force updateSunAnchor to re-place the light
+    updateSunAnchor()
+  }
+
   placeSun()
   // shadowMode isn't otherwise applied until a param change or a fade-driven
   // rescale — without this, renderer.shadowMap.autoUpdate stays at three's
@@ -287,6 +302,7 @@ export function createStage(params, container) {
     composer,
     lineResolution,
     sun,
+    hemi, // exposed for environment.js — the only other writer of hemi.color/intensity
     dof,
     dofPass,
     exposureFx,
@@ -302,6 +318,7 @@ export function createStage(params, container) {
     },
     clampPan,
     placeSun,
+    placeSunAt,
     applyShadowMode,
     setShadowRes,
     shadowNeedsUpdate,
@@ -316,13 +333,18 @@ export function createStage(params, container) {
     // P2 per-frame view scaling: fog wall follows the dolly distance, shadow
     // frustum grows/fades, and the LOD target re-evaluates through the
     // hysteresis. Returns lodChanged so the engine can re-sow labels/POIs.
-    tickView(camDist, realMode) {
+    // envFogMul (docs/ENVIRONMENT_DESIGN.md §weather): a same-frame multiplier
+    // on top of fogScale, e.g. ~0.55 in rain / ~0.4 in typhoon so the murk
+    // closes in — driven every frame (not throttled) so it never lags behind
+    // camera dolly the way a throttled ramp recompute would. 1 = no-op,
+    // byte-for-byte the pre-weather fog math.
+    tickView(camDist, realMode, envFogMul = 1) {
       // R2 viewRange: user-facing "view distance" folds into the same scale so
       // everything tied to the fog wall (streaming radius, scan, POI search,
       // contour/grid morphing) stretches together.
       fogScale = (realMode ? Math.max(1, camDist / LOD_D0) : 1) * (params.viewRange ?? 1)
-      scene.fog.near = params.fogNear * fogScale
-      scene.fog.far = params.fogFar * fogScale
+      scene.fog.near = params.fogNear * fogScale * envFogMul
+      scene.fog.far = params.fogFar * fogScale * envFogMul
       updateShadowScale(realMode ? camDist : LOD_D0)
       let lodChanged = false
       if (realMode) {

@@ -1,6 +1,39 @@
 import { useCallback, useEffect, useState } from 'react'
-import { T } from '../../theme.js'
+import { T, FONT_DATA } from '../../theme.js'
 import { SectionHeader, Row, Slider, Segmented, ColorSwatch, Toggle } from '../controls.jsx'
+import * as timeStore from '../../../state/timeStore.js'
+
+// 時段快捷（docs/ENVIRONMENT_DESIGN.md）：直接寫 timeStore，不經 engine.setParams
+// —— 時刻本來就是 timeStore 的地盤，跳時段只是「同一天內 setTime 到目標秒數」，
+// 跟 TimelineBar.jsx 的日期切換用同一招（取當下 getTime() 扣掉當日已過秒數）。
+const TIME_PRESETS = [
+  { label: '清晨 05:30', sec: 5.5 * 3600 },
+  { label: '上午 09:00', sec: 9 * 3600 },
+  { label: '中午 12:00', sec: 12 * 3600 },
+  { label: '下午 15:30', sec: 15.5 * 3600 },
+  { label: '黃昏 17:45', sec: 17.75 * 3600 },
+  { label: '夜晚 21:00', sec: 21 * 3600 },
+]
+// Chinese-only option labels (matches the app's other Segmented rows, e.g.
+// 精緻度 Detail's 標準/高/超高) — a 3-way bilingual control here left no room
+// for the Row's own label (天氣 Weather was ellipsis-truncated to 天...).
+const WEATHER_OPTIONS = [
+  { label: '晴', value: 'clear' },
+  { label: '雨', value: 'rain' },
+  { label: '颱風', value: 'typhoon' },
+]
+const presetBtnStyle = {
+  all: 'unset',
+  cursor: 'pointer',
+  fontFamily: FONT_DATA,
+  fontSize: T.fs.sm,
+  padding: '4px 6px',
+  borderRadius: T.radius.md,
+  color: T.textDim,
+  background: T.ctrlInactiveBg,
+  border: `1px solid ${T.ctrlInactiveBorder}`,
+  textAlign: 'center',
+}
 
 // 設定面板（精選）。rebuild 類參數（demExaggeration / chunkRes）只在放開/點選時
 // commit — R1 的教訓：live 送會連環觸發全地形重建。
@@ -65,6 +98,32 @@ export default function Settings({ engine }) {
       <Row label="海底地形 Bathymetry">
         <Toggle on={p.bathymetryVisible} onChange={live('bathymetryVisible')} />
       </Row>
+
+      <SectionHeader>Environment</SectionHeader>
+      <Row label="即時光影 Auto light">
+        <Toggle on={p.envAuto} onChange={live('envAuto')} />
+      </Row>
+      <Row label="天氣 Weather">
+        <Segmented
+          options={WEATHER_OPTIONS.map((w) => w.label)}
+          value={WEATHER_OPTIONS.find((w) => w.value === p.weather)?.label ?? WEATHER_OPTIONS[0].label}
+          onChange={(label) => live('weather')(WEATHER_OPTIONS.find((w) => w.label === label).value)}
+        />
+      </Row>
+      <div style={{ padding: '4px 8px 6px' }}>
+        <div style={{ fontFamily: 'inherit', fontSize: T.fs.base, color: T.textMuted, marginBottom: 4 }}>時段 Time of day</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 4 }}>
+          {TIME_PRESETS.map((tp) => (
+            <button
+              key={tp.label}
+              style={presetBtnStyle}
+              onClick={() => timeStore.setTime(timeStore.getTime() - timeStore.getDaySeconds() + tp.sec)}
+            >
+              {tp.label}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <SectionHeader>Theme</SectionHeader>
       <Row label="強調色 Accent">

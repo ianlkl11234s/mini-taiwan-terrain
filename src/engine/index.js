@@ -5,6 +5,8 @@ import { createCoastlineLayer, createCountiesLayer, createRailLayer, createRiver
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
+import { createRainLayer } from './rain.js'
+import { createEnvironment } from './environment.js'
 import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
 import { createCurrentsLayer } from './currents.js'
@@ -359,6 +361,19 @@ export const DEFAULT_PARAMS = {
   // For the satellite look, set a dark/ocean-blue fogColor + a near-white cloud
   // (e.g. fogColor '#16324f', typhoonColor '#eef2f7') — white cloud needs a dark sky
   typhoonColor: '#c8d2df',
+  // rain: camera-following particle streaks (src/engine/rain.js) — driven by
+  // the weather system below but independently toggleable, same relationship
+  // typhoonVisible has to the (procedural, always-available) typhoon layer.
+  rainVisible: false,
+  rainIntensity: 0.6,
+  rainDensity: 3000,
+
+  // environment (src/engine/environment.js, docs/ENVIRONMENT_DESIGN.md):
+  // timeline-driven sun position (suncalc) + a weather mood layered on top.
+  // envAuto=true is the default — turning it off reproduces the exact
+  // pre-existing manual-light look (see environment.js's applyManual).
+  envAuto: true,
+  weather: 'clear', // 'clear' | 'rain' | 'typhoon'
 
   // HUD
   hud: true,
@@ -865,6 +880,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // to the same mountain/hiking context as trails, so it sits alongside them
     labels: { group: GROUP_OUTDOOR },
     typhoon: { group: GROUP_FX },
+    rain: { group: GROUP_FX },
   }
   // registration order = draw / update order (coastline → counties →
   // buildings → airspace → rail → trains → thsr → trails → rivers →
@@ -922,6 +938,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     ftwFieldsLayer,
     createIrrigationLayer(params),
     createTyphoonLayer(params),
+    createRainLayer(params),
     pointLayer,
     stationsLayer,
     shipsLayer,
@@ -947,6 +964,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (layer.visibleParam) LAYER_KEYS.add(layer.visibleParam)
     if (layer.paramMap) for (const k in layer.paramMap) LAYER_KEYS.add(layer.paramMap[k])
   }
+
+  // environment (docs/ENVIRONMENT_DESIGN.md): scene-level system, not a Layer
+  // (no LayerManager registration, no Layers panel row — see that module's
+  // header). Needs the region layer's sea env uniforms, so it's created after
+  // the registration loop above.
+  const environment = createEnvironment(params, stage, {
+    regionLayer: layers.get('region'),
+    invalidate,
+  })
 
   // chunk streaming: which chunks exist follows the pan target (radius tied to
   // the EFFECTIVE fog wall, so it grows with the far-view fogScale) — meshes
@@ -1854,6 +1880,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     emit('layers')
   }
   let shipsActivated = false // onActivate: first switch-on loads today + subscribes to future date changes (once — see shipsVisible HANDLER)
+  // weather (docs/ENVIRONMENT_DESIGN.md): true only while weather itself
+  // turned typhoonVisible on — so switching weather back to clear/rain only
+  // closes the typhoon layer it opened, never one the user opened by hand
+  // via the Layers panel.
+  let weatherOpenedTyphoon = false
 
   // ocean currents: CDN PNG+JSON snapshot (docs/OCEAN_CURRENTS_DESIGN.md) —
   // fetch-once-on-first-switch-on, same {loading,loaded} guard as
@@ -2391,6 +2422,34 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     typhoonLon: () => layers.get('typhoon').update(layerCtx()),
     typhoonLat: () => layers.get('typhoon').update(layerCtx()),
     typhoonColor: () => layers.get('typhoon').update(layerCtx()),
+    // rain: purely procedural, no deferred fetch — every param just re-runs
+    // the layer's update (visibility gate + style), same as typhoon above.
+    rainVisible: () => layers.get('rain').update(layerCtx()),
+    rainIntensity: () => layers.get('rain').update(layerCtx()),
+    rainDensity: () => layers.get('rain').update(layerCtx()),
+    // weather (docs/ENVIRONMENT_DESIGN.md): a "mood" preset — drives
+    // rainVisible/rainIntensity and (typhoon only) typhoonVisible directly,
+    // same bathymetryVisible-style direct-param-mutation-plus-manual-update
+    // pattern as bathymetryVisible above (those keys aren't in setParams'
+    // own patch, so their own HANDLERS won't fire on their own).
+    weather: (v) => {
+      params.rainVisible = v !== 'clear'
+      params.rainIntensity = v === 'typhoon' ? 1.0 : v === 'rain' ? 0.6 : params.rainIntensity
+      if (v === 'typhoon') {
+        if (!params.typhoonVisible) weatherOpenedTyphoon = true
+        params.typhoonVisible = true
+      } else if (weatherOpenedTyphoon) {
+        params.typhoonVisible = false
+        weatherOpenedTyphoon = false
+      }
+      layers.get('rain').update(layerCtx())
+      layers.get('typhoon').update(layerCtx())
+      environment.apply() // fog/light mood modifier — see environment.js's WEATHER table
+      emit('layers') // refresh the Layers panel (rainVisible/typhoonVisible just changed under it)
+    },
+    // envAuto: flips between the timeline-driven ramp and the exact
+    // pre-existing manual-params look (environment.js's applyManual)
+    envAuto: () => environment.apply(),
     // look
     exposure: (v) => (stage.exposureFx.uniforms.get('exposure').value = v),
     contrast: (v) => (stage.contrastFx.uniforms.get('contrast').value = v),
@@ -2399,10 +2458,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     grain: (v) => (stage.grain.blendMode.opacity.value = v),
     fogNear: (v) => (scene.fog.near = v),
     fogFar: (v) => (scene.fog.far = v),
-    fogColor: (v) => {
-      scene.fog.color.set(v)
-      scene.background.set(v)
-    },
+    // fogColor routes through environment.apply() (not a direct scene.fog set)
+    // so it still works correctly under both modes: envAuto=false resolves to
+    // exactly the old two-line set (environment.js's applyManual does that
+    // literally); envAuto=true treats the new color as the ramp's "day"
+    // baseline, so a custom fogColor still surfaces at midday.
+    fogColor: () => environment.apply(),
     surveyLines: (v) => (hud3.lines.visible = v),
     // HUD colors rebuild the 3D FUI layer (CSS variables are the UI layer's half)
     hudAccent: () => regenerateHud(),
@@ -2416,11 +2477,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     pixelRatio: (v) => stage.setPixelRatio(v),
     shadowMode: () => stage.applyShadowMode(),
     shadowRes: (v) => stage.setShadowRes(v),
-    // light
-    sunIntensity: () => stage.placeSun(),
-    sunAzimuth: () => stage.placeSun(),
-    sunElevation: () => stage.placeSun(),
-    hemiIntensity: () => stage.placeSun(),
+    // light — routed through environment.apply() (not stage.placeSun()
+    // directly) so envAuto=true keeps owning the light; envAuto=false falls
+    // straight through to applyManual(), which calls the original
+    // stage.placeSun() itself, so manual-mode behaviour is unchanged.
+    sunIntensity: () => environment.apply(),
+    sunAzimuth: () => environment.apply(),
+    sunElevation: () => environment.apply(),
+    hemiIntensity: () => environment.apply(),
     envLight: (v) => (scene.environmentIntensity = v),
     shadowSoftness: (v) => (stage.sun.shadow.radius = v),
   }
@@ -2556,9 +2620,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (params.source !== 'real' || !heightField) return true
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
+      params.rainVisible || // rain streaks fall every frame while visible — wall-clock ambient, same as typhoon
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
       (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
+      (params.envAuto && timeStore.getPlaying()) || // sun position keeps recomputing only while the timeline actually plays — static+paused must freeze (docs/ENVIRONMENT_DESIGN.md)
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||
@@ -2742,11 +2808,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // the rest of this function.
     controls.panSpeed = THREE.MathUtils.clamp(0.35 / camDist, 1, 4)
     const realMode = params.source === 'real' && heightField
-    const lodChanged = stage.tickView(camDist, !!realMode)
+    const lodChanged = stage.tickView(camDist, !!realMode, environment.getFogMul())
     const fogScale = stage.fogScale
     terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
     terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
     layers.tickAll(layerCtx(dt)) // anti-z-fight lift tracks the view scale; marker dot rescale / tag crowd control
+    environment.tick(dt) // sky-dome camera recentre every frame; throttled suncalc/ramp recompute while envAuto+playing
     // follow camera: delta-carry off the entity's JUST-updated position above
     // — must run after layers.tickAll() (this frame's placement) and before
     // chunkManager.update() below (so DEM streaming follows the carried
@@ -3005,6 +3072,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       window.removeEventListener('pointerdown', onPickPointerDown)
       window.removeEventListener('pointerup', onPickPointerUp)
       offTimeStore()
+      environment.dispose()
       keyPan.dispose()
       controls.dispose()
       stage.renderer.dispose()
@@ -3029,6 +3097,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
         return labelsLayer.renderGroup
       },
       layers,
+      // verify hook (docs/ENVIRONMENT_DESIGN.md): current computed sun az/el,
+      // ramp/weather output, envAuto state — window.__exp.environment
+      get environment() {
+        return environment.debug()
+      },
       get heightField() {
         return heightField
       },
