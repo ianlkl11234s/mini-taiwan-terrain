@@ -2829,7 +2829,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // input is in play; note follow-camera mode is deliberately NOT included
     // here — it's classified as ambient and throttles to 30fps too (see
     // docs/HANDOFF.md 顯示效能提升包 for the tradeoff writeup)
-    const fullRate = motion.tweenActive || motion.tourActive || performance.now() < interactUntil
+    // walk.isMoving() is fullRate, not ambient: first-person motion integrates
+    // dt each frame, so the ambient throttle's long real gaps + the 0.05s dt
+    // cap would time-dilate walking speed (caught in acceptance: 40 m/s felt
+    // like 2 m/s under throttled rendering).
+    const fullRate = motion.tweenActive || motion.tourActive || walk.isMoving() || performance.now() < interactUntil
     const ambientOnly = animating && !fullRate
     if (animating) invalidate()
     if (!animating && performance.now() >= activeUntil) {
