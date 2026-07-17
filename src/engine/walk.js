@@ -224,9 +224,11 @@ export function createWalk({ camera, controls, params, motion, follow, getHeight
 
     if (walking) {
       // yaw-only forward/right — pitch is deliberately excluded so looking
-      // up/down never lifts the walker off the ground
-      _fwd.set(Math.sin(state.yaw), 0, Math.cos(state.yaw))
-      _right.set(Math.sin(state.yaw + Math.PI / 2), 0, Math.cos(state.yaw + Math.PI / 2))
+      // up/down never lifts the walker off the ground. A YXZ camera LOOKS
+      // along (-sin(yaw), 0, -cos(yaw)) — both components negated, or W
+      // walks backward (user-reported).
+      _fwd.set(-Math.sin(state.yaw), 0, -Math.cos(state.yaw))
+      _right.set(Math.cos(state.yaw), 0, -Math.sin(state.yaw))
       _move.set(0, 0, 0).addScaledVector(_fwd, f).addScaledVector(_right, r)
       if (_move.lengthSq() > 1e-8) _move.normalize()
       const speedWorldPerSec = params.walkSpeed * (sprint ? SPRINT_MULT : 1) * hf.projection.K
