@@ -5,6 +5,8 @@ import { createCoastlineLayer, createCountiesLayer, createRailLayer, createRiver
 import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
+import { createRainLayer, WIND_BY_WEATHER } from './rain.js'
+import { createEnvironment } from './environment.js'
 import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
 import { createCurrentsLayer } from './currents.js'
@@ -23,6 +25,8 @@ import { findRealPeaks } from './peaks.js'
 import { createStage, LOD_MIN, LOD_MAX, LOD_D0 } from './scene.js'
 import { createMotion } from './tour.js'
 import { createFollow } from './follow.js'
+import { createRide } from './ride.js'
+import { createWalk } from './walk.js'
 import { createKeyPan } from './keypan.js'
 import { Line2 } from 'three/addons/lines/Line2.js'
 import { LineGeometry } from 'three/addons/lines/LineGeometry.js'
@@ -38,7 +42,14 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js'
 //     (src/engine/follow.js, docs/FOLLOW_CAMERA_DESIGN.md); a layer opts in by
 //     implementing getEntityPosition(entityId) and returning `followable:
 //     {layerId, entityId}` from its pick() payload (see trains.js)
-//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params' 'follow'
+//   - engine.toggleRideView() / canRideView(layerId) — cockpit "ride" camera
+//     layered on top of an active follow session (src/engine/ride.js, same
+//     doc's "Ride view" section); a layer opts in by additionally
+//     implementing getEntityLookahead(entityId, aheadMeters) (trains.js only)
+//   - engine.toggleWalkMode() — first-person WASD walk on the terrain
+//     (src/engine/walk.js, docs/WALK_MODE_DESIGN.md); independent of
+//     follow/ride, no layer opt-in needed
+//   - engine.on(event, cb) — 'frame' 'stats' 'gps' 'pois' 'selection' 'loading' 'params' 'follow' 'ride' 'walk'
 // UI never reaches into scene internals; debug/verify scripts use engine.debug.
 
 // Taiwan presets: [lat, lon, zoom]. P1: one streamed world locked to z12 —
@@ -98,6 +109,29 @@ export const DEFAULT_PARAMS = {
   focusDistance: 24.74,
   focusRange: 25,
   bokehScale: 0,
+
+  // ride view (src/engine/ride.js, docs/FOLLOW_CAMERA_DESIGN.md §Ride view):
+  // cockpit camera glued to a followed train. rideHeight is in WORLD UNITS
+  // (0.04 ≈ 20m — "watching from the roof", the doc's default; 1 unit ≈
+  // 480.78m, see geo.js's K_ANCHOR comment). rideLookAhead is in real-world
+  // METERS (same unit trains.js's carLenM/part.lengthM already use) — how far
+  // ahead along the track the camera aims.
+  rideHeight: 0.04,
+  rideLookAhead: 3000,
+
+  // walk mode (src/engine/walk.js, docs/WALK_MODE_DESIGN.md): first-person
+  // WASD camera on the terrain. Both in real-world METERS. walkSpeed 40 m/s
+  // reads like a brisk "walk" at this world scale (a real 1.5 m/s would be
+  // imperceptible against 480.78 m/unit); walkEyeHeight 12 m balances detail
+  // vs. the 20m-DEM near-ground blur a true 1.7m eye height would sit in.
+  walkSpeed: 40,
+  walkEyeHeight: 12,
+  // jump peak height, real-world METERS — same live/no-rebuild param class as
+  // walkSpeed/walkEyeHeight above (walk.js reads it fresh every tick, no
+  // HANDLERS entry needed). 10m default is a fun/exploratory "leap", not a
+  // real human jump — see walk.js's WALK_GRAVITY_MPS2 for the paired gravity
+  // constant that makes it feel right at this world's scale.
+  walkJumpHeight: 10,
 
   // map overlay
   mapTint: 1.0,
@@ -359,6 +393,19 @@ export const DEFAULT_PARAMS = {
   // For the satellite look, set a dark/ocean-blue fogColor + a near-white cloud
   // (e.g. fogColor '#16324f', typhoonColor '#eef2f7') — white cloud needs a dark sky
   typhoonColor: '#c8d2df',
+  // rain: camera-following particle streaks (src/engine/rain.js) — driven by
+  // the weather system below but independently toggleable, same relationship
+  // typhoonVisible has to the (procedural, always-available) typhoon layer.
+  rainVisible: false,
+  rainIntensity: 0.6,
+  rainDensity: 5000,
+
+  // environment (src/engine/environment.js, docs/ENVIRONMENT_DESIGN.md):
+  // timeline-driven sun position (suncalc) + a weather mood layered on top.
+  // envAuto=true is the default — turning it off reproduces the exact
+  // pre-existing manual-light look (see environment.js's applyManual).
+  envAuto: true,
+  weather: 'clear', // 'clear' | 'rain' | 'typhoon'
 
   // HUD
   hud: true,
@@ -865,6 +912,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // to the same mountain/hiking context as trails, so it sits alongside them
     labels: { group: GROUP_OUTDOOR },
     typhoon: { group: GROUP_FX },
+    rain: { group: GROUP_FX },
   }
   // registration order = draw / update order (coastline → counties →
   // buildings → airspace → rail → trains → thsr → trails → rivers →
@@ -922,6 +970,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     ftwFieldsLayer,
     createIrrigationLayer(params),
     createTyphoonLayer(params),
+    createRainLayer(params),
     pointLayer,
     stationsLayer,
     shipsLayer,
@@ -947,6 +996,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (layer.visibleParam) LAYER_KEYS.add(layer.visibleParam)
     if (layer.paramMap) for (const k in layer.paramMap) LAYER_KEYS.add(layer.paramMap[k])
   }
+
+  // environment (docs/ENVIRONMENT_DESIGN.md): scene-level system, not a Layer
+  // (no LayerManager registration, no Layers panel row — see that module's
+  // header). Needs the region layer's sea env uniforms, so it's created after
+  // the registration loop above.
+  const environment = createEnvironment(params, stage, {
+    regionLayer: layers.get('region'),
+    invalidate,
+  })
 
   // chunk streaming: which chunks exist follows the pan target (radius tied to
   // the EFFECTIVE fog wall, so it grows with the far-view fogScale) — meshes
@@ -1079,7 +1137,50 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     motion,
     layers,
     invalidate,
-    onChange: (s) => emit('follow', s),
+    onChange: (s) => {
+      // ride view (src/engine/ride.js) is layered on top of follow and owns
+      // no mutex logic of its own — the instant follow stops (any of its
+      // mutex callers: startTour/flyToLonLat/selectPoi/deselect/keyPan/
+      // pan-drag/entity-vanished, see follow.js header), ride must fully
+      // exit too, synchronously, BEFORE whatever new tween/tour is about to
+      // start writing the camera. Every one of those callers invokes
+      // follow.stopFollow() as its first step (see design doc §3), so this
+      // notify() always fires ahead of the competing motion source's own
+      // setup — ride.exit() below always wins the race.
+      if (!s.active) ride.exit()
+      emit('follow', s)
+    },
+  })
+
+  // ride view: cockpit camera glued to the followed train, looking forward
+  // along the track (src/engine/ride.js, docs/FOLLOW_CAMERA_DESIGN.md §Ride
+  // view) — Immersive Mode Phase 1's second piece. `ride` is referenced
+  // inside follow's onChange above; safe because that callback only ever
+  // fires later (never during createFollow() itself), by which time this
+  // `const` has already been assigned.
+  const ride = createRide({
+    camera,
+    controls,
+    follow,
+    motion,
+    layers,
+    params,
+    getHeightField: () => heightField,
+    invalidate,
+    onChange: (s) => emit('ride', s),
+  })
+
+  // walk mode: first-person WASD camera, standalone (no followed entity) —
+  // Immersive-mode Phase 2 prototype (src/engine/walk.js, docs/WALK_MODE_DESIGN.md).
+  const walk = createWalk({
+    camera,
+    controls,
+    params,
+    motion,
+    follow,
+    getHeightField: () => heightField,
+    invalidate,
+    onChange: (s) => emit('walk', s),
   })
 
   // ---------------------------------------------------------------- tour path preview
@@ -1854,6 +1955,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     emit('layers')
   }
   let shipsActivated = false // onActivate: first switch-on loads today + subscribes to future date changes (once — see shipsVisible HANDLER)
+  // weather (docs/ENVIRONMENT_DESIGN.md): true only while weather itself
+  // turned typhoonVisible on — so switching weather back to clear/rain only
+  // closes the typhoon layer it opened, never one the user opened by hand
+  // via the Layers panel.
+  let weatherOpenedTyphoon = false
 
   // ocean currents: CDN PNG+JSON snapshot (docs/OCEAN_CURRENTS_DESIGN.md) —
   // fetch-once-on-first-switch-on, same {loading,loaded} guard as
@@ -2159,6 +2265,22 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     else regenerateTerrain()
   }
 
+  // rain overlay (screen-space postprocessing pass, src/engine/rainOverlay.js,
+  // docs/ENVIRONMENT_DESIGN.md §8): keeps stage.rainOverlayFx's uniforms and
+  // stage.rainOverlayPass.enabled in sync with params. Called from every
+  // HANDLER that can change what the overlay should look like (rainVisible,
+  // rainIntensity, weather) — rainDensity is excluded, it only resizes the
+  // world-space rain.js BufferGeometry and has no meaning for this pass.
+  // WIND_BY_WEATHER is imported from rain.js, not duplicated here, so the
+  // world-space and screen-space rain always slant the same way.
+  function applyRainOverlay() {
+    stage.rainOverlayPass.enabled = params.rainVisible
+    stage.rainOverlayFx.uniforms.get('uIntensity').value = params.rainIntensity
+    const wind = WIND_BY_WEATHER[params.weather] ?? WIND_BY_WEATHER.clear
+    stage.rainOverlayFx.uniforms.get('uWind').value.set(wind[0], wind[1])
+  }
+  applyRainOverlay() // initial sync on load — same seed-then-apply() pattern as environment.js
+
   // ---------------------------------------------------------------- setParams dispatch
   // rebuild class is deduped (one regenerateTerrain per patch); everything else
   // dispatches per-key: uniforms / material / post chain / camera / lights.
@@ -2391,6 +2513,43 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     typhoonLon: () => layers.get('typhoon').update(layerCtx()),
     typhoonLat: () => layers.get('typhoon').update(layerCtx()),
     typhoonColor: () => layers.get('typhoon').update(layerCtx()),
+    // rain: purely procedural, no deferred fetch — every param just re-runs
+    // the layer's update (visibility gate + style), same as typhoon above.
+    // Also syncs the screen-space overlay pass (applyRainOverlay, defined
+    // above HANDLERS) — rainDensity excluded, see that function's comment.
+    rainVisible: () => {
+      layers.get('rain').update(layerCtx())
+      applyRainOverlay()
+    },
+    rainIntensity: () => {
+      layers.get('rain').update(layerCtx())
+      applyRainOverlay()
+    },
+    rainDensity: () => layers.get('rain').update(layerCtx()),
+    // weather (docs/ENVIRONMENT_DESIGN.md): a "mood" preset — drives
+    // rainVisible/rainIntensity and (typhoon only) typhoonVisible directly,
+    // same bathymetryVisible-style direct-param-mutation-plus-manual-update
+    // pattern as bathymetryVisible above (those keys aren't in setParams'
+    // own patch, so their own HANDLERS won't fire on their own).
+    weather: (v) => {
+      params.rainVisible = v !== 'clear'
+      params.rainIntensity = v === 'typhoon' ? 1.0 : v === 'rain' ? 0.6 : params.rainIntensity
+      if (v === 'typhoon') {
+        if (!params.typhoonVisible) weatherOpenedTyphoon = true
+        params.typhoonVisible = true
+      } else if (weatherOpenedTyphoon) {
+        params.typhoonVisible = false
+        weatherOpenedTyphoon = false
+      }
+      layers.get('rain').update(layerCtx())
+      layers.get('typhoon').update(layerCtx())
+      applyRainOverlay() // weather also drives uWind (WIND_BY_WEATHER) — see that function
+      environment.apply() // fog/light mood modifier — see environment.js's WEATHER table
+      emit('layers') // refresh the Layers panel (rainVisible/typhoonVisible just changed under it)
+    },
+    // envAuto: flips between the timeline-driven ramp and the exact
+    // pre-existing manual-params look (environment.js's applyManual)
+    envAuto: () => environment.apply(),
     // look
     exposure: (v) => (stage.exposureFx.uniforms.get('exposure').value = v),
     contrast: (v) => (stage.contrastFx.uniforms.get('contrast').value = v),
@@ -2399,10 +2558,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     grain: (v) => (stage.grain.blendMode.opacity.value = v),
     fogNear: (v) => (scene.fog.near = v),
     fogFar: (v) => (scene.fog.far = v),
-    fogColor: (v) => {
-      scene.fog.color.set(v)
-      scene.background.set(v)
-    },
+    // fogColor routes through environment.apply() (not a direct scene.fog set)
+    // so it still works correctly under both modes: envAuto=false resolves to
+    // exactly the old two-line set (environment.js's applyManual does that
+    // literally); envAuto=true treats the new color as the ramp's "day"
+    // baseline, so a custom fogColor still surfaces at midday.
+    fogColor: () => environment.apply(),
     surveyLines: (v) => (hud3.lines.visible = v),
     // HUD colors rebuild the 3D FUI layer (CSS variables are the UI layer's half)
     hudAccent: () => regenerateHud(),
@@ -2416,12 +2577,15 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     pixelRatio: (v) => stage.setPixelRatio(v),
     shadowMode: () => stage.applyShadowMode(),
     shadowRes: (v) => stage.setShadowRes(v),
-    // light
-    sunIntensity: () => stage.placeSun(),
-    sunAzimuth: () => stage.placeSun(),
-    sunElevation: () => stage.placeSun(),
-    hemiIntensity: () => stage.placeSun(),
-    envLight: (v) => (scene.environmentIntensity = v),
+    // light — routed through environment.apply() (not stage.placeSun()
+    // directly) so envAuto=true keeps owning the light; envAuto=false falls
+    // straight through to applyManual(), which calls the original
+    // stage.placeSun() itself, so manual-mode behaviour is unchanged.
+    sunIntensity: () => environment.apply(),
+    sunAzimuth: () => environment.apply(),
+    sunElevation: () => environment.apply(),
+    hemiIntensity: () => environment.apply(),
+    envLight: () => environment.apply(), // both modes read params.envLight; envAuto multiplies in the ramp/weather IBL coefficient
     shadowSoftness: (v) => (stage.sun.shadow.radius = v),
   }
 
@@ -2556,9 +2720,12 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     if (params.source !== 'real' || !heightField) return true
     return (
       params.typhoonVisible || // procedural storm swirls every frame while visible
+      params.rainVisible || // rain streaks fall every frame while visible — wall-clock ambient, same as typhoon
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
       (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
-      ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing
+      ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing — also covers ride view (src/engine/ride.js): riding always requires trainsVisible/thsrVisible true (getEntityPosition gates on group.visible) and its camera motion is driven by the SAME train-position advance, so no separate ride branch is needed here. Paused timeline ⇒ this goes false ⇒ ride camera correctly freezes too.
+      walk.isMoving() || // walk mode (src/engine/walk.js): true while any WASD key is held OR the vertical ground-follow damper hasn't snapped to its target yet — a stationary, level walker correctly lets this go false and the loop idles
+      environment.needsFrameLoop() || // sun sweeps per-frame only during fast playback (>=60x); live/slow playback uses environment.js's sparse timer so the app still idles (docs/ENVIRONMENT_DESIGN.md)
       motion.tourActive ||
       motion.tweenActive ||
       scanStart >= 0 ||
@@ -2668,7 +2835,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // input is in play; note follow-camera mode is deliberately NOT included
     // here — it's classified as ambient and throttles to 30fps too (see
     // docs/HANDOFF.md 顯示效能提升包 for the tradeoff writeup)
-    const fullRate = motion.tweenActive || motion.tourActive || performance.now() < interactUntil
+    // walk.isMoving() is fullRate, not ambient: first-person motion integrates
+    // dt each frame, so the ambient throttle's long real gaps + the 0.05s dt
+    // cap would time-dilate walking speed (caught in acceptance: 40 m/s felt
+    // like 2 m/s under throttled rendering).
+    const fullRate = motion.tweenActive || motion.tourActive || walk.isMoving() || performance.now() < interactUntil
     const ambientOnly = animating && !fullRate
     if (animating) invalidate()
     if (!animating && performance.now() >= activeUntil) {
@@ -2685,8 +2856,14 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     }
     if (idle) exitIdle()
 
-    // camera motion: tour > fly tween > free navigation (with pan clamp)
-    if (!motion.tick(dt)) {
+    // camera motion: tour > fly tween > free navigation (with pan clamp).
+    // walk mode (src/engine/walk.js) owns the camera outright while active —
+    // same reasoning as the tour/tween branch below, so it takes the same
+    // keyPan.reset() path (W/A/S/D are shared keys between keyPan's map-pan
+    // and walk's movement; walk.tick() below is the only writer while active).
+    if (walk.active) {
+      keyPan.reset()
+    } else if (!motion.tick(dt)) {
       keyPan.tick(dt) // arrow/WASD velocity, applied before damping + clamp
       controls.update()
       stage.clampPan() // free navigation only — tours / fly-tos manage their own path
@@ -2742,16 +2919,26 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // the rest of this function.
     controls.panSpeed = THREE.MathUtils.clamp(0.35 / camDist, 1, 4)
     const realMode = params.source === 'real' && heightField
-    const lodChanged = stage.tickView(camDist, !!realMode)
+    const lodChanged = stage.tickView(camDist, !!realMode, environment.getFogMul())
     const fogScale = stage.fogScale
     terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
     terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
     layers.tickAll(layerCtx(dt)) // anti-z-fight lift tracks the view scale; marker dot rescale / tag crowd control
+    environment.tick(dt) // sky-dome camera recentre every frame; throttled suncalc/ramp recompute while envAuto+playing
     // follow camera: delta-carry off the entity's JUST-updated position above
     // — must run after layers.tickAll() (this frame's placement) and before
     // chunkManager.update() below (so DEM streaming follows the carried
     // target) and camera.updateMatrixWorld() (see design doc §4)
     follow.tick()
+    // ride view: absolute camera placement layered on top of follow's
+    // delta-carry above — must run after it (see ride.js header) and before
+    // chunkManager.update()/camera.updateMatrixWorld() below, same slot follow
+    // itself uses.
+    ride.tick(dt)
+    // walk mode: absolute camera placement + controls.target write, same slot
+    // as ride — must land before chunkManager.update() below so streaming
+    // follows the walker (src/engine/walk.js module header).
+    walk.tick(dt)
     if (lodChanged && !rebuildPending) {
       // far/near label policies changed — re-sow peaks + spot elevations now
       refreshPoiAnchor()
@@ -2940,6 +3127,18 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     // if the layer/entity can't be resolved right now.
     followEntity: follow.followEntity,
     stopFollow: follow.stopFollow,
+    // ride view (src/engine/ride.js) — LayerPickCard's Ride button / the
+    // corner chip's ride toggle. No-op (returns false) unless a follow
+    // session is active on a ride-capable layer; canRideView lets the UI
+    // decide whether to show the toggle at all (today: trains.js only).
+    toggleRideView: ride.toggle,
+    canRideView(layerId) {
+      const layer = layers.get(layerId)
+      return !!layer && typeof layer.getEntityLookahead === 'function'
+    },
+    // walk mode (src/engine/walk.js) — Settings panel's Walk section button.
+    // No-op (returns false) until the real-world height field has loaded.
+    toggleWalkMode: walk.toggle,
     // generic marker sets (pure display layer — see markers.js). Same id
     // with `points` replaces the set; without `points` patches color/visible.
     setMarkerSet(id, def) {
@@ -3005,7 +3204,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       window.removeEventListener('pointerdown', onPickPointerDown)
       window.removeEventListener('pointerup', onPickPointerUp)
       offTimeStore()
+      environment.dispose()
       keyPan.dispose()
+      ride.dispose()
+      walk.dispose()
       controls.dispose()
       stage.renderer.dispose()
       stage.renderer.domElement.remove()
@@ -3029,6 +3231,20 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
         return labelsLayer.renderGroup
       },
       layers,
+      // verify hook (docs/ENVIRONMENT_DESIGN.md): current computed sun az/el,
+      // ramp/weather output, envAuto state — window.__exp.environment
+      get environment() {
+        return environment.debug()
+      },
+      // rain overlay verify hook (rainOverlay.js, docs/ENVIRONMENT_DESIGN.md
+      // §8): window.__exp.rainOverlay — {enabled, intensity, wind}
+      get rainOverlay() {
+        return {
+          enabled: stage.rainOverlayPass.enabled,
+          intensity: stage.rainOverlayFx.uniforms.get('uIntensity').value,
+          wind: stage.rainOverlayFx.uniforms.get('uWind').value.toArray(),
+        }
+      },
       get heightField() {
         return heightField
       },
@@ -3056,7 +3272,36 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       },
       invalidate,
       stats,
+      // camera-motion-source triage (tour.js): tweenActive/tourActive gate
+      // both follow's engage sequencing and ride's entry guard (ride.js
+      // canRide()) — exposed alongside follow/ride below since debugging one
+      // of the three almost always means inspecting all three together.
+      motion,
       follow,
+      ride,
+      // ride view verify hook (docs/FOLLOW_CAMERA_DESIGN.md §Ride view):
+      // window.__exp.rideState — {active, layerId, entityId, ratio}. ratio is
+      // the followed train's current arc-length fraction (0..1) along
+      // whichever rail_lines.json part it's on right now (trains.js's
+      // getEntityRatio); null outside a ride/follow session or if the layer
+      // doesn't expose it.
+      get rideState() {
+        return {
+          active: ride.active,
+          layerId: follow.layerId,
+          entityId: follow.entityId,
+          ratio: layers.get(follow.layerId)?.getEntityRatio?.(follow.entityId) ?? null,
+        }
+      },
+      // walk mode verify hook (docs/WALK_MODE_DESIGN.md): window.__exp.walk
+      // exposes setInput({forward,right,sprint,jump,yaw,pitch}) for headless/
+      // pointer-lock-less testing (jump is one-shot, consumed next tick);
+      // window.__exp.walkState is the read-only snapshot — {active, x, z,
+      // eyeY, groundM, moving, yaw, pitch, airborne}.
+      walk,
+      get walkState() {
+        return walk.debugState()
+      },
     },
   }
   engine.debug.engine = engine

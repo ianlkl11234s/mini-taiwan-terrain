@@ -376,6 +376,11 @@ export function createTrainsLayer(params, config = {}) {
   // car-chain scratch (layoutCars) — sized once per layer instance (carCount
   // is fixed per network, see config below), reused every train every frame
   const _carScale = new THREE.Vector3()
+  // ride view scratch (getEntityLookahead, called from ride.js AFTER this
+  // frame's layout() has already run) — kept separate from _sample so a
+  // lookahead query can never alias whatever layout()'s own per-instance
+  // sampling left in _sample
+  const _sampleAhead = { lon: 0, lat: 0, elev: 0 }
 
   // click-to-inspect candidates (pick() below), refreshed every layout() call
   // — one entry per instance actually drawn this pass, carrying the train ref
@@ -392,6 +397,16 @@ export function createTrainsLayer(params, config = {}) {
   // — that's "the train's position" for a chained car-mesh the same way the
   // single dot was for the far-view LOD.
   const hitByTrainNo = new Map()
+  // trainNo -> {partIdx, ratio, dir}, refreshed every layout() call alongside
+  // hitByTrainNo — ride view's getEntityLookahead below needs the SAME
+  // part/ratio/direction locateTrain resolved for this train this frame (not
+  // just its resulting world position) to walk further along the track.
+  const locByTrainNo = new Map()
+  // ride view (src/engine/ride.js): trainNo currently hidden from rendering
+  // because the camera is riding it — position/ratio bookkeeping above keeps
+  // running regardless (ride still needs a live position), only the instance
+  // matrix write is skipped (see layoutDots/layoutCars)
+  let hiddenTrainNo = null
 
   function gate() {
     return params.source === 'real' && !!hf && params[visibleKey] && dataReady
@@ -536,6 +551,7 @@ export function createTrainsLayer(params, config = {}) {
     const exaggeration = params.demExaggeration
     lastHits.length = 0
     hitByTrainNo.clear()
+    locByTrainNo.clear()
     return carMode ? layoutCars(proj, exaggeration) : layoutDots(proj, exaggeration)
   }
 
@@ -551,11 +567,16 @@ export function createTrainsLayer(params, config = {}) {
       sampleAlongPart(part, _loc.ratio, _sample)
       const w = proj.lonLatToWorld(_sample.lon, _sample.lat)
       const y = metersToWorldY(hf, _sample.elev, exaggeration) + lift
+      hitByTrainNo.set(tr.trainNo, { x: w.x, y, z: w.z })
+      locByTrainNo.set(tr.trainNo, { partIdx: _loc.partIdx, ratio: _loc.ratio, dir: _loc.dir })
+      // ride view (src/engine/ride.js): the followed train's own dot would
+      // otherwise render right at the camera — skip the instance write, keep
+      // the position bookkeeping above (see layoutCars for the same pattern)
+      if (tr.trainNo === hiddenTrainNo) continue
       _dummy.makeScale(r, r, r)
       _dummy.setPosition(w.x, y, w.z)
       dotMesh.setMatrixAt(count, _dummy)
       lastHits.push({ train: tr, elapsed, x: w.x, y, z: w.z })
-      hitByTrainNo.set(tr.trainNo, { x: w.x, y, z: w.z })
       count++
     }
     dotMesh.count = count
@@ -617,6 +638,16 @@ export function createTrainsLayer(params, config = {}) {
         const bx = _carPos[c * 3]
         const by = _carPos[c * 3 + 1]
         const bz = _carPos[c * 3 + 2]
+        if (c === 0) {
+          // head car = "the train's position" (also the ride-view lookahead baseline)
+          hitByTrainNo.set(tr.trainNo, { x: bx, y: by, z: bz })
+          locByTrainNo.set(tr.trainNo, { partIdx: _loc.partIdx, ratio: _loc.ratio, dir: _loc.dir })
+        }
+        // ride view (src/engine/ride.js): the followed train's own car chain
+        // would otherwise render right where/under the camera sits — skip
+        // this train's instance writes while it's the ride-hidden entity,
+        // but keep the bookkeeping above (ride still needs a live position)
+        if (tr.trainNo === hiddenTrainNo) continue
         let dx
         let dz
         if (c < carCount - 1) {
@@ -635,7 +666,6 @@ export function createTrainsLayer(params, config = {}) {
         _dummy.setPosition(bx, by, bz)
         carMesh.setMatrixAt(instCount, _dummy)
         lastHits.push({ train: tr, elapsed, x: bx, y: by, z: bz })
-        if (c === 0) hitByTrainNo.set(tr.trainNo, { x: bx, y: by, z: bz }) // head car = "the train's position"
         instCount++
       }
       trainCount++
@@ -701,6 +731,47 @@ export function createTrainsLayer(params, config = {}) {
     getEntityPosition(trainNo) {
       if (!group.visible) return null
       return hitByTrainNo.get(trainNo) ?? null
+    },
+
+    // ride view (src/engine/ride.js, docs/FOLLOW_CAMERA_DESIGN.md §Ride
+    // view): forward-looking sample along the SAME part/direction locateTrain
+    // resolved for this train THIS frame (locByTrainNo, kept fresh by
+    // layout() above) — walking the real arc-length table is what lets the
+    // ride camera track the actual curve instead of guessing a straight line.
+    // aheadMeters is real-world meters (same unit carLenM/part.lengthM
+    // already use elsewhere in this module). Known limitation: clamps to
+    // [0,1] on the CURRENT part only — the same simplification layoutCars'
+    // own car-chain tail offset already makes (see module header) — so near a
+    // part boundary (a rail_lines.json segment join) the look-ahead point
+    // freezes at that part's end vertex instead of continuing onto the next
+    // part, until the train itself crosses over and locByTrainNo updates.
+    getEntityLookahead(trainNo, aheadMeters) {
+      if (!group.visible || !hf) return null
+      const loc = locByTrainNo.get(trainNo)
+      if (!loc || !parts) return null
+      const part = parts[loc.partIdx]
+      if (!part || !part.lengthM) return null
+      const ratioAhead = THREE.MathUtils.clamp(loc.ratio + loc.dir * (aheadMeters / part.lengthM), 0, 1)
+      sampleAlongPart(part, ratioAhead, _sampleAhead)
+      const w = hf.projection.lonLatToWorld(_sampleAhead.lon, _sampleAhead.lat)
+      return { x: w.x, y: metersToWorldY(hf, _sampleAhead.elev, params.demExaggeration) + lift, z: w.z }
+    },
+
+    // ride view debug hook only (window.__exp.rideState, see index.js's debug
+    // block) — current arc-length fraction (0..1) along whichever part the
+    // train is on right now. Not consumed by ride.js's own logic.
+    getEntityRatio(trainNo) {
+      return locByTrainNo.get(trainNo)?.ratio ?? null
+    },
+
+    // ride view: hide/show this train's own rendered instance(s) — see
+    // layoutDots/layoutCars' hiddenTrainNo checks. Guards against a stale
+    // unhide clobbering a DIFFERENT train that got hidden after this call was
+    // queued (shouldn't happen — ride.js only ever hides one entity at a
+    // time — but cheap to make safe).
+    setEntityHidden(trainNo, hidden) {
+      if (hidden) hiddenTrainNo = trainNo
+      else if (hiddenTrainNo === trainNo) hiddenTrainNo = null
     },
 
     // click-to-inspect (see index.js pointerup handler / layers.pickAll).
@@ -825,6 +896,7 @@ export function createTrainsLayer(params, config = {}) {
       lastQueryT = null
       lastActiveCount = 0
       lastHits = []
+      hiddenTrainNo = null // a new schedule invalidates any stale ride-hide flag
       dataReady = trainsByStart.length > 0
     },
 

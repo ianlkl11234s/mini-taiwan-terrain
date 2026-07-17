@@ -12,12 +12,18 @@ import { T, FONT_DATA, FONT_CJK, glass } from '../theme.js'
 // pick.followable = {layerId, entityId} 存在時才顯示按鈕。第二條 'follow'
 // 訂閱只用來決定按鈕是否要畫成「跟隨中」——不是這顆卡片本身的跟隨狀態擁有者
 // （那是 engine/follow.js），這裡純粹是訂閱+顯示。
+//
+// 車廂視角（src/engine/ride.js，docs/FOLLOW_CAMERA_DESIGN.md §Ride view）：
+// follow 的延伸——只在「正在跟隨這個 entity」且該圖層有實作 getEntityLookahead
+// （目前只有 trains.js／台鐵＋高鐵）時才顯示第二顆按鈕。跟 Follow 按鈕同一套
+// 「訂閱 engine 事件 + 顯示，狀態擁有者在 engine/ride.js」模式。
 
 const CARD_W = 240
 
 export default function LayerPickCard({ engine }) {
   const [pick, setPick] = useState(null)
   const [followState, setFollowState] = useState({ active: false, layerId: null, entityId: null })
+  const [rideState, setRideState] = useState({ active: false, layerId: null, entityId: null })
   const pickRef = useRef(null) // mirrors `pick` for the frame-event closure
   const cardRef = useRef(null)
 
@@ -39,10 +45,12 @@ export default function LayerPickCard({ engine }) {
       el.style.opacity = pos.visible ? 1 : 0
     })
     const offFollow = engine.on('follow', (s) => setFollowState(s))
+    const offRide = engine.on('ride', (s) => setRideState(s))
     return () => {
       offPick()
       offFrame()
       offFollow()
+      offRide()
     }
   }, [engine])
 
@@ -54,6 +62,8 @@ export default function LayerPickCard({ engine }) {
     if (isFollowingThis) engine.stopFollow()
     else engine.followEntity(followable.layerId, followable.entityId, pick.title)
   }
+  const isRidingThis = !!followable && rideState.active && rideState.layerId === followable.layerId && rideState.entityId === followable.entityId
+  const rideCapable = isFollowingThis && engine.canRideView(followable.layerId)
 
   return (
     <div
@@ -125,6 +135,30 @@ export default function LayerPickCard({ engine }) {
           }}
         >
           {isFollowingThis ? '跟隨中 ✓ Following' : '跟隨 Follow'}
+        </button>
+      )}
+      {rideCapable && (
+        <button
+          onClick={() => engine.toggleRideView()}
+          style={{
+            all: 'unset',
+            cursor: 'pointer',
+            display: 'block',
+            width: '100%',
+            boxSizing: 'border-box',
+            marginTop: 6,
+            padding: '5px 0',
+            borderRadius: T.radius.md,
+            textAlign: 'center',
+            fontFamily: FONT_CJK,
+            fontSize: T.fs.base,
+            fontWeight: 600,
+            color: isRidingThis ? T.accent : T.textStrong,
+            background: isRidingThis ? T.accentSoft : T.ctrlInactiveBg,
+            border: `1px solid ${isRidingThis ? T.accent : T.ctrlInactiveBorder}`,
+          }}
+        >
+          {isRidingThis ? '車廂視角中 ✓ Riding' : '車廂視角 Ride view'}
         </button>
       )}
     </div>

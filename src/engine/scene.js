@@ -16,6 +16,7 @@ import {
   Effect,
   BlendFunction,
 } from 'postprocessing'
+import { RainOverlayEffect } from './rainOverlay.js'
 
 // The "stage": renderer / camera / controls / lights / post chain, plus the
 // per-frame view-scale machinery (distance LOD target, fogScale, shadow
@@ -218,6 +219,21 @@ export function createStage(params, container) {
     if (params.shadowMode === 'static') renderer.shadowMap.needsUpdate = true
   }
 
+  // Environment-system override (src/engine/environment.js, docs/ENVIRONMENT_DESIGN.md):
+  // sets the sun's DIRECTION only, from explicit az/el degrees rather than
+  // params.sunAzimuth/sunElevation — lets envAuto drive the light off suncalc
+  // without ever mutating those params (the manual-mode round-trip guarantee).
+  // Intensity/color/hemi are the caller's job (environment.js sets stage.sun /
+  // stage.hemi directly, both now exposed below).
+  function placeSunAt(azDeg, elDeg) {
+    const az = THREE.MathUtils.degToRad(azDeg)
+    const el = THREE.MathUtils.degToRad(elDeg)
+    const r = 34
+    _sunOffset.set(Math.cos(az) * Math.cos(el) * r, Math.sin(el) * r, Math.sin(az) * Math.cos(el) * r)
+    _sunAnchor.set(NaN, NaN) // force updateSunAnchor to re-place the light
+    updateSunAnchor()
+  }
+
   placeSun()
   // shadowMode isn't otherwise applied until a param change or a fade-driven
   // rescale — without this, renderer.shadowMap.autoUpdate stays at three's
@@ -261,9 +277,39 @@ export function createStage(params, container) {
 
   const dofPass = new EffectPass(camera, dof)
   composer.addPass(dofPass)
+
+  // rain overlay (rainOverlay.js, docs/ENVIRONMENT_DESIGN.md §8): screen-space
+  // streaks. MUST sit here — before the exposure/tonemap/grade merged pass
+  // below, in the same toggleable slot dofPass occupies — and NOT as the
+  // chain's last pass. First draft put it last (reasoning: read post-tonemap
+  // colors for an accurate light/dark tint pick) and that broke on/off
+  // toggling: EffectComposer.addPass() gives `renderToScreen` to whichever
+  // pass was added most recently, and render() only writes the actual visible
+  // canvas from whichever pass currently has that flag AND is enabled
+  // (`if (pass.enabled) { pass.render(...) }` — a disabled pass's render()
+  // never runs, full stop). With rain last, disabling it left NOTHING
+  // painting the screen that frame — the canvas visibly froze on the last
+  // rain frame forever (confirmed empirically: renderCount kept climbing
+  // after weather→clear while the on-screen streaks never went away, fixed
+  // immediately by moving the pass here). The always-on merged pass below
+  // must stay the last-added pass so it keeps permanent renderToScreen
+  // ownership — exactly the guarantee dofPass already relies on. Cost: rain's
+  // luminance-based tint reads the pre-tonemap HDR linear buffer instead of
+  // final graded colors (see rainOverlay.js's lum→lumTone compression for how
+  // that's handled). Seed values here are placeholders; index.js's
+  // applyRainOverlay() does the real initial sync right after HANDLERS is set
+  // up (same two-step seed-then-apply() pattern environment.js uses).
+  const rainOverlayFx = new RainOverlayEffect({ intensity: params.rainIntensity, wind: [0, 0] })
+  const rainOverlayPass = new EffectPass(camera, rainOverlayFx)
+  composer.addPass(rainOverlayPass)
+
   composer.addPass(new EffectPass(camera, exposureFx, toneMap, hueSat, contrastFx, grain, vignette, smaa))
   // skip the whole DOF pass when bokeh is zero — it's pure cost with no visual effect
   dofPass.enabled = params.bokehScale > 0
+  // zero-cost while off — EffectComposer skips disabled passes entirely, same
+  // guarantee dofPass relies on above (see the placement comment for why this
+  // pass must NOT be last in the chain for that guarantee to hold safely).
+  rainOverlayPass.enabled = params.rainVisible
 
   // shared viewport uniform for the fat-line materials (Line2/LineMaterial
   // needs the resolution to convert px linewidth → clip space): the overlay
@@ -287,6 +333,7 @@ export function createStage(params, container) {
     composer,
     lineResolution,
     sun,
+    hemi, // exposed for environment.js — the only other writer of hemi.color/intensity
     dof,
     dofPass,
     exposureFx,
@@ -294,6 +341,8 @@ export function createStage(params, container) {
     hueSat,
     grain,
     vignette,
+    rainOverlayFx,
+    rainOverlayPass,
     get lodZoom() {
       return lodZoom
     },
@@ -302,6 +351,7 @@ export function createStage(params, container) {
     },
     clampPan,
     placeSun,
+    placeSunAt,
     applyShadowMode,
     setShadowRes,
     shadowNeedsUpdate,
@@ -316,13 +366,18 @@ export function createStage(params, container) {
     // P2 per-frame view scaling: fog wall follows the dolly distance, shadow
     // frustum grows/fades, and the LOD target re-evaluates through the
     // hysteresis. Returns lodChanged so the engine can re-sow labels/POIs.
-    tickView(camDist, realMode) {
+    // envFogMul (docs/ENVIRONMENT_DESIGN.md §weather): a same-frame multiplier
+    // on top of fogScale, e.g. ~0.55 in rain / ~0.4 in typhoon so the murk
+    // closes in — driven every frame (not throttled) so it never lags behind
+    // camera dolly the way a throttled ramp recompute would. 1 = no-op,
+    // byte-for-byte the pre-weather fog math.
+    tickView(camDist, realMode, envFogMul = 1) {
       // R2 viewRange: user-facing "view distance" folds into the same scale so
       // everything tied to the fog wall (streaming radius, scan, POI search,
       // contour/grid morphing) stretches together.
       fogScale = (realMode ? Math.max(1, camDist / LOD_D0) : 1) * (params.viewRange ?? 1)
-      scene.fog.near = params.fogNear * fogScale
-      scene.fog.far = params.fogFar * fogScale
+      scene.fog.near = params.fogNear * fogScale * envFogMul
+      scene.fog.far = params.fogFar * fogScale * envFogMul
       updateShadowScale(realMode ? camDist : LOD_D0)
       let lodChanged = false
       if (realMode) {
