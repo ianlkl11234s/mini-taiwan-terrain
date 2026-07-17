@@ -165,6 +165,14 @@ export const DEFAULT_PARAMS = {
   contourColor: '#000000',
   gridStep: 5,
   gridOpacity: 1,
+  // Phase 3 packet C (docs/PHASE3_VISUAL_DESIGN.md): near-view procedural
+  // detail normal (terrain.js onBeforeCompile injection after
+  // normal_fragment_maps) — disguises the 20 m DEM's "staircase" facets at
+  // walk-mode/ride-view distances with an analytic value-noise gradient.
+  // 0 = fully off (byte-for-byte current behavior); fades out again beyond
+  // 2 km camera distance regardless of value (see terrain.js's
+  // terrainDetailStrength), so the default is a no-op from any overhead view.
+  terrainDetail: 0.6,
   peakLimit: 15,
   peakMinElev: 0,
   peakRadiusKm: 0,
@@ -2325,6 +2333,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     contourColor: (v) => terrain.mapUniforms.uContourColor.value.set(v),
     gridStep: (v) => (terrain.mapUniforms.uGridStep.value = v),
     gridOpacity: (v) => (terrain.mapUniforms.uGridOpacity.value = v),
+    // Phase 3 packet C: purely a uniform — no rebuild, no isAnimating (static effect)
+    terrainDetail: (v) => (terrain.mapUniforms.uTerrainDetail.value = v),
     gradLow: () => terrain.rebuildRamp(params),
     gradMid1: () => terrain.rebuildRamp(params),
     gradMid2: () => terrain.rebuildRamp(params),

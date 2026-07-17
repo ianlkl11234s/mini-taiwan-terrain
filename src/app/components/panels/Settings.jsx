@@ -117,6 +117,9 @@ export default function Settings({ engine }) {
       <SectionHeader>Map</SectionHeader>
       <Slider label="等高線間距 Contour interval" min={0.04} max={0.6} step={0.01} value={p.contourInterval} onChange={live('contourInterval')} format={(v) => v.toFixed(2)} />
       <Slider label="等高線濃度 Contour opacity" min={0} max={1} step={0.02} value={p.contourOpacity} onChange={live('contourOpacity')} format={(v) => v.toFixed(2)} />
+      {/* 近景地形細節（docs/PHASE3_VISUAL_DESIGN.md 工作包 C）——只在 <2km 近景生效，
+          俯瞰時無感；0 = 完全現狀 */}
+      <Slider label="地形細節 Terrain detail" min={0} max={1} step={0.05} value={p.terrainDetail} onChange={live('terrainDetail')} format={(v) => v.toFixed(2)} />
       <Slider label="顆粒 Grain" min={0} max={0.5} step={0.01} value={p.grain} onChange={live('grain')} format={(v) => v.toFixed(2)} />
       <Row label="海底地形 Bathymetry">
         <Toggle on={p.bathymetryVisible} onChange={live('bathymetryVisible')} />
