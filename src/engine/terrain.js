@@ -12,6 +12,19 @@ export const FLOOR_Y = -0.35
 // [0, SEA_RAMP_SPLIT] of the ramp, land [SEA_RAMP_SPLIT, 1]
 const SEA_RAMP_SPLIT = 0.35
 
+// Phase 3 packet C (docs/PHASE3_VISUAL_DESIGN.md "工作包 C"): near-view
+// procedural detail normal. DETAIL_HEIGHT_M is the characteristic bump
+// height of the disguise noise, in real-world METERS — converted to world Y
+// units the same way every other vertical quantity in this module is
+// (metersToWorldY/worldYScale convention, §全域鐵則 5), even though this is a
+// shading-only normal-perturbation strength rather than a real elevation, so
+// it scales consistently with demExaggeration instead of a hand-picked
+// world-unit magic number. WORLD_UNITS_PER_METER_FALLBACK is the documented
+// 1 unit ≈ 480.78 m constant, used only when no heightField exists yet
+// (procedural mode / before the first DEM tile lands).
+const DETAIL_HEIGHT_M = 3.0
+const WORLD_UNITS_PER_METER_FALLBACK = 1 / 480.78
+
 // CPU-generated terrain: multi-scale FBM + ridged multifractal + domain warping,
 // with real vertex normals so PBR lighting and DOF read the actual relief.
 export class Terrain {
@@ -74,6 +87,13 @@ export class Terrain {
       uFarmBounds: { value: new THREE.Vector4(0, 0, 0, 0) },
       uFarmOpacity: { value: 0 },
       uFarmColor: { value: new THREE.Color(params.farmColor) },
+      // Phase 3 packet C: near-view procedural detail normal (see the
+      // DETAIL_HEIGHT_M comment above). uTerrainDetail 0 = fully off — every
+      // mix()/perturbation the fragment shader does with it collapses to a
+      // byte-for-byte no-op. uDetailAmpWorld is kept in sync with
+      // demExaggeration by _detailAmpWorld()/_prepareChunkShading below.
+      uTerrainDetail: { value: params.terrainDetail },
+      uDetailAmpWorld: { value: this._detailAmpWorld(params) },
     }
     this.rebuildRamp(params)
     this.material.onBeforeCompile = (shader) => {
@@ -135,7 +155,68 @@ uniform vec3 uRiverSimColor;
 uniform sampler2D uFarmTex;
 uniform vec4 uFarmBounds;
 uniform float uFarmOpacity;
-uniform vec3 uFarmColor;`
+uniform vec3 uFarmColor;
+uniform float uTerrainDetail;
+uniform float uDetailAmpWorld;
+// --- Phase 3 packet C (docs/PHASE3_VISUAL_DESIGN.md): near-view procedural
+// detail normal. Pure ALU, world-space XZ, no textures, no dFdx/dFdy
+// (SwiftShader-safe — same analytic-slope discipline as region.js's sea
+// ripple). Classic quintic-fade value noise WITH an analytic derivative
+// (Inigo Quilez's "noise derivatives" technique) so the gradient used to
+// tilt the normal stays continuous across cell borders — a linear-fade value
+// noise's derivative is discontinuous at every integer cell and would show
+// as faceted banding once used to perturb a normal.
+float terrainDetailHash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+// returns (value, dValue/dx, dValue/dy) for one octave, x already pre-scaled
+// by that octave's frequency.
+vec3 terrainDetailNoiseD(vec2 x) {
+  vec2 p = floor(x);
+  vec2 f = fract(x);
+  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0); // quintic fade
+  vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0); // fade curve derivative
+  float a = terrainDetailHash(p);
+  float b = terrainDetailHash(p + vec2(1.0, 0.0));
+  float c = terrainDetailHash(p + vec2(0.0, 1.0));
+  float d = terrainDetailHash(p + vec2(1.0, 1.0));
+  float k0 = a;
+  float k1 = b - a;
+  float k2 = c - a;
+  float k4 = a - b - c + d;
+  float value = k0 + k1 * u.x + k2 * u.y + k4 * u.x * u.y;
+  vec2 deriv = du * (vec2(k1, k2) + k4 * u.yx);
+  return vec3(value, deriv);
+}
+// 3-octave fbm with derivative accumulation — each octave's gradient is
+// scaled by ITS OWN frequency before summing (chain rule: d/dp[n(f·p)] =
+// f·n'(f·p)), exactly like the value sum is scaled by that octave's
+// amplitude. Frequencies stay in the ~50–160 world-space band the design doc
+// calls for (feature scale ~3–15 m at 1 world unit ≈ 480.78 m).
+vec3 terrainDetailFbmD(vec2 p) {
+  float freq = 60.0; // ≈8 m period
+  float amp = 0.6;
+  float value = 0.0;
+  vec2 deriv = vec2(0.0);
+  for (int i = 0; i < 3; i++) {
+    vec3 n = terrainDetailNoiseD(p * freq);
+    value += amp * n.x;
+    deriv += amp * freq * n.yz;
+    freq *= 2.3;
+    amp *= 0.45;
+  }
+  return vec3(value, deriv);
+}
+// shared strength: <500 m full strength → 2 km zero (fixed world-unit
+// thresholds — 500 m≈1.04, 2 km≈4.16 at 1 unit≈480.78 m, the design doc's
+// simplification for this horizontal-only distance gate). uTerrainDetail 0
+// forces strength 0 everywhere, so every mix()/perturbation gated on it below
+// is byte-for-byte a no-op — the param-zero-is-current-state contract.
+float terrainDetailStrength(vec3 worldPos) {
+  float distToCam = distance(cameraPosition, worldPos);
+  float fade = 1.0 - smoothstep(1.04, 4.16, distToCam);
+  return uTerrainDetail * fade;
+}`
         )
         .replace(
           '#include <color_fragment>',
@@ -175,6 +256,20 @@ uniform vec3 uFarmColor;`
   // keep the lighting/AO shading from the base surface but let the gradient own the color
   float luma = dot(diffuseColor.rgb, vec3(0.2126, 0.7152, 0.0722));
   diffuseColor.rgb = mix(diffuseColor.rgb, ramp * clamp(luma * 2.4, 0.2, 1.4), uTint);
+
+  // --- Phase 3 packet C: albedo micro-dither reuses the SAME analytic value
+  // noise as the detail normal below (not a second unrelated noise call) —
+  // ±3% luma jitter from its low-frequency (first-octave) component, gated
+  // by the identical distance/terrainDetail strength so it's byte-for-byte a
+  // no-op together with the normal perturbation (uTerrainDetail 0, or beyond
+  // the 2 km distance fade).
+  {
+    float detailDitherStrength = terrainDetailStrength(vWorldPos);
+    if (detailDitherStrength > 0.0005) {
+      float lowFreqN = terrainDetailNoiseD(vWorldPos.xz * 60.0).x;
+      diffuseColor.rgb *= 1.0 + (lowFreqN - 0.5) * 0.06 * detailDitherStrength;
+    }
+  }
 
   // --- physics-derived river tint: sample the flow-accumulation bake in the
   // pilot footprint and paint valley floors blue. Gated by uRiverSimOpacity
@@ -247,6 +342,32 @@ uniform vec3 uFarmColor;`
 }`
         )
         .replace(
+          '#include <normal_fragment_maps>',
+          `#include <normal_fragment_maps>
+// --- Phase 3 packet C (docs/PHASE3_VISUAL_DESIGN.md): near-view procedural
+// detail normal — tilt the (already bump-mapped) lighting normal by an
+// analytic value-noise gradient in the world XZ plane. Slope-independent by
+// design (the same absolute XZ tilt is added regardless of the underlying
+// surface's own slope — see the design doc's "坡度無關"), so it disguises the
+// 20 m DEM's "staircase" facets on flat ground and steep ridgelines alike
+// without needing a tangent-space basis this material doesn't build (no
+// normal-map UVs on the terrain mesh). 'normal' here is VIEW space (set by
+// normal_fragment_begin above and optionally bump-mapped by
+// normal_fragment_maps just above this injection) — round-trip through world
+// space so the perturbation is a stable world-XZ tilt independent of camera
+// orientation.
+{
+  float detailStrength = terrainDetailStrength(vWorldPos);
+  if (detailStrength > 0.0005) {
+    vec3 nd = terrainDetailFbmD(vWorldPos.xz);
+    vec2 grad = nd.yz * uDetailAmpWorld;
+    vec3 worldN = inverseTransformDirection(normal, viewMatrix);
+    vec3 detailWorldN = normalize(worldN + vec3(-grad.x, 0.0, -grad.y) * detailStrength);
+    normal = normalize((viewMatrix * vec4(detailWorldN, 0.0)).xyz);
+  }
+}`
+        )
+        .replace(
           '#include <emissivemap_fragment>',
           `#include <emissivemap_fragment>
 // radar scan ripple: an emissive wavefront expanding from the center across the relief
@@ -293,6 +414,15 @@ if (uScanT >= 0.0) {
   // scene height → display elevation in feet (real when a DEM drives the terrain)
   heightToFeet(h) {
     return this._h2ft ? this._h2ft(h) : Math.round(4800 + h * 420)
+  }
+
+  // Phase 3 packet C: DETAIL_HEIGHT_M (real-world meters) → world Y units,
+  // respecting demExaggeration like every other vertical quantity (see the
+  // DETAIL_HEIGHT_M comment up top). Falls back to the documented 1 unit ≈
+  // 480.78 m constant when no heightField exists yet.
+  _detailAmpWorld(params) {
+    const K = this.heightField ? this.heightField.projection.K : WORLD_UNITS_PER_METER_FALLBACK
+    return K * params.demExaggeration * DETAIL_HEIGHT_M
   }
 
   // Sampler over the real-world height field: world xz → meters → scene units.
@@ -422,6 +552,7 @@ if (uScanT >= 0.0) {
     const minH = metersToWorldY(hf, hf.minM, params.demExaggeration)
     const maxH = metersToWorldY(hf, hf.maxM, params.demExaggeration)
     this.applyBathymetryShading(params) // toggle-aware uHeightRange/uSeaLevelY/uSeaSplit + ramp
+    this.mapUniforms.uDetailAmpWorld.value = this._detailAmpWorld(params) // packet C: track demExaggeration
     // P2: one sampler per LOD zoom — a chunk built at zoom z reads z's tile
     // pyramid level (this.sample stays the primary-zoom sampler for labels,
     // peaks and tours)
@@ -662,6 +793,7 @@ if (uScanT >= 0.0) {
     this.mapUniforms.uSeaLevelY.value = minH
     this.mapUniforms.uSeaSplit.value = 0
     this.rebuildRamp(params)
+    this.mapUniforms.uDetailAmpWorld.value = this._detailAmpWorld(params) // packet C: track demExaggeration
 
     this.mesh.geometry.dispose()
     this.mesh.geometry = geo
