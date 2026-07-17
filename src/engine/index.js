@@ -6,6 +6,7 @@ import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
 import { createRainLayer, WIND_BY_WEATHER } from './rain.js'
+import { createGrassLayer } from './grass.js'
 import { createEnvironment } from './environment.js'
 import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
@@ -399,6 +400,16 @@ export const DEFAULT_PARAMS = {
   rainVisible: false,
   rainIntensity: 0.6,
   rainDensity: 5000,
+  // grass: Phase 3 work package B (docs/PHASE3_VISUAL_DESIGN.md, src/engine/grass.js)
+  // — a chunked InstancedMesh of procedural blade tufts, near-ground-only
+  // (hidden above ctx.camGroundM 1500 m — see that module). Default ON:
+  // invisible at any overview/orbit distance, so it's "俯瞰無感、近景即所見"
+  // and needs no separate first-toggle gesture, unlike the manifest-fetched
+  // layers above. grassDensity/grassHeight are live styleSchema sliders
+  // (Layers panel, describe() auto-generates them — see grass.js).
+  grassVisible: true,
+  grassDensity: 0.6,
+  grassHeight: 2.2,
 
   // environment (src/engine/environment.js, docs/ENVIRONMENT_DESIGN.md):
   // timeline-driven sun position (suncalc) + a weather mood layered on top.
@@ -845,6 +856,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const windTurbinesLayer = createWindTurbinesLayer(params, { onActivate: () => loadWindTurbinesData() })
   const shipsLayer = createShipsLayer(params)
   const currentsLayer = createCurrentsLayer(params)
+  // grass (src/engine/grass.js, Phase 3 work package B) — captured as its own
+  // variable (same reason currentsLayer is above it) so isAnimating() below
+  // can call its custom isAnimating() method directly.
+  const grassLayer = createGrassLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
   // whatever meta.group/subgroup it's registered with through to describe(),
@@ -922,6 +937,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     labels: { group: GROUP_OUTDOOR },
     typhoon: { group: GROUP_FX },
     rain: { group: GROUP_FX },
+    // grass (src/engine/grass.js) — procedural, wall-clock-driven, no data
+    // fetch, same theme as typhoon/rain above
+    grass: { group: GROUP_FX },
   }
   // registration order = draw / update order (coastline → counties →
   // buildings → airspace → rail → trains → thsr → trails → rivers →
@@ -980,6 +998,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     createIrrigationLayer(params),
     createTyphoonLayer(params),
     createRainLayer(params),
+    grassLayer,
     pointLayer,
     stationsLayer,
     shipsLayer,
@@ -2535,6 +2554,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       applyRainOverlay()
     },
     rainDensity: () => layers.get('rain').update(layerCtx()),
+    // grass (src/engine/grass.js): visible/height are cheap — layer.update()
+    // just re-gates + re-layouts the currently-active instances (no re-
+    // sampling). density needs real point regeneration — routed to the
+    // layer's own regenerate() instead (see that method's header).
+    grassVisible: () => grassLayer.update(layerCtx()),
+    grassDensity: () => grassLayer.regenerate(layerCtx()),
+    grassHeight: () => grassLayer.update(layerCtx()),
     // weather (docs/ENVIRONMENT_DESIGN.md): a "mood" preset — drives
     // rainVisible/rainIntensity and (typhoon only) typhoonVisible directly,
     // same bathymetryVisible-style direct-param-mutation-plus-manual-update
@@ -2732,6 +2758,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       params.rainVisible || // rain streaks fall every frame while visible — wall-clock ambient, same as typhoon
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
       (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
+      (params.grassVisible && grassLayer.isAnimating()) || // grass wind sway (src/engine/grass.js) — wall-clock ambient like typhoon/rain/sea-ripple, but ALSO gated on the layer's own camGroundM<1500 + actual-instance-count check, so any overview/orbit distance correctly idles even with the toggle on
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing — also covers ride view (src/engine/ride.js): riding always requires trainsVisible/thsrVisible true (getEntityPosition gates on group.visible) and its camera motion is driven by the SAME train-position advance, so no separate ride branch is needed here. Paused timeline ⇒ this goes false ⇒ ride camera correctly freezes too.
       walk.isMoving() || // walk mode (src/engine/walk.js): true while any WASD key is held OR the vertical ground-follow damper hasn't snapped to its target yet — a stationary, level walker correctly lets this go false and the loop idles
       environment.needsFrameLoop() || // sun sweeps per-frame only during fast playback (>=60x); live/slow playback uses environment.js's sparse timer so the app still idles (docs/ENVIRONMENT_DESIGN.md)
