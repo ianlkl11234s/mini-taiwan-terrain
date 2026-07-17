@@ -60,8 +60,12 @@ const GRASS_STYLE = {
 // low/high-elevation tint endpoints — low-saturation yellow-green so it
 // doesn't fight the terrain's own hypsometric ramp (spec: "別跟地形 ramp 打架
 // ——偏黃綠、飽和度低")
-const LOW_COLOR = new THREE.Color().setHSL(100 / 360, 0.4, 0.3)
-const HIGH_COLOR = new THREE.Color().setHSL(75 / 360, 0.28, 0.42)
+// SRGBColorSpace: setHSL()'s default writes raw values into the LINEAR
+// working space (no sRGB→linear conversion), which renders these ~1.5 stops
+// brighter than authored — the tufts came out pale sage instead of olive
+// (integration-acceptance finding).
+const LOW_COLOR = new THREE.Color().setHSL(100 / 360, 0.4, 0.3, THREE.SRGBColorSpace)
+const HIGH_COLOR = new THREE.Color().setHSL(75 / 360, 0.28, 0.42, THREE.SRGBColorSpace)
 
 // Is the DEM tile under (x,z) actually resident (fetched-and-resolved, land
 // OR sea)? Copied verbatim from walk.js's tileResident (not exported there —
@@ -92,7 +96,7 @@ function hashCell(cx, cz) {
 // the wind shader's tip weight with no extra attribute (spec offers either
 // "每頂點 0–1 權重 attribute 或用 uv.y" — this is the equivalent-but-simpler
 // "use an existing per-vertex value" option).
-const BLADE_HALF_W = 0.045 // meters, base half-width
+const BLADE_HALF_W = 0.14 // meters, base half-width — stylized to match the 2.2 m tuft height; true-scale 4-5 cm blades read as sparse hairline needles even at walk-mode distances (integration-acceptance finding)
 const BLADE_CURVE = 0.22 // meters, static forward lean baked into the resting shape
 const BLADE_DEFS = [
   // fixed (not randomized) fan-out within one tuft — this geometry is shared
