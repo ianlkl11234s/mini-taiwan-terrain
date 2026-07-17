@@ -375,6 +375,14 @@ export const DEFAULT_PARAMS = {
   seaAnimated: true,
   seaRippleStrength: 0.3,
   seaRippleSpeed: 1.0,
+  // Phase 3 工作包 A (docs/PHASE3_VISUAL_DESIGN.md): near-camera Gerstner wave
+  // patch on the SAME region.js sea plane group — a high-subdivision mesh
+  // that follows the camera, fading in only at low camGroundM (region.js
+  // owns the camGroundM/edge/land-mask gating; these three just drive the
+  // shader). seaWaveHeight 0 = patch fully invisible, exact pre-existing look.
+  seaWaveHeight: 1.2, // meters, dominant-wave amplitude budget across the 4 Gerstner waves
+  seaWaveChop: 0.6, // 0-1, per-wave steepness multiplier (horizontal sharpness)
+  seaFoam: 0.7, // 0-1, shoreline wash + wave-crest whitecap intensity
   // typhoon: a purely procedural vortex cloud sheet high above the terrain
   // (src/engine/typhoon.js) — no data, animated entirely in the fragment shader.
   // The eye defaults to just off the SE coast so the rainbands sweep the island;
@@ -2510,6 +2518,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     seaAnimated: () => layers.get('region').update(layerCtx()),
     seaRippleStrength: () => layers.get('region').update(layerCtx()),
     seaRippleSpeed: () => layers.get('region').update(layerCtx()),
+    // Phase 3 工作包 A: near-camera wave patch style — same re-run-update
+    // pattern as the ripple params above (non-rebuild, live shader uniforms)
+    seaWaveHeight: () => layers.get('region').update(layerCtx()),
+    seaWaveChop: () => layers.get('region').update(layerCtx()),
+    seaFoam: () => layers.get('region').update(layerCtx()),
     // typhoon: procedural vortex cloud sheet — every param just re-runs the
     // layer's update (visibility gate + place/scale + shader-uniform style)
     typhoonVisible: () => layers.get('typhoon').update(layerCtx()),
