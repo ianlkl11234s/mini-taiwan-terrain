@@ -649,6 +649,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // Layers that only run inside tick() (tickAll) always see the current
   // frame's value; the rarer update()-only call sites just see the last one.
   let lastCamDist = LOD_D0
+  // camera height above the terrain directly beneath it, in ground meters —
+  // near-detail layers (sea wave patch, grass) gate their spawn/fade on this
+  // via layerCtx().camGroundM. Refreshed once per tick() next to lastCamDist;
+  // Infinity until the DEM is up (non-real mode / pre-load) so distance-gated
+  // layers stay dormant instead of spawning at a bogus height.
+  let lastCamGroundM = Infinity
+  let lastWalkActive = false // walk.active snapshot — walk is created later; layerCtx() may run before it exists
 
   // fresh per-call snapshot of the live world state every layer reads from
   function layerCtx(dt = 0) {
@@ -659,6 +666,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       camera,
       fogScale: stage.fogScale,
       camDist: lastCamDist,
+      camGroundM: lastCamGroundM,
+      walkActive: lastWalkActive,
       dt,
       lineResolution: stage.lineResolution,
       // label-specific: fictional cartography in noise mode, real spot heights
@@ -2921,6 +2930,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     const realMode = params.source === 'real' && heightField
     const lodChanged = stage.tickView(camDist, !!realMode, environment.getFogMul())
     const fogScale = stage.fogScale
+    // camGroundM: inverse of metersToWorldY on the camera's Y, minus the
+    // terrain height right under it. One heightAtWorld sample per frame
+    // (LRU-cached). Must refresh before layers.tickAll() below so this
+    // frame's layers see this frame's height.
+    if (realMode) {
+      const camYm = camera.position.y / worldYScale(heightField, params.demExaggeration) + heightField.datumM
+      lastCamGroundM = camYm - heightField.heightAtWorld(camera.position.x, camera.position.z)
+    } else {
+      lastCamGroundM = Infinity
+    }
+    lastWalkActive = walk.active
     terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
     terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
     layers.tickAll(layerCtx(dt)) // anti-z-fight lift tracks the view scale; marker dot rescale / tag crowd control
