@@ -126,6 +126,12 @@ export const DEFAULT_PARAMS = {
   // vs. the 20m-DEM near-ground blur a true 1.7m eye height would sit in.
   walkSpeed: 40,
   walkEyeHeight: 12,
+  // jump peak height, real-world METERS — same live/no-rebuild param class as
+  // walkSpeed/walkEyeHeight above (walk.js reads it fresh every tick, no
+  // HANDLERS entry needed). 10m default is a fun/exploratory "leap", not a
+  // real human jump — see walk.js's WALK_GRAVITY_MPS2 for the paired gravity
+  // constant that makes it feel right at this world's scale.
+  walkJumpHeight: 10,
 
   // map overlay
   mapTint: 1.0,
@@ -3288,9 +3294,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
         }
       },
       // walk mode verify hook (docs/WALK_MODE_DESIGN.md): window.__exp.walk
-      // exposes setInput({forward,right,sprint,yaw,pitch}) for headless/
-      // pointer-lock-less testing; window.__exp.walkState is the read-only
-      // snapshot — {active, x, z, eyeY, groundM, moving, yaw, pitch}.
+      // exposes setInput({forward,right,sprint,jump,yaw,pitch}) for headless/
+      // pointer-lock-less testing (jump is one-shot, consumed next tick);
+      // window.__exp.walkState is the read-only snapshot — {active, x, z,
+      // eyeY, groundM, moving, yaw, pitch, airborne}.
       walk,
       get walkState() {
         return walk.debugState()

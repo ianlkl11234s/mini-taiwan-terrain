@@ -7,6 +7,7 @@ import Telemetry from './components/Telemetry.jsx'
 import TimelineBar from './components/TimelineBar.jsx'
 import PoiTags from './components/PoiTags.jsx'
 import LayerPickCard from './components/LayerPickCard.jsx'
+import WalkPanel from './components/WalkPanel.jsx'
 
 // React shell (R2)：engine mount 容器 + 全部 overlay。引擎只透過 facade
 // （createEngine / setParams / 事件）互動，src/engine/ 內部一概不碰。
@@ -18,6 +19,9 @@ import LayerPickCard from './components/LayerPickCard.jsx'
 // 車廂視角（src/engine/ride.js，同文件 §Ride view）也掛在這顆 chip 上，理由
 // 一樣：pick 卡片可能已關，chip 才是「不管卡片開關都能切換/退出 ride」的常駐
 // 入口。只有跟隨中的圖層有實作 getEntityLookahead（目前只有 trains.js）才顯示。
+//
+// 不帶自己的 position/top/right/zIndex——跟 WalkPanel 共用 App.jsx 那個右上角
+// fixed flex-column 容器（見下方 render），讓兩者自然堆疊不用手算偏移。
 function FollowChip({ engine }) {
   const [follow, setFollow] = useState({ active: false, title: null, layerId: null, entityId: null })
   const [ride, setRide] = useState({ active: false })
@@ -35,10 +39,6 @@ function FollowChip({ engine }) {
     <div
       style={{
         ...glass(),
-        position: 'fixed',
-        top: 16,
-        right: 16,
-        zIndex: 20,
         display: 'flex',
         alignItems: 'center',
         gap: 8,
@@ -186,7 +186,25 @@ export default function App() {
           <TitleBlock engine={engine} />
           <IconRailSidebar engine={engine} />
           <LayerPickCard engine={engine} />
-          <FollowChip engine={engine} />
+          {/* 右上角堆疊：WalkPanel（常駐入口）在上，FollowChip（只在跟隨中才
+              出現）在下——flex column 讓兩者自然疊起來，WalkPanel 收合/展開
+              高度不同、FollowChip 開關也是條件渲染，手算 top/bottom 偏移在
+              任一邊狀態變化時都會碎掉，交給 flexbox 比較穩。 */}
+          <div
+            style={{
+              position: 'fixed',
+              top: 16,
+              right: 16,
+              zIndex: 20,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'flex-end',
+              gap: 10,
+            }}
+          >
+            <WalkPanel engine={engine} />
+            <FollowChip engine={engine} />
+          </div>
           <WalkHint engine={engine} />
         </>
       )}

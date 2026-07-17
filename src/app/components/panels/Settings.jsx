@@ -40,10 +40,8 @@ const presetBtnStyle = {
 
 export default function Settings({ engine }) {
   const [p, setP] = useState(() => ({ ...engine.getParams() }))
-  const [walking, setWalking] = useState(false)
 
   useEffect(() => engine.on('params', () => setP({ ...engine.getParams() })), [engine])
-  useEffect(() => engine.on('walk', (s) => setWalking(s.active)), [engine])
 
   const live = useCallback(
     (key) => (v) => {
@@ -109,51 +107,6 @@ export default function Settings({ engine }) {
         value={p.rideLookAhead}
         onChange={live('rideLookAhead')}
         format={(v) => `${(v / 1000).toFixed(1)} km`}
-      />
-
-      <SectionHeader>Walk 步行</SectionHeader>
-      {/* 第一人稱 WASD 步行（src/engine/walk.js, docs/WALK_MODE_DESIGN.md）——
-          原型驗證：20m DEM 在步行視角的可接受度。walkSpeed/walkEyeHeight 都是
-          「讀即用」的 live 參數，不需要 rebuild，跟上面 Ride view 兩顆滑桿同款。 */}
-      <button
-        onClick={() => engine.toggleWalkMode()}
-        style={{
-          all: 'unset',
-          cursor: 'pointer',
-          display: 'block',
-          margin: '4px 8px 6px',
-          padding: '7px 0',
-          width: 'calc(100% - 16px)',
-          borderRadius: T.radius.lg,
-          textAlign: 'center',
-          fontFamily: FONT_CJK,
-          fontSize: T.fs.base,
-          fontWeight: 600,
-          color: walking ? '#fff' : T.textDim,
-          background: walking ? T.accent : T.ctrlInactiveBg,
-          border: `1px solid ${walking ? T.accent : T.ctrlInactiveBorder}`,
-          boxSizing: 'border-box',
-        }}
-      >
-        {walking ? '結束步行 Exit Walk（ESC）' : '進入步行 Enter Walk'}
-      </button>
-      <Slider
-        label="移動速度 Speed"
-        min={5}
-        max={300}
-        step={5}
-        value={p.walkSpeed}
-        onChange={live('walkSpeed')}
-        format={(v) => `${v} m/s`}
-      />
-      <Slider
-        label="視角高度 Eye height"
-        min={2}
-        max={100}
-        step={1}
-        value={p.walkEyeHeight}
-        onChange={live('walkEyeHeight')}
-        format={(v) => `${v} m`}
       />
 
       <SectionHeader>Peaks</SectionHeader>
