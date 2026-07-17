@@ -266,9 +266,22 @@ uniform float uWindStrength;`
     lastGenMs = performance.now() - t0
   }
 
+  let lastAnchorCX = null
+  let lastAnchorCZ = null
+
   function ensureCellsAround(ax, az) {
     const cx0 = Math.floor(ax / CELL_SIZE)
     const cz0 = Math.floor(az / CELL_SIZE)
+    // grass keeps the loop alive continuously at ground level (wind sway), so
+    // this runs every ambient frame — skip the Set/string-key rebuild + full
+    // recycle scan unless the anchor actually crossed into another cell.
+    // cells.size===0 re-arms it after regenerate() clears the map (the anchor
+    // cell itself is always wanted, so a completed run leaves size ≥ 1).
+    // Worst-case staleness of the radius test is one cell (~240 m) — hidden
+    // inside the spawn falloff.
+    if (cx0 === lastAnchorCX && cz0 === lastAnchorCZ && cells.size > 0) return
+    lastAnchorCX = cx0
+    lastAnchorCZ = cz0
     const wanted = new Set()
     for (let dz = -R_CELLS; dz <= R_CELLS; dz++) {
       for (let dx = -R_CELLS; dx <= R_CELLS; dx++) {
