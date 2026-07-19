@@ -6,6 +6,7 @@ import { createPointLayer } from './markers.js'
 import { createReservoirLayer } from './water.js'
 import { createTyphoonLayer } from './typhoon.js'
 import { createRainLayer, WIND_BY_WEATHER } from './rain.js'
+import { createGrassLayer } from './grass.js'
 import { createEnvironment } from './environment.js'
 import { createTrainsLayer } from './trains.js'
 import { createShipsLayer, parseTrailString, filterGpsAnomalies } from './ships.js'
@@ -165,6 +166,14 @@ export const DEFAULT_PARAMS = {
   contourColor: '#000000',
   gridStep: 5,
   gridOpacity: 1,
+  // Phase 3 packet C (docs/PHASE3_VISUAL_DESIGN.md): near-view procedural
+  // detail normal (terrain.js onBeforeCompile injection after
+  // normal_fragment_maps) — disguises the 20 m DEM's "staircase" facets at
+  // walk-mode/ride-view distances with an analytic value-noise gradient.
+  // 0 = fully off (byte-for-byte current behavior); fades out again beyond
+  // 2 km camera distance regardless of value (see terrain.js's
+  // terrainDetailStrength), so the default is a no-op from any overhead view.
+  terrainDetail: 0.6,
   peakLimit: 15,
   peakMinElev: 0,
   peakRadiusKm: 0,
@@ -375,6 +384,14 @@ export const DEFAULT_PARAMS = {
   seaAnimated: true,
   seaRippleStrength: 0.3,
   seaRippleSpeed: 1.0,
+  // Phase 3 工作包 A (docs/PHASE3_VISUAL_DESIGN.md): near-camera Gerstner wave
+  // patch on the SAME region.js sea plane group — a high-subdivision mesh
+  // that follows the camera, fading in only at low camGroundM (region.js
+  // owns the camGroundM/edge/land-mask gating; these three just drive the
+  // shader). seaWaveHeight 0 = patch fully invisible, exact pre-existing look.
+  seaWaveHeight: 1.2, // meters, dominant-wave amplitude budget across the 4 Gerstner waves
+  seaWaveChop: 0.6, // 0-1, per-wave steepness multiplier (horizontal sharpness)
+  seaFoam: 0.7, // 0-1, shoreline wash + wave-crest whitecap intensity
   // typhoon: a purely procedural vortex cloud sheet high above the terrain
   // (src/engine/typhoon.js) — no data, animated entirely in the fragment shader.
   // The eye defaults to just off the SE coast so the rainbands sweep the island;
@@ -399,6 +416,16 @@ export const DEFAULT_PARAMS = {
   rainVisible: false,
   rainIntensity: 0.6,
   rainDensity: 5000,
+  // grass: Phase 3 work package B (docs/PHASE3_VISUAL_DESIGN.md, src/engine/grass.js)
+  // — a chunked InstancedMesh of procedural blade tufts, near-ground-only
+  // (hidden above ctx.camGroundM 1500 m — see that module). Default ON:
+  // invisible at any overview/orbit distance, so it's "俯瞰無感、近景即所見"
+  // and needs no separate first-toggle gesture, unlike the manifest-fetched
+  // layers above. grassDensity/grassHeight are live styleSchema sliders
+  // (Layers panel, describe() auto-generates them — see grass.js).
+  grassVisible: true,
+  grassDensity: 0.6,
+  grassHeight: 2.2,
 
   // environment (src/engine/environment.js, docs/ENVIRONMENT_DESIGN.md):
   // timeline-driven sun position (suncalc) + a weather mood layered on top.
@@ -649,6 +676,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   // Layers that only run inside tick() (tickAll) always see the current
   // frame's value; the rarer update()-only call sites just see the last one.
   let lastCamDist = LOD_D0
+  // camera height above the terrain directly beneath it, in ground meters —
+  // near-detail layers (sea wave patch, grass) gate their spawn/fade on this
+  // via layerCtx().camGroundM. Refreshed once per tick() next to lastCamDist;
+  // Infinity until the DEM is up (non-real mode / pre-load) so distance-gated
+  // layers stay dormant instead of spawning at a bogus height.
+  let lastCamGroundM = Infinity
+  let lastWalkActive = false // walk.active snapshot — walk is created later; layerCtx() may run before it exists
 
   // fresh per-call snapshot of the live world state every layer reads from
   function layerCtx(dt = 0) {
@@ -659,6 +693,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       camera,
       fogScale: stage.fogScale,
       camDist: lastCamDist,
+      camGroundM: lastCamGroundM,
+      walkActive: lastWalkActive,
       dt,
       lineResolution: stage.lineResolution,
       // label-specific: fictional cartography in noise mode, real spot heights
@@ -836,6 +872,10 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
   const windTurbinesLayer = createWindTurbinesLayer(params, { onActivate: () => loadWindTurbinesData() })
   const shipsLayer = createShipsLayer(params)
   const currentsLayer = createCurrentsLayer(params)
+  // grass (src/engine/grass.js, Phase 3 work package B) — captured as its own
+  // variable (same reason currentsLayer is above it) so isAnimating() below
+  // can call its custom isAnimating() method directly.
+  const grassLayer = createGrassLayer(params)
   // Layers panel grouping (主題 → 圖層): the ONLY place a layer's theme is
   // decided — layer modules stay presentation-agnostic, layers.js just carries
   // whatever meta.group/subgroup it's registered with through to describe(),
@@ -913,6 +953,9 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     labels: { group: GROUP_OUTDOOR },
     typhoon: { group: GROUP_FX },
     rain: { group: GROUP_FX },
+    // grass (src/engine/grass.js) — procedural, wall-clock-driven, no data
+    // fetch, same theme as typhoon/rain above
+    grass: { group: GROUP_FX },
   }
   // registration order = draw / update order (coastline → counties →
   // buildings → airspace → rail → trains → thsr → trails → rivers →
@@ -971,6 +1014,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     createIrrigationLayer(params),
     createTyphoonLayer(params),
     createRainLayer(params),
+    grassLayer,
     pointLayer,
     stationsLayer,
     shipsLayer,
@@ -2316,6 +2360,8 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     contourColor: (v) => terrain.mapUniforms.uContourColor.value.set(v),
     gridStep: (v) => (terrain.mapUniforms.uGridStep.value = v),
     gridOpacity: (v) => (terrain.mapUniforms.uGridOpacity.value = v),
+    // Phase 3 packet C: purely a uniform — no rebuild, no isAnimating (static effect)
+    terrainDetail: (v) => (terrain.mapUniforms.uTerrainDetail.value = v),
     gradLow: () => terrain.rebuildRamp(params),
     gradMid1: () => terrain.rebuildRamp(params),
     gradMid2: () => terrain.rebuildRamp(params),
@@ -2501,6 +2547,11 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     seaAnimated: () => layers.get('region').update(layerCtx()),
     seaRippleStrength: () => layers.get('region').update(layerCtx()),
     seaRippleSpeed: () => layers.get('region').update(layerCtx()),
+    // Phase 3 工作包 A: near-camera wave patch style — same re-run-update
+    // pattern as the ripple params above (non-rebuild, live shader uniforms)
+    seaWaveHeight: () => layers.get('region').update(layerCtx()),
+    seaWaveChop: () => layers.get('region').update(layerCtx()),
+    seaFoam: () => layers.get('region').update(layerCtx()),
     // typhoon: procedural vortex cloud sheet — every param just re-runs the
     // layer's update (visibility gate + place/scale + shader-uniform style)
     typhoonVisible: () => layers.get('typhoon').update(layerCtx()),
@@ -2526,6 +2577,13 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       applyRainOverlay()
     },
     rainDensity: () => layers.get('rain').update(layerCtx()),
+    // grass (src/engine/grass.js): visible/height are cheap — layer.update()
+    // just re-gates + re-layouts the currently-active instances (no re-
+    // sampling). density needs real point regeneration — routed to the
+    // layer's own regenerate() instead (see that method's header).
+    grassVisible: () => grassLayer.update(layerCtx()),
+    grassDensity: () => grassLayer.regenerate(layerCtx()),
+    grassHeight: () => grassLayer.update(layerCtx()),
     // weather (docs/ENVIRONMENT_DESIGN.md): a "mood" preset — drives
     // rainVisible/rainIntensity and (typhoon only) typhoonVisible directly,
     // same bathymetryVisible-style direct-param-mutation-plus-manual-update
@@ -2723,6 +2781,7 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
       params.rainVisible || // rain streaks fall every frame while visible — wall-clock ambient, same as typhoon
       (params.seaAnimated && params.regionVisible) || // sea ripple decoration — wall-clock, not gated on the timeline, same as typhoon
       (params.currentsVisible && currentsFetch.loaded) || // ocean current particles advect every frame while visible — wall-clock ambient, same as typhoon/sea-ripple (not tied to the trains/thsr/ships timeline below). Gated on the CDN snapshot actually having loaded: a failed/pending fetch must NOT hold the loop out of idle forever rendering an empty layer (opus final-review finding).
+      (params.grassVisible && grassLayer.isAnimating()) || // grass wind sway (src/engine/grass.js) — wall-clock ambient like typhoon/rain/sea-ripple, but ALSO gated on the layer's own camGroundM<1500 + actual-instance-count check, so any overview/orbit distance correctly idles even with the toggle on
       ((params.trainsVisible || params.thsrVisible || params.shipsVisible) && timeStore.getPlaying()) || // light dots advance only while the timeline is playing — also covers ride view (src/engine/ride.js): riding always requires trainsVisible/thsrVisible true (getEntityPosition gates on group.visible) and its camera motion is driven by the SAME train-position advance, so no separate ride branch is needed here. Paused timeline ⇒ this goes false ⇒ ride camera correctly freezes too.
       walk.isMoving() || // walk mode (src/engine/walk.js): true while any WASD key is held OR the vertical ground-follow damper hasn't snapped to its target yet — a stationary, level walker correctly lets this go false and the loop idles
       environment.needsFrameLoop() || // sun sweeps per-frame only during fast playback (>=60x); live/slow playback uses environment.js's sparse timer so the app still idles (docs/ENVIRONMENT_DESIGN.md)
@@ -2921,6 +2980,17 @@ export async function createEngine({ container, params: overrides = {} } = {}) {
     const realMode = params.source === 'real' && heightField
     const lodChanged = stage.tickView(camDist, !!realMode, environment.getFogMul())
     const fogScale = stage.fogScale
+    // camGroundM: inverse of metersToWorldY on the camera's Y, minus the
+    // terrain height right under it. One heightAtWorld sample per frame
+    // (LRU-cached). Must refresh before layers.tickAll() below so this
+    // frame's layers see this frame's height.
+    if (realMode) {
+      const camYm = camera.position.y / worldYScale(heightField, params.demExaggeration) + heightField.datumM
+      lastCamGroundM = camYm - heightField.heightAtWorld(camera.position.x, camera.position.z)
+    } else {
+      lastCamGroundM = Infinity
+    }
+    lastWalkActive = walk.active
     terrain.mapUniforms.uContourInterval.value = params.contourInterval * fogScale
     terrain.mapUniforms.uGridStep.value = params.gridStep * fogScale
     layers.tickAll(layerCtx(dt)) // anti-z-fight lift tracks the view scale; marker dot rescale / tag crowd control

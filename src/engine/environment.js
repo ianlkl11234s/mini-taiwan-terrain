@@ -64,6 +64,11 @@ const MOON_FALLBACK_AZ = 210
 const MOON_FALLBACK_EL = 45
 const _moonColor = new THREE.Color('#b9c9e8')
 
+// ceiling for the SHADING light's elevation (see the clamp in applyAuto) —
+// twice the manual default 19° keeps midday clearly brighter/flatter than
+// morning while never reaching the blown-out overhead regime.
+const SUN_EL_MAX = 38
+
 // unit sun direction in the engine's world axes — same formula placeSun()/
 // placeSunAt() use for the light offset and typhoon.js's applyLight() uses
 // for its cloud lighting; kept in one place here since environment.js also
@@ -96,11 +101,14 @@ const RAMP = [
   // 金色時刻 0..8: warm horizon glow
   { el: 0, env: 0.5, sun: 0.14, sunColor: '#ff9a5c', hemi: 0.08, hemiSky: '#5a4a63', hemiGround: '#241d2c', fog: '#f0b487', sky: '#f6c89a', envTint: 0.55, turbidity: 8, rayleigh: 2.4, mie: 0.02 },
   { el: 8, env: 0.85, sun: 0.75, sunColor: '#ffe0b0', hemi: 0.02, hemiSky: '#cfd8dc', hemiGround: '#8a8f92', fog: DAY, sky: '#dfe6e2', envTint: 0.88, turbidity: 4.5, rayleigh: 1.4, mie: 0.01 },
-  // 白天 8..35 -> 正午 >35: back to the neutral pre-existing look (sun coef 1
-  // = exactly params.sunIntensity; hemiSky/Ground match HemisphereLight's own
-  // 0xdadada/0x5c5c5c constructor defaults — envAuto reduces to a no-op look here)
-  { el: 35, env: 1.0, sun: 1.0, sunColor: '#ffffff', hemi: 0, hemiSky: '#dadada', hemiGround: '#5c5c5c', fog: DAY, sky: '#dfe6e2', envTint: 1.0, turbidity: 2.2, rayleigh: 1.0, mie: 0.006 },
-  { el: 90, env: 1.0, sun: 1.0, sunColor: '#ffffff', hemi: 0, hemiSky: '#dadada', hemiGround: '#5c5c5c', fog: DAY, sky: '#dfe6e2', envTint: 1.0, turbidity: 1.6, rayleigh: 0.85, mie: 0.004 },
+  // 白天 8..35 -> 正午 >35: near the neutral pre-existing look (hemiSky/Ground
+  // match HemisphereLight's own 0xdadada/0x5c5c5c constructor defaults; env 1.0
+  // = exactly params.envLight). sun sits BELOW 1.0 and the shading light's
+  // elevation is clamped to SUN_EL_MAX in applyAuto — a real overhead sun at
+  // coef 1.0 lit flat terrain ~2.6x brighter than the manual 19° look and
+  // washed the whole vista out (user feedback 2026-07-18).
+  { el: 35, env: 1.0, sun: 0.85, sunColor: '#ffffff', hemi: 0, hemiSky: '#dadada', hemiGround: '#5c5c5c', fog: DAY, sky: '#dfe6e2', envTint: 1.0, turbidity: 2.2, rayleigh: 1.0, mie: 0.006 },
+  { el: 90, env: 1.0, sun: 0.85, sunColor: '#ffffff', hemi: 0, hemiSky: '#dadada', hemiGround: '#5c5c5c', fog: DAY, sky: '#dfe6e2', envTint: 1.0, turbidity: 1.6, rayleigh: 0.85, mie: 0.004 },
 ]
 // pre-parse every non-DAY hex once (module load, not per-apply)
 for (const stop of RAMP) {
@@ -223,6 +231,16 @@ export function createEnvironment(params, stage, { regionLayer, invalidate }) {
       lightEl = real ? moon.el : MOON_FALLBACK_EL
       lightIntensity = Math.max(lightIntensity, MOON_COEF * moonT * w.sunMul * params.sunIntensity)
       lightColor = _moonColor
+    } else {
+      // cartographic light clamp: ground irradiance goes with cos(incidence),
+      // so a real midday sun (55-60° in July) lights flat terrain ~2.6x
+      // brighter than the classic manual look's 19° modeling sun AND kills the
+      // relief shading — a vista at noon read as blown-out white (user
+      // feedback, 2026-07-18). Shading light never climbs past this; the Sky
+      // dome below still tracks the REAL solar position, so the sky/horizon
+      // keep honest time-of-day colors. Azimuth stays real — shadows still
+      // swing east→west through the day.
+      lightEl = Math.min(lightEl, SUN_EL_MAX)
     }
 
     // reposition the actual directional light only when it moved enough to
