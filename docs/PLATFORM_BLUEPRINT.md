@@ -106,6 +106,21 @@ Phase 1 與 2 可平行；3 依賴 2；4 獨立可插隊。
 
 依賴鏈：③a 獨立；④ 是一次上游重烘工程（含③b 遮罩）；⑤ 疊在④的 bake 之上；①② 完全獨立、隨時可插隊。
 
+### 沉浸模式 backlog（2026-07-20，Phase 1-3 已 merge：PR #9/#10）
+
+研究 SSOT：`docs/IMMERSIVE_MODE_RESEARCH.md`（四階段總路線）、`docs/GRASS_RENDERING_RESEARCH.md`（草地升級三 PR 細部規格）。
+
+| # | 項目 | 內容 | 前置/備註 |
+|---|------|------|----------|
+| G-A | 草地光照造型層 | 漸層色＋Voronoi clumping＋view-space thickening（抄 SimonDev MIT）＋wrap lighting＋世界空間風場＋坡度軟過渡——全在 grass.js 既有 onBeforeCompile 內增量改 | 無前置，成本最低、蓊鬱感立即翻倍，建議下一個動工 |
+| G-B | 草地密度與 LOD 圈層 | 4 萬→50 萬 instance（attr 打包 16-24B 取代 instanceMatrix）、兩級葉片幾何、逐 cell frustum culling | 依賴 G-A 打底才有意義；WebGL2 實證安全帶內 |
+| G-C | Ground blending | terrain.js 草區 splat（葉隙不再白紙）＋遠景退化成地面色；蓊鬱感貢獻第一名 | **風格決策須 user 拍板**：恆常開 vs 近景淡入 vs 獨立 Lush 開關 |
+| P4 | 沉浸 Phase 4 架構投資 | LOD streaming 重構（three-tile 評估）、WIM 雙尺度、@takram 大氣散射 | 等現有體驗撐不住再啟動 |
+| T-1 | 導覽演出 | 步行＋車廂＋時段組合成一鍵 tour（例：黃昏搭南迴看海） | 獨立可插隊，對外展示價值高 |
+| 遺留 | 淺水泡沫帶實海驗證 | Phase 3 海面 patch 的 shoreFoam 只做過合成深度單元驗證，找真實淺水海岸目視確認 | 順手驗即可 |
+
+依賴鏈：G-A→G-B→G-C 依序；P4/T-1 獨立。WebGPU 已評估不採用（見草地研究 §三），G 系列全部留在 WebGL2。
+
 ## 6. Agent 分工
 
 - **主迴圈（Fable/Opus 級）**：理解需求、拆任務、派工（必指定模型）、驗收、跨 repo 決策把關。不下場寫大量程式碼。
