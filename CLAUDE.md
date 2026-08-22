@@ -8,10 +8,10 @@
 
 | Repo | 角色 | 對本 repo 的意義 |
 |------|------|-----------------|
-| `../taipei-gis-analytics` | 資料探索第一站：29 主題 pipeline、78 個成品資料集、43GB data/ | 新圖層的資料來源。成品在 `data/processed/{theme}/{dataset}/`（EPSG:4326，GeoJSON+Parquet+FGB+PMTiles，附 `_manifest.json`）；清冊 SSOT = `docs/data-registry.yaml` + `docs/data-catalog/` |
+| `../taipei-gis-analytics` | 資料探索第一站：主題 pipeline 與成品資料集（清單 SSOT = 其 `docs/data-registry.yaml`，各資料集附 `_manifest.json`） | 新圖層的資料來源。成品在 `data/processed/{theme}/{dataset}/`（EPSG:4326，GeoJSON+Parquet+FGB+PMTiles，附 `_manifest.json`）；清冊 SSOT = `docs/data-registry.yaml` + `docs/data-catalog/` |
 | `../gis-platform` | Supabase schema / migrations / RPC 的 SSOT（生態系共用一個 Supabase project `utcmcikhvxnohbxchbrs`） | 要新 RPC、改表、動 RLS → 去那裡開 migration，不要在前端硬幹 |
-| `../data-collectors` | 65 個 collector 24/7 收資料（Zeabur + HiCloud VM），寫入 Supabase realtime.* 與 S3。**repo 內 toggle 預設 false 是假象，線上實況以 `config/cross_layer_map.yaml` 為準（58 個在跑）** | 即時圖層的資料來源；表清冊 = `config/realtime_tables.yaml` |
-| `../mini-taiwan-pulse` | 主力 2D 即時地圖（Mapbox+deck.gl+Three，265 圖層），往 monitor 發展 | **要抄的參考實作**：時間軸 `src/state/timeStore.ts`、韌性 fetch `src/lib/supabase.ts`、CDN 快照 `src/data/staticRpc.ts`、圖層鎖 `src/lib/layerGates.ts` |
+| `../data-collectors` | collector 群 24/7 收資料（Zeabur + HiCloud VM），寫入 Supabase realtime.* 與 S3。**repo 內 toggle 預設 false 是假象，線上實況以 `config/cross_layer_map.yaml` 為準** | 即時圖層的資料來源；表清冊 = `config/realtime_tables.yaml` |
+| `../mini-taiwan-pulse` | 主力 2D 即時地圖（Mapbox+deck.gl+Three，圖層現況見其 README），往 monitor 發展 | **要抄的參考實作**：時間軸 `src/state/timeStore.ts`、韌性 fetch `src/lib/supabase.ts`、CDN 快照 `src/data/staticRpc.ts`、圖層鎖 `src/lib/layerGates.ts` |
 | `../mini-taiwan-info` | 縣市統計儀錶板（themes yaml 驅動） | 跨 repo 同步矩陣在它的 `.claude/memory/CROSS_REPO.md` |
 
 資料流：政府開放資料 → **analytics**（探索/ETL/bake）→ **gis-platform**（DB schema）← **data-collectors**（持續寫入）→ pulse / info / **terrain-art**（讀取展示）。大型靜態資產另走 Cloudflare R2 + CDN（`tiles.itsmigu.com`）。
