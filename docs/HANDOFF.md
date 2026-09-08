@@ -1,5 +1,7 @@
 # HANDOFF — 2026-07-12 隔夜衝刺交接
 
+> 2026-09-08 digital twin 審查接手點：[改善方向與驗收缺口](../.claude/memory/2026-09-08-digital-twin-review.md)。僅記錄建議，未實作／部署；以下保留 7 月歷史快照。
+
 > 給下一個 session 的第一份讀物。搭配 `CLAUDE.md`（慣例）與 `docs/PLATFORM_BLUEPRINT.md`（藍圖）。
 > 上一版（2026-07-12 晨間基線）見 git 歷史 `61474e0`。
 
