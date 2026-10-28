@@ -58,7 +58,7 @@
 
 ## 部署
 
-- 主線：**Zeabur** 靜態站（build-time 注入 `VITE_TILE_BASE=https://tiles.itsmigu.com`）；圖磚在 R2 + Cloudflare CDN
+- 主線：**Cloudflare Workers 靜態資產**（`wrangler.jsonc`＋`.github/workflows/deploy-cloudflare.yml`，push main 自動部署；build 注入 `VITE_TILE_BASE=https://tiles.itsmigu.com`）；圖磚在 R2 + Cloudflare CDN。Zeabur 舊站待切網域後停用（見 GIS/.gis-agent-system/projects/2026-10-zeabur-migration）
 - `.github/workflows/deploy.yml`（GitHub Pages）是備線，產物不含圖磚
 - 改圖磚：`rclone copy` → `r2:terrain-tiles/`；改 `VITE_TILE_BASE` 需 Zeabur redeploy（build-time 變數）
 
