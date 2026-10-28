@@ -1,7 +1,14 @@
+// Cloudflare Workers 靜態資產部署設定（取代 Zeabur 靜態站；Zeabur 2026-12 停運）
+// - 網頁本體：dist/ 走 Workers 靜態資產
+// - 圖磚、向量瓦片、船舶快照在 R2（tiles.itsmigu.com），build 時由 VITE_TILE_BASE 指向，不進 dist
 {
-  "name": "monolith-terrain",
-  "compatibility_date": "2026-07-01",
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mini-taiwan-terrain",
+  "compatibility_date": "2026-10-01",
   "assets": {
-    "directory": "./dist"
-  }
+    "directory": "./dist",
+    // 舊站對不存在的路徑回 index.html（200），沿用（單頁應用，沒有其他前端路由）
+    "not_found_handling": "single-page-application"
+  },
+  "observability": { "enabled": true }
 }

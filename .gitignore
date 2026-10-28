@@ -8,3 +8,4 @@ public/tiles
 __pycache__/
 .claude/worktrees/
 scripts/.cache/
+.wrangler/

@@ -1,0 +1,43 @@
+# main 有新 commit 就 build 並部署到 Cloudflare Workers（mini-taiwan-terrain）
+# 需要 repo secret：CLOUDFLARE_API_TOKEN（Edit Cloudflare Workers 權限）
+# 圖磚走 R2（tiles.itsmigu.com），build 時注入 VITE_TILE_BASE；原 GitHub Pages 備線（deploy.yml）保持不動
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloudflare
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: |
+          test -n "$VITE_TILE_BASE" || { echo "::error::VITE_TILE_BASE 未設定"; exit 1; }
+          npm run build
+        env:
+          VITE_TILE_BASE: https://tiles.itsmigu.com
+
+      - name: Deploy
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: d104f32eafd7b294ba1f74b731ffd1e0
